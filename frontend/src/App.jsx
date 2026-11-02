@@ -272,6 +272,7 @@ function App() {
   const [currentVideoDefaultChannelTitle, setCurrentVideoDefaultChannelTitle] = useState('')
   const [publicationDialog, setPublicationDialog] = useState(null)
   const [sceneResetDialog, setSceneResetDialog] = useState(null)
+  const [introRegenDialog, setIntroRegenDialog] = useState(null)
   const [duplicateWarningDialog, setDuplicateWarningDialog] = useState(null)
   const [currentVideoHasCheckpoint, setCurrentVideoHasCheckpoint] = useState(false)
   const [isPublishingNow, setIsPublishingNow] = useState(false)
@@ -1239,6 +1240,55 @@ function App() {
     }
   };
 
+  const handleSetPrimaryThumbnail = async (imgUrl) => {
+    if (!currentVideoId) {
+      alert('Vui lòng chọn video trước khi thay đổi ảnh thumbnail chính.');
+      return;
+    }
+    try {
+      const res = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/set-primary-thumbnail`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thumbnail_url: imgUrl })
+      });
+      const data = await res.json();
+      if (data.success && data.script) {
+        setResultText(data.script);
+        await fetchSavedVideos(currentPage, publishFilter);
+      } else {
+        alert('Lỗi đặt ảnh chính: ' + (data.detail || data.error || 'Thao tác không thành công'));
+      }
+    } catch {
+      alert('Không thể kết nối Backend.');
+    }
+  };
+
+  const handleRemoveThumbnail = async (imgUrl) => {
+    if (!currentVideoId) {
+      alert('Vui lòng chọn video trước khi xóa ảnh.');
+      return;
+    }
+    if (!window.confirm('Bạn có chắc chắn muốn xóa ảnh phương án này khỏi kịch bản?')) {
+      return;
+    }
+    try {
+      const res = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/remove-thumbnail`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thumbnail_url: imgUrl })
+      });
+      const data = await res.json();
+      if (data.success && data.script) {
+        setResultText(data.script);
+        await fetchSavedVideos(currentPage, publishFilter);
+      } else {
+        alert('Lỗi xóa ảnh: ' + (data.detail || data.error || 'Thao tác không thành công'));
+      }
+    } catch {
+      alert('Không thể kết nối Backend.');
+    }
+  };
+
   const handleGenerateChapters = async () => {
     if (!currentVideoId || chatGptControlsDisabled) return;
     const requestedVideoId = currentVideoId;
@@ -1689,6 +1739,70 @@ function App() {
       alert('Lỗi dừng render: ' + error.message);
     } finally {
       setIsCancelingRender(false);
+    }
+  };
+
+  const handleExecuteRegenerateIntro = async (keepSuccessful = true) => {
+    if (!currentVideoId || isRendering || currentVideoIsError) return;
+    setIntroRegenDialog(prev => ({ ...(prev || {}), isSubmitting: true, error: '' }));
+    setIsRendering(true);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/regenerate-intro-videos`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ keep_successful: keepSuccessful })
+        }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể tạo lại video intro.');
+      }
+      setIntroRegenDialog(null);
+      alert(data.message || 'Đã bắt đầu tạo lại video intro.');
+      const statusRes = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/render-status`);
+      if (statusRes.ok) {
+        const statusData = await statusRes.json();
+        setRenderInfo(statusData);
+      }
+    } catch (error) {
+      setIntroRegenDialog(prev => ({ ...(prev || {}), isSubmitting: false, error: error.message }));
+      alert('Lỗi tạo lại video intro: ' + error.message);
+    } finally {
+      setIsRendering(false);
+    }
+  };
+
+  const handleIntroReviewDecision = async (action, keepSuccessful = true) => {
+    if (!currentVideoId || isRendering || currentVideoIsError) return;
+    setIntroRegenDialog(prev => ({ ...(prev || {}), isSubmitting: true, error: '' }));
+    setIsRendering(true);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/intro-review/decision`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action, keep_successful: keepSuccessful })
+        }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể thực hiện lựa chọn duyệt.');
+      }
+      setIntroRegenDialog(null);
+      alert(data.message || 'Đã cập nhật trạng thái duyệt intro.');
+      const statusRes = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/render-status`);
+      if (statusRes.ok) {
+        const statusData = await statusRes.json();
+        setRenderInfo(statusData);
+      }
+    } catch (error) {
+      setIntroRegenDialog(prev => ({ ...(prev || {}), isSubmitting: false, error: error.message }));
+      alert('Lỗi duyệt intro: ' + error.message);
+    } finally {
+      setIsRendering(false);
     }
   };
 
@@ -3771,7 +3885,58 @@ function App() {
                                     )}
                                   </div>
                                 </div>
-                                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                                {(renderInfo?.current_stage === 'intro_fallback_review' || renderInfo?.current_stage === 'flow_reconcile_stalled') && (
+                                    <div style={{
+                                      width: '100%',
+                                      marginBottom: '10px',
+                                      padding: '10px 14px',
+                                      background: 'rgba(230, 126, 34, 0.15)',
+                                      border: '1px solid #e67e22',
+                                      borderRadius: '6px',
+                                      color: '#f39c12'
+                                    }}>
+                                      <div style={{ fontWeight: 'bold', fontSize: '0.9em', marginBottom: '4px' }}>
+                                        ⚠️ Cảnh báo chất lượng Intro: Toàn bộ video intro đều thất bại (đang dùng ảnh tĩnh)
+                                      </div>
+                                      <div style={{ fontSize: '0.82em', color: '#ecf0f1', marginBottom: '8px' }}>
+                                        Hệ thống đã dừng lại chờ bạn duyệt. Bạn có thể thử tạo lại video intro hoặc chấp nhận dùng ảnh tĩnh để tiếp tục dựng MP4.
+                                      </div>
+                                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                                        <button
+                                          onClick={() => setIntroRegenDialog({ videoId: currentVideoId, videoTitle: videoTitle || `Video #${currentVideoId}`, keepSuccessful: true, isSubmitting: false, error: '', actionSource: 'review' })}
+                                          disabled={isRendering}
+                                          style={{
+                                            background: 'linear-gradient(135deg, #9b59b6, #8e44ad)',
+                                            color: '#fff',
+                                            border: 'none',
+                                            padding: '4px 12px',
+                                            borderRadius: '4px',
+                                            fontSize: '0.82em',
+                                            fontWeight: 'bold',
+                                            cursor: 'pointer'
+                                          }}
+                                        >
+                                          🔄 Thử tạo lại Video Intro
+                                        </button>
+                                        <button
+                                          onClick={() => handleIntroReviewDecision('accept_fallback')}
+                                          disabled={isRendering}
+                                          style={{
+                                            background: 'rgba(255, 255, 255, 0.1)',
+                                            border: '1px solid #bdc3c7',
+                                            color: '#ecf0f1',
+                                            padding: '4px 12px',
+                                            borderRadius: '4px',
+                                            fontSize: '0.82em',
+                                            cursor: 'pointer'
+                                          }}
+                                        >
+                                          ✅ Dùng ảnh tĩnh & Tiếp tục Dựng MP4
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+                                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
                                   {isRenderActive ? (
                                     <>
                                       <button
@@ -3841,6 +4006,27 @@ function App() {
                                       >
                                         ▶️ Tiếp tục
                                       </button>
+                                      <button
+                                        className="btn-secondary"
+                                        onClick={() => handleIntroReviewDecision('accept_fallback')}
+                                        disabled={isRendering || currentVideoIsError}
+                                        title="Dựng thành phẩm MP4 ngay lập tức (sử dụng 3 video đã có + ảnh tĩnh cho các cảnh còn thiếu)"
+                                        style={{
+                                          padding: '4px 14px',
+                                          fontSize: '0.82em',
+                                          background: 'linear-gradient(135deg, #27ae60, #2ecc71)',
+                                          cursor: 'pointer',
+                                          fontWeight: 'bold',
+                                          borderRadius: '4px',
+                                          border: 'none',
+                                          color: '#fff',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }}
+                                      >
+                                        ✅ Dựng MP4 ngay
+                                      </button>
                                       {renderInfo?.render_mode !== 'stock_video' && (
                                         <button
                                           className="btn-secondary"
@@ -3868,6 +4054,29 @@ function App() {
                                           }}
                                         >
                                           🎯 Tạo lại từ cảnh...
+                                        </button>
+                                      )}
+                                      {renderInfo?.render_mode !== 'stock_video' && (
+                                        <button
+                                          className="btn-secondary"
+                                          onClick={() => setIntroRegenDialog({ videoId: currentVideoId, videoTitle: videoTitle || `Video #${currentVideoId}`, keepSuccessful: true, isSubmitting: false, error: '', actionSource: 'direct' })}
+                                          disabled={isRendering || currentVideoIsError}
+                                          title="Tạo lại riêng các video intro (giữ nguyên ảnh thân bài)"
+                                          style={{
+                                            padding: '4px 14px',
+                                            fontSize: '0.82em',
+                                            background: 'rgba(155, 89, 182, 0.15)',
+                                            border: '1px solid #9b59b6',
+                                            color: '#c39bd3',
+                                            cursor: 'pointer',
+                                            fontWeight: 'bold',
+                                            borderRadius: '4px',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '4px'
+                                          }}
+                                        >
+                                          🎬 Tạo lại Intro
                                         </button>
                                       )}
                                       <button
@@ -4052,6 +4261,52 @@ function App() {
                                       {renderInfo?.render_mode !== 'stock_video' && (
                                         <button
                                           className="btn-secondary"
+                                          onClick={() => handleIntroReviewDecision('accept_fallback')}
+                                          disabled={isRendering || currentVideoIsError}
+                                          title="Dựng thành phẩm MP4 ngay lập tức (dùng các video đã có + ảnh tĩnh cho các cảnh còn thiếu)"
+                                          style={{
+                                            padding: '4px 14px',
+                                            fontSize: '0.82em',
+                                            background: 'linear-gradient(135deg, #27ae60, #2ecc71)',
+                                            cursor: 'pointer',
+                                            fontWeight: 'bold',
+                                            borderRadius: '4px',
+                                            border: 'none',
+                                            color: '#fff',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '4px'
+                                          }}
+                                        >
+                                          ✅ Dựng MP4 ngay
+                                        </button>
+                                      )}
+                                      {renderInfo?.render_mode !== 'stock_video' && (
+                                        <button
+                                          className="btn-secondary"
+                                          onClick={() => setIntroRegenDialog({ videoId: currentVideoId, videoTitle: videoTitle || `Video #${currentVideoId}`, keepSuccessful: true, isSubmitting: false, error: '', actionSource: 'direct' })}
+                                          disabled={isRendering || currentVideoIsError}
+                                          title="Tạo lại riêng các video intro (giữ nguyên ảnh thân bài)"
+                                          style={{
+                                            padding: '4px 14px',
+                                            fontSize: '0.82em',
+                                            background: 'rgba(155, 89, 182, 0.15)',
+                                            border: '1px solid #9b59b6',
+                                            color: '#c39bd3',
+                                            cursor: 'pointer',
+                                            fontWeight: 'bold',
+                                            borderRadius: '4px',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '4px'
+                                          }}
+                                        >
+                                          🎬 Tạo lại Intro
+                                        </button>
+                                      )}
+                                      {renderInfo?.render_mode !== 'stock_video' && (
+                                        <button
+                                          className="btn-secondary"
                                           onClick={() => setSceneResetDialog({
                                             videoId: currentVideoId,
                                             videoTitle: videoTitle || `Video #${currentVideoId}`,
@@ -4174,11 +4429,41 @@ function App() {
                                         const fileName = `${isWithoutText ? 'thumbnail-khong-chu' : 'thumbnail-co-chu'}-${i + 1}.png`;
                                         return (
                                         <div key={i} style={{ position: 'relative' }}>
-                                          {extractedImages.length > 1 && (
-                                            <div style={{ color: '#bbb', fontWeight: 600, marginBottom: '7px' }}>
-                                              Phương án {i + 1}
+                                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '7px' }}>
+                                            <div style={{ color: '#bbb', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                              {extractedImages.length > 1 ? `Phương án ${i + 1}` : 'Ảnh thumbnail'}
+                                              {i === 0 ? (
+                                                <span style={{ background: '#27ae60', color: 'white', padding: '2px 8px', borderRadius: '4px', fontSize: '0.75em' }}>
+                                                  ⭐ Ảnh chính
+                                                </span>
+                                              ) : (
+                                                <button
+                                                  onClick={() => handleSetPrimaryThumbnail(img)}
+                                                  style={{
+                                                    background: '#2980b9', color: 'white', border: 'none',
+                                                    padding: '2px 8px', borderRadius: '4px', fontSize: '0.75em',
+                                                    cursor: 'pointer', fontWeight: 600
+                                                  }}
+                                                  title="Đưa ảnh này lên vị trí đầu tiên để hệ thống render và xuất bản dùng ảnh này"
+                                                >
+                                                  ⭐ Đặt làm ảnh chính
+                                                </button>
+                                              )}
                                             </div>
-                                          )}
+                                            {extractedImages.length > 1 && (
+                                              <button
+                                                onClick={() => handleRemoveThumbnail(img)}
+                                                style={{
+                                                  background: 'rgba(231,76,60,0.2)', color: '#e74c3c', border: '1px solid #e74c3c',
+                                                  padding: '2px 8px', borderRadius: '4px', fontSize: '0.75em',
+                                                  cursor: 'pointer'
+                                                }}
+                                                title="Xóa phương án này khỏi kịch bản"
+                                              >
+                                                🗑️ Xóa ảnh này
+                                              </button>
+                                            )}
+                                          </div>
                                           <img
                                             src={imgSrc}
                                             alt={`${section.title} - Phương án ${i + 1}`}
@@ -4550,6 +4835,123 @@ function App() {
           </form>
         </div>
       )}
+        {introRegenDialog && (
+          <div
+            className="dialog-backdrop"
+            onClick={(e) => {
+              if (e.target === e.currentTarget && !introRegenDialog.isSubmitting) {
+                setIntroRegenDialog(null)
+              }
+            }}
+            style={{
+              position: 'fixed', inset: 0, zIndex: 1000,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              padding: '20px', background: 'rgba(0, 0, 0, 0.75)'
+            }}
+          >
+            <form
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="intro-regen-dialog-title"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (introRegenDialog.actionSource === 'review') {
+                  handleIntroReviewDecision('retry_intro', introRegenDialog.keepSuccessful);
+                } else {
+                  handleExecuteRegenerateIntro(introRegenDialog.keepSuccessful);
+                }
+              }}
+              style={{
+                width: 'min(540px, 100%)', padding: '24px', borderRadius: '14px',
+                border: '1px solid rgba(155, 89, 182, 0.6)', background: '#17121b',
+                boxShadow: '0 24px 80px rgba(0, 0, 0, 0.65)'
+              }}
+            >
+              <h3 id="intro-regen-dialog-title" style={{ margin: '0 0 8px', color: '#c39bd3', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                🎬 Tùy chọn tạo lại Video Intro
+              </h3>
+              <p style={{ margin: '0 0 16px', color: '#ccc', fontSize: '0.9em', lineHeight: 1.45 }}>
+                {introRegenDialog.videoTitle}
+              </p>
+              
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '16px' }}>
+                <label style={{
+                  display: 'flex', alignItems: 'flex-start', gap: '12px', padding: '12px 14px',
+                  borderRadius: '8px', cursor: 'pointer',
+                  border: introRegenDialog.keepSuccessful ? '1px solid #9b59b6' : '1px solid #333',
+                  background: introRegenDialog.keepSuccessful ? 'rgba(155, 89, 182, 0.15)' : '#201a24'
+                }}>
+                  <input
+                    type="radio"
+                    name="keepIntroSuccess"
+                    checked={introRegenDialog.keepSuccessful === true}
+                    onChange={() => setIntroRegenDialog(prev => ({ ...prev, keepSuccessful: true }))}
+                    disabled={introRegenDialog.isSubmitting}
+                    style={{ marginTop: '3px' }}
+                  />
+                  <div>
+                    <div style={{ fontWeight: 'bold', color: '#ecf0f1', fontSize: '0.95em' }}>
+                      ✨ Giữ lại các cảnh đã tạo thành công (Khuyến nghị)
+                    </div>
+                    <div style={{ color: '#aaa', fontSize: '0.82em', marginTop: '2px', lineHeight: 1.35 }}>
+                      Chỉ tạo lại các cảnh intro bị lỗi hoặc thiếu video. Tiết kiệm tối đa thời gian và hạn mức Google Flow.
+                    </div>
+                  </div>
+                </label>
+
+                <label style={{
+                  display: 'flex', alignItems: 'flex-start', gap: '12px', padding: '12px 14px',
+                  borderRadius: '8px', cursor: 'pointer',
+                  border: !introRegenDialog.keepSuccessful ? '1px solid #e74c3c' : '1px solid #333',
+                  background: !introRegenDialog.keepSuccessful ? 'rgba(231, 76, 60, 0.15)' : '#201a24'
+                }}>
+                  <input
+                    type="radio"
+                    name="keepIntroSuccess"
+                    checked={introRegenDialog.keepSuccessful === false}
+                    onChange={() => setIntroRegenDialog(prev => ({ ...prev, keepSuccessful: false }))}
+                    disabled={introRegenDialog.isSubmitting}
+                    style={{ marginTop: '3px' }}
+                  />
+                  <div>
+                    <div style={{ fontWeight: 'bold', color: '#ecf0f1', fontSize: '0.95em' }}>
+                      🔄 Xóa toàn bộ & Tạo mới 100% Intro
+                    </div>
+                    <div style={{ color: '#aaa', fontSize: '0.82em', marginTop: '2px', lineHeight: 1.35 }}>
+                      Xóa tất cả các video intro cũ và tạo mới lại từ Scene 0 đến Scene cuối của intro.
+                    </div>
+                  </div>
+                </label>
+              </div>
+
+              {introRegenDialog.error && (
+                <p role="alert" style={{ margin: '12px 0 0', color: '#ff6b6b', lineHeight: 1.4 }}>
+                  {introRegenDialog.error}
+                </p>
+              )}
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  disabled={introRegenDialog.isSubmitting}
+                  onClick={() => setIntroRegenDialog(null)}
+                >
+                  Hủy
+                </button>
+                <button
+                  type="submit"
+                  className="btn-run"
+                  disabled={introRegenDialog.isSubmitting}
+                  style={{ width: 'auto', padding: '10px 20px', background: 'linear-gradient(135deg, #9b59b6, #8e44ad)', color: '#fff', fontWeight: 'bold' }}
+                >
+                  {introRegenDialog.isSubmitting ? '⏳ Đang khởi chạy...' : '🚀 Bắt đầu tạo lại'}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
         {sceneResetDialog && (
           <div
             className="dialog-backdrop"

@@ -935,7 +935,9 @@ def get_existing_thumbnail_identities(page: Page) -> set[str]:
     """Collect image identities currently visible in the DOM before sending a prompt."""
     try:
         scroll_chatgpt_conversation_to_bottom(page)
-        images = page.locator(THUMBNAIL_IMAGE_SELECTOR)
+        images = page.locator(
+            f'{THUMBNAIL_IMAGE_SELECTOR}, main img, [role="main"] img, article img'
+        )
         if images.count() == 0:
             return set()
         image_snapshots = images.evaluate_all(
@@ -1025,22 +1027,31 @@ def wait_for_thumbnail_images(
         try:
             image_snapshots = images.evaluate_all(
                 """
-                elements => elements.map(image => {
-                    const src = image.getAttribute('src') || image.currentSrc || '';
-                    const isUser = Boolean(image.closest('[data-message-author-role="user"], [data-user-message-bubble="true"], [class*="group/user-message"], .bg-user-message'));
-                    const width = image.naturalWidth || image.width || 0;
-                    const height = image.naturalHeight || image.height || 0;
-                    return {
-                        src: src,
-                        ready: Boolean(
-                            src
-                            && image.complete
-                            && width >= 200
-                            && height >= 200
-                            && !isUser
-                        ),
-                    };
-                })
+                elements => {
+                    const userEls = Array.from(document.querySelectorAll(
+                        '[data-message-author-role="user"], [data-user-message-bubble="true"], [class*="group/user-message"], .bg-user-message, article:has([data-message-author-role="user"])'
+                    ));
+                    const lastUserEl = userEls.length > 0 ? userEls[userEls.length - 1] : null;
+
+                    return elements.map(image => {
+                        const src = image.getAttribute('src') || image.currentSrc || '';
+                        const isUser = Boolean(image.closest('[data-message-author-role="user"], [data-user-message-bubble="true"], [class*="group/user-message"], .bg-user-message'));
+                        const isAfterLastUser = !lastUserEl || Boolean(lastUserEl.compareDocumentPosition(image) & Node.DOCUMENT_POSITION_FOLLOWING);
+                        const width = image.naturalWidth || image.width || 0;
+                        const height = image.naturalHeight || image.height || 0;
+                        return {
+                            src: src,
+                            ready: Boolean(
+                                src
+                                && image.complete
+                                && width >= 200
+                                && height >= 200
+                                && !isUser
+                                && isAfterLastUser
+                            ),
+                        };
+                    });
+                }
                 """
             )
             generation_active = is_chatgpt_generation_active(page)

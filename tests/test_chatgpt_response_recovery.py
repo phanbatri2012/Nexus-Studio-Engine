@@ -645,6 +645,16 @@ def test_generate_thumbnails_request_default_attach_references():
     assert req.attach_references is False
 
 
+def test_set_primary_thumbnail_and_remove_models():
+    from nexus_engine.main import SetPrimaryThumbnailRequest, RemoveThumbnailRequest
+    req1 = SetPrimaryThumbnailRequest(thumbnail_url="/api/thumbnails/thumb_123.png")
+    assert req1.thumbnail_url == "/api/thumbnails/thumb_123.png"
+    assert req1.section == "auto"
+
+    req2 = RemoveThumbnailRequest(thumbnail_url="/api/thumbnails/thumb_123.png")
+    assert req2.thumbnail_url == "/api/thumbnails/thumb_123.png"
+
+
 
 
 

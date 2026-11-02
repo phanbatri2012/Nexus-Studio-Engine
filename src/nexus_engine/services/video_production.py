@@ -1023,6 +1023,60 @@ def purge_scene_artifacts_from_index(video_id: int, from_index: int) -> int:
     return removed_count
 
 
+def purge_intro_video_artifacts(video_id: int, *, keep_successful: bool = True) -> int:
+    """Purge ONLY scene_video:* artifacts and flow_media_manifest for intro regeneration,
+    leaving all base scene images (scene:*) intact.
+
+    Args:
+        video_id: Target video ID.
+        keep_successful: If True, retains existing completed scene_video artifacts with valid files
+            on disk, purging only failed/missing ones. If False, purges all scene_video artifacts.
+    """
+    artifacts = list(db.list_video_artifacts(video_id, "scene_video:"))
+    removed_count = 0
+    for art in artifacts:
+        art_path = art.get("path")
+        status = str(art.get("status") or "")
+        if keep_successful and status == "completed":
+            if art_path and Path(art_path).is_file() and Path(art_path).stat().st_size > 1000:
+                continue
+
+        if art_path:
+            try:
+                Path(art_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if art.get("id"):
+            db.delete_video_artifact(art["id"])
+            removed_count += 1
+
+    # Also purge flow_media_manifest and final_mp4 so media will be reconciled/rebuilt
+    manifest = db.get_latest_video_artifact(video_id, "flow_media_manifest")
+    if manifest:
+        man_path = manifest.get("path")
+        if man_path:
+            try:
+                Path(man_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if manifest.get("id"):
+            db.delete_video_artifact(manifest["id"])
+
+    final_mp4 = db.get_latest_video_artifact(video_id, "final_mp4")
+    if final_mp4:
+        mp4_path = final_mp4.get("path")
+        if mp4_path:
+            try:
+                Path(mp4_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if final_mp4.get("id"):
+            db.delete_video_artifact(final_mp4["id"])
+
+    logger.info("Purged %d intro scene_video artifacts for video %s (keep_successful=%s)", removed_count, video_id, keep_successful)
+    return removed_count
+
+
 def purge_video_render_artifacts(video_id: int) -> dict:
     """Purge all rendered MP4/video files from disk and database for a clean re-creation."""
     purged_files: list[str] = []
@@ -3630,7 +3684,7 @@ def generate_scene_media(
                             },
                         )
             summary["fallback_count"] = len(summary["fallback_scenes"])
-            MAX_RECONCILE_POLLS = 5
+            MAX_RECONCILE_POLLS = 20
             expired_poll_videos = [
                 item for item in list(pending_videos)
                 if int(item.get("reconciliation_poll_count") or 0) >= MAX_RECONCILE_POLLS
@@ -5398,6 +5452,133 @@ def prepare_google_flow_media(
     }
 
 
+def materialize_flow_media_manifest_with_fallbacks(
+    video_id: int,
+    snapshot: dict | None = None,
+    progress=None,
+) -> dict:
+    """Tạo hoặc khôi phục flow_media_manifest từ các scene image và video clip sẵn có trên đĩa.
+
+    Tất cả các cảnh intro yêu cầu video mà chưa hoàn tất hoặc bị lỗi sẽ được
+    fallback sang ảnh tĩnh tương ứng, cho phép dựng MP4 ngay lập tức mà không
+    cần đợi đối soát thêm.
+    """
+    if progress is None:
+        progress = lambda *a, **kw: None
+
+    if not snapshot:
+        video = db.get_video(video_id)
+        prompt_version = (video or {}).get("prompt_version") or ""
+        from nexus_engine.main import _get_prompt_production_snapshot
+        snapshot = _get_prompt_production_snapshot(prompt_version)
+
+    prepared = prepare_visual_plan_inputs(video_id, snapshot, progress)
+    plan_artifact, plan_payload = load_visual_scene_plan(video_id)
+    if plan_artifact.get("content_hash") != prepared["plan_hash"]:
+        raise VideoProductionError(
+            "Kế hoạch cảnh đã thay đổi; không thể tạo manifest Google Flow."
+        )
+    validated_plan = validate_visual_scene_plan(
+        plan_payload,
+        prepared["windows"],
+    )
+    scenes = validated_plan["scenes"]
+    if not scenes:
+        raise VideoProductionError("Kế hoạch cảnh không có dữ liệu phân cảnh.")
+
+    artifacts = db.list_video_artifacts(video_id)
+    artifact_map = {str(a.get("artifact_type") or ""): a for a in artifacts}
+
+    media_paths: list[Path] = []
+    fallback_image_paths: list[Path | None] = []
+    fallback_scenes: list[dict] = []
+    requested_count = 0
+    generated_count = 0
+
+    for idx, scene in enumerate(scenes):
+        scene_index = int(scene.get("index", idx))
+        img_art = artifact_map.get(f"scene:{scene_index}")
+        img_path = Path(img_art.get("path") or "") if img_art else None
+        if not img_path or not img_path.is_file() or img_path.stat().st_size <= 0:
+            raise VideoProductionError(
+                f"Cảnh {scene_index + 1} chưa có ảnh cơ sở hợp lệ trên đĩa; không thể dựng MP4."
+            )
+
+        is_video_scene = bool(scene.get("is_video") or scene.get("media_type") == "video")
+        if is_video_scene:
+            requested_count += 1
+            vid_art = artifact_map.get(f"scene_video:{scene_index}")
+            vid_path = Path(vid_art.get("path") or "") if vid_art else None
+            has_valid_video = bool(
+                vid_art
+                and vid_art.get("status") == "completed"
+                and vid_path
+                and vid_path.is_file()
+                and vid_path.stat().st_size > 0
+            )
+            if has_valid_video:
+                generated_count += 1
+                media_paths.append(vid_path)
+                fallback_image_paths.append(img_path)
+            else:
+                media_paths.append(img_path)
+                fallback_image_paths.append(img_path)
+                fallback_scenes.append(
+                    {
+                        "scene_index": scene_index,
+                        "failure_stage": "user_fallback",
+                        "reason_code": "user_accepted_fallback",
+                    }
+                )
+                if vid_art and vid_art.get("status") in {"queued", "running", "retry_wait", "processing"}:
+                    db.upsert_video_artifact(
+                        video_id=video_id,
+                        artifact_type=f"scene_video:{scene_index}",
+                        path=str(vid_art.get("path") or ""),
+                        content_hash=str(vid_art.get("content_hash") or ""),
+                        status="failed",
+                        mime_type="video/mp4",
+                        metadata={
+                            **(vid_art.get("metadata") or {}),
+                            "failure_stage": "user_fallback",
+                            "reason_code": "user_accepted_fallback",
+                            "terminal": True,
+                        },
+                    )
+        else:
+            media_paths.append(img_path)
+            fallback_image_paths.append(None)
+
+    intro_video_summary = _normalize_intro_video_summary(
+        {
+            "enabled": requested_count > 0,
+            "requested_count": requested_count,
+            "generated_count": generated_count,
+            "fallback_count": len(fallback_scenes),
+            "fallback_scenes": fallback_scenes,
+        }
+    )
+
+    saved = save_flow_media_manifest(
+        video_id=video_id,
+        plan_hash=prepared["plan_hash"],
+        caption_hash=prepared["caption_hash"],
+        scenes=scenes,
+        visual_bible=validated_plan.get("visual_bible") or {},
+        media_paths=media_paths,
+        fallback_image_paths=fallback_image_paths,
+        intro_video_summary=intro_video_summary,
+    )
+    progress("Đã tổng hợp manifest media sẵn sàng dựng MP4", "flow_media_ready")
+    return {
+        "manifest_artifact": saved["artifact"],
+        "manifest": saved["manifest"],
+        "plan_hash": prepared["plan_hash"],
+        "scene_count": len(scenes),
+        "intro_video_summary": intro_video_summary,
+    }
+
+
 def render_prepared_google_flow_video(
     video_id: int,
     snapshot: dict,
@@ -5414,15 +5595,26 @@ def render_prepared_google_flow_video(
         plan_payload,
         prepared["windows"],
     )
-    _, manifest = load_flow_media_manifest(video_id)
-    if manifest.get("plan_hash") != prepared["plan_hash"]:
-        raise VideoProductionError(
-            "Manifest media không khớp kế hoạch cảnh hiện tại."
+    try:
+        _, manifest = load_flow_media_manifest(video_id)
+    except VideoProductionError:
+        manifest = None
+
+    if (
+        not manifest
+        or manifest.get("plan_hash") != prepared["plan_hash"]
+        or manifest.get("caption_hash") != prepared["caption_hash"]
+    ):
+        logger.info(
+            "flow_media_manifest chưa sẵn sàng hoặc không khớp hash cho video %s; tự động dựng manifest từ scene artifacts.",
+            video_id,
         )
-    if manifest.get("caption_hash") != prepared["caption_hash"]:
-        raise VideoProductionError(
-            "Phụ đề đã thay đổi; cần chuẩn bị lại media trước khi render."
+        materialized = materialize_flow_media_manifest_with_fallbacks(
+            video_id=video_id,
+            snapshot=snapshot,
+            progress=progress,
         )
+        manifest = materialized["manifest"]
 
     scenes = validated_plan["scenes"]
     media_entries = manifest.get("media") or []

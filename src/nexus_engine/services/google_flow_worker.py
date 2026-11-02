@@ -2625,7 +2625,7 @@ class GoogleFlowWorker:
                             queued = true;
                         }
                         const nodes = Array.from(agent.querySelectorAll(
-                            'flow-media-tile, flow-canvas-tile, flow-canvas-item, ' +
+                            'flow-video-tile, flow-a2ui-video-option, flow-media-tile, flow-canvas-tile, flow-canvas-item, ' +
                             '[data-testid*="media" i], .media-card, .canvas-tile, ' +
                             'video, source[src], ' +
                             '[data-video-url], [data-media-url], [data-download-url], ' +
@@ -2642,11 +2642,15 @@ class GoogleFlowWorker:
                                 if (!url || url.startsWith('data:')) return;
                                 if (!matchUrls.includes(url)) matchUrls.push(url);
                                 const lower = url.toLowerCase();
+                                const isMediaStream = lower.includes('=mm,') || lower.includes('/videoplayback');
                                 const videoUrl = lower.startsWith('blob:') ||
                                     /\.(?:mp4|webm|mov)(?:\?|$)/i.test(url) ||
-                                    lower.includes('/videoplayback') || lower.includes('/video/');
-                                const imageUrl = /\.(?:png|jpe?g|webp|gif)(?:\?|$)/i.test(url) ||
-                                    lower.includes('/image/') || lower.includes('/asb/');
+                                    isMediaStream || lower.includes('/video/');
+                                const imageUrl = !isMediaStream && (
+                                    /\.(?:png|jpe?g|webp|gif)(?:\?|$)/i.test(url) ||
+                                    lower.includes('/image/') ||
+                                    (lower.includes('/asb/') && !playable && !videoUrl)
+                                );
                                 if ((playable || videoUrl) && !imageUrl && !urls.includes(url)) {
                                     urls.push(url);
                                 }

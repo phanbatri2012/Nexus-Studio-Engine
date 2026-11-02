@@ -7053,6 +7053,35 @@ def _execute_flow_media_generation_job(job: dict) -> None:
         result_json=result,
         finished_at=db.utc_now(),
     )
+
+    requested_count = int(intro_summary.get("requested_count") or 0)
+    generated_count = int(intro_summary.get("generated_count") or 0)
+    if requested_count > 0 and generated_count == 0:
+        review_progress = (
+            f"Toàn bộ {requested_count} video intro đều thất bại (đang dùng ảnh tĩnh). "
+            "Cần duyệt thủ công trước khi xuất MP4."
+        )
+        db.update_system_job(
+            job["id"],
+            status="completed",
+            progress=review_progress,
+            result_json=result,
+            finished_at=db.utc_now(),
+        )
+        db.update_video_production_state(
+            video_id,
+            render_status="pending_review",
+            current_stage="intro_fallback_review",
+            production_progress=review_progress,
+            blocking_reason="intro_all_images_fallback",
+        )
+        logger.warning(
+            "Video %s: Toàn bộ %d video intro đều thất bại; dừng ở intro_fallback_review chờ người dùng duyệt.",
+            video_id,
+            requested_count,
+        )
+        return
+
     # Chi enqueue render sau khi job media da completed
     render_job, _ = _enqueue_video_render_job(
         video_id=video_id,
@@ -13361,6 +13390,111 @@ async def generate_thumbnails_endpoint(req: GenerateThumbnailsRequest, backgroun
         _finish_chatgpt_operation()
 
 
+class SetPrimaryThumbnailRequest(BaseModel):
+    thumbnail_url: str = Field(min_length=1, max_length=1024)
+    section: Optional[str] = Field(default="auto")
+
+
+class RemoveThumbnailRequest(BaseModel):
+    thumbnail_url: str = Field(min_length=1, max_length=1024)
+
+
+@app.post("/api/videos/{video_id}/set-primary-thumbnail")
+def set_primary_thumbnail_endpoint(video_id: int, req: SetPrimaryThumbnailRequest):
+    video = _require_actionable_video(video_id)
+    script = video.get("generated_script") or ""
+    if not script:
+        raise HTTPException(status_code=400, detail="Video không có kịch bản.")
+
+    target_url = req.thumbnail_url.strip()
+    target_clean = target_url
+    if "/api/thumbnails/" in target_clean:
+        target_clean = "/api/thumbnails/" + target_clean.split("/api/thumbnails/", 1)[1]
+
+    sections = ["THUMBNAIL KHÔNG CHỮ", "THUMBNAIL CÓ CHỮ", "THUMBNAIL"]
+    modified = False
+
+    for sec_name in sections:
+        pattern = rf"(###\s*\[{re.escape(sec_name)}\]\s*\n)(.*?)(?=\n###\s*\[|\Z)"
+        match = re.search(pattern, script, flags=re.DOTALL | re.IGNORECASE)
+        if not match:
+            continue
+        header = match.group(1)
+        body = match.group(2)
+        urls = re.findall(r"\[IMAGE_URL:([^\]]+)\]", body)
+        if not urls:
+            continue
+
+        normalized_urls = []
+        for u in urls:
+            u_clean = u.strip()
+            if "/api/thumbnails/" in u_clean:
+                u_clean = "/api/thumbnails/" + u_clean.split("/api/thumbnails/", 1)[1]
+            normalized_urls.append(u_clean)
+
+        if target_clean in normalized_urls:
+            new_urls = [target_clean] + [u for u in normalized_urls if u != target_clean]
+            prompt_only = re.sub(r"\[IMAGE_URL:.*?\]", "", body).strip()
+            image_markers = "\n\n".join(f"[IMAGE_URL:{u}]" for u in new_urls)
+            new_body = f"{prompt_only}\n\n{image_markers}\n" if prompt_only else f"{image_markers}\n"
+            script = script[:match.start()] + f"{header}{new_body}" + script[match.end():]
+            modified = True
+
+    if not modified:
+        raise HTTPException(status_code=404, detail="Không tìm thấy thumbnail trong kịch bản để đặt làm ảnh chính.")
+
+    db.update_script(video_id, script)
+
+    filename = Path(target_clean).name
+    cand_path = THUMBNAILS_DIR / filename
+    if cand_path.is_file() and cand_path.stat().st_size > 0:
+        s0 = db.get_latest_video_artifact(video_id, "scene:0")
+        if s0 and s0.get("id"):
+            meta = s0.get("metadata_json") or "{}"
+            try:
+                m_dict = json.loads(meta) if isinstance(meta, str) else dict(meta)
+                m_dict["reference_path"] = str(cand_path)
+                m_dict["reference_hash"] = hashlib.sha256(cand_path.read_bytes()).hexdigest()
+                db.upsert_video_artifact(
+                    video_id=video_id,
+                    artifact_type="scene:0",
+                    path=str(s0.get("path") or ""),
+                    content_hash=str(s0.get("content_hash") or ""),
+                    status=str(s0.get("status") or "queued"),
+                    metadata=m_dict,
+                )
+            except Exception as exc:
+                logger.warning("Could not sync scene:0 reference: %s", exc)
+
+    return {"success": True, "script": script}
+
+
+@app.post("/api/videos/{video_id}/remove-thumbnail")
+def remove_thumbnail_endpoint(video_id: int, req: RemoveThumbnailRequest):
+    video = _require_actionable_video(video_id)
+    script = video.get("generated_script") or ""
+    if not script:
+        raise HTTPException(status_code=400, detail="Video không có kịch bản.")
+
+    target_url = req.thumbnail_url.strip()
+    target_clean = target_url
+    if "/api/thumbnails/" in target_clean:
+        target_clean = "/api/thumbnails/" + target_clean.split("/api/thumbnails/", 1)[1]
+
+    filename = Path(target_clean).name
+    pattern = rf"\n*\[IMAGE_URL:[^\]]*{re.escape(filename)}[^\]]*\]"
+    new_script = re.sub(pattern, "", script)
+    if new_script == script:
+        pattern_full = rf"\n*\[IMAGE_URL:{re.escape(target_clean)}\]"
+        new_script = re.sub(pattern_full, "", script)
+
+    if new_script != script:
+        db.update_script(video_id, new_script)
+        return {"success": True, "script": new_script}
+    else:
+        raise HTTPException(status_code=404, detail="Không tìm thấy ảnh để xóa trong kịch bản.")
+
+
 @app.get("/api/videos/{video_id}/audio-review")
 def get_audio_review(video_id: int):
     _require_actionable_video(video_id)
@@ -14203,6 +14337,128 @@ def trigger_render_video(video_id: int, mode: str = "resume"):
     }
 
 
+class RegenerateIntroRequest(BaseModel):
+    keep_successful: bool = True
+
+
+class IntroReviewDecisionRequest(BaseModel):
+    action: str  # "accept_fallback" | "retry_intro"
+    keep_successful: bool = True
+
+
+@app.post("/api/videos/{video_id}/regenerate-intro-videos")
+def trigger_regenerate_intro_videos(video_id: int, request: RegenerateIntroRequest | None = None):
+    keep_successful = request.keep_successful if request is not None else True
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+    if video.get("video_status") == db.VIDEO_STATUS_ERROR:
+        raise HTTPException(status_code=400, detail="Video đang ở trạng thái lỗi.")
+
+    # Check for active conflicting jobs
+    jobs = db.list_system_jobs(video_id=video_id, limit=None)
+    active_jobs = [
+        j for j in jobs
+        if j.get("job_type") in {"flow_media_generation", "muse_media_generation", "video_render"}
+        and j.get("status") in {"queued", "running", "retry_wait"}
+    ]
+    if active_jobs:
+        raise HTTPException(
+            status_code=409,
+            detail="Đang có tiến trình tạo media hoặc dựng video đang chạy; vui lòng hủy trước khi tạo lại intro.",
+        )
+
+    prompt_version = video.get("prompt_version") or ""
+    snapshot = _get_prompt_production_snapshot(prompt_version)
+
+    # 1. Purge intro scene_video artifacts (respecting keep_successful) and flow_media_manifest
+    from nexus_engine.services import video_production
+    purged_count = video_production.purge_intro_video_artifacts(video_id, keep_successful=keep_successful)
+
+    # 2. Enqueue flow media generation job in resume mode
+    job, created = _enqueue_flow_media_job(
+        video_id=video_id,
+        snapshot=snapshot,
+        mode="resume",
+        force_new_project=False,
+    )
+
+    db.update_video_production_state(
+        video_id,
+        render_status="queued",
+        current_stage="flow_media_generation",
+        production_progress="Đang đưa yêu cầu tạo lại video intro vào hàng đợi" + (" (chỉ tạo các cảnh thiếu)" if keep_successful else " (tạo lại toàn bộ)"),
+        blocking_reason="",
+    )
+    _kick_job_queues({"flow_media_generation"})
+
+    mode_desc = f"giữ lại các cảnh hợp lệ và dọn {purged_count} clip lỗi/thiếu để tạo bù" if keep_successful else f"xóa toàn bộ {purged_count} clip intro cũ để tạo lại từ đầu"
+    return {
+        "success": True,
+        "video_id": video_id,
+        "job_id": job["id"],
+        "status": job["status"],
+        "purged_count": purged_count,
+        "keep_successful": keep_successful,
+        "message": f"Đã {mode_desc}.",
+    }
+
+
+@app.post("/api/videos/{video_id}/intro-review/decision")
+def decide_intro_review(video_id: int, request: IntroReviewDecisionRequest):
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+
+    action = str(request.action or "").strip().lower()
+    if action == "retry_intro":
+        return trigger_regenerate_intro_videos(
+            video_id,
+            request=RegenerateIntroRequest(keep_successful=request.keep_successful),
+        )
+    elif action == "accept_fallback":
+        # Cancel any active or paused media generation jobs to prevent conflict
+        for j in db.list_system_jobs(video_id=video_id, limit=None):
+            if j.get("job_type") in {"flow_media_generation", "muse_media_generation"} and j.get("status") in {"queued", "running", "retry_wait", "paused"}:
+                db.update_system_job(j["id"], status="canceled", error="Đã hủy để chuyển sang dựng MP4 theo quyết định của người dùng.")
+
+        prompt_version = video.get("prompt_version") or ""
+        snapshot = _get_prompt_production_snapshot(prompt_version)
+        try:
+            video_production.materialize_flow_media_manifest_with_fallbacks(
+                video_id=video_id,
+                snapshot=snapshot,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Không thể materialize flow manifest khi accept_fallback cho video %s: %s",
+                video_id,
+                exc,
+            )
+        render_job, created = _enqueue_video_render_job(
+            video_id=video_id,
+            snapshot=snapshot,
+            mode="resume",
+        )
+        db.update_video_production_state(
+            video_id,
+            render_status="queued",
+            current_stage="video_render_queue",
+            production_progress="Người dùng đã duyệt dùng ảnh tĩnh cho intro; đang chờ dựng MP4",
+            blocking_reason="",
+        )
+        _kick_job_queues({"video_render"})
+        return {
+            "success": True,
+            "video_id": video_id,
+            "job_id": render_job["id"],
+            "action": "accept_fallback",
+            "message": "Đã chấp nhận ảnh tĩnh và đưa vào hàng đợi dựng MP4.",
+        }
+    else:
+        raise HTTPException(status_code=400, detail=f"Hành động không hợp lệ: {request.action}")
+
+
 @app.post("/api/videos/{video_id}/cancel-render")
 def cancel_render_video(video_id: int):
     video = db.get_video(video_id)
@@ -14586,6 +14842,8 @@ def get_render_status(video_id: int):
     return {
         "video_id": video_id,
         "production_progress": str(video.get("production_progress") or ""),
+        "current_stage": str(video.get("current_stage") or ""),
+        "render_status": str(video.get("render_status") or ""),
         "state": state,
         "phase": phase,
         "render_mode": render_mode,
