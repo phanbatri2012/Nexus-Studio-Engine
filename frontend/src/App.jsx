@@ -243,6 +243,33 @@ function App() {
   const isRenderError = !isRenderActive && !isRenderPaused && Boolean(renderInfo?.is_error || renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
   const isRenderCanceled = !isRenderActive && !isRenderPaused && Boolean(renderInfo?.is_canceled || renderInfo?.job?.status === 'canceled')
   const hasMp4Ready = Boolean(!isRenderActive && !isRenderError && !isRenderCanceled && renderInfo?.has_mp4)
+  const mediaReadiness = renderInfo?.media_readiness
+  let allBaseImagesReady = false
+  let completedIntroVideos = 0
+  let requestedIntroVideos = 0
+
+  if (mediaReadiness) {
+    allBaseImagesReady = Boolean(mediaReadiness.all_base_images_ready)
+    completedIntroVideos = Number(mediaReadiness.completed_intro_videos || 0)
+    requestedIntroVideos = Number(mediaReadiness.requested_intro_videos || 0)
+  } else {
+    const fmp = renderInfo?.job?.flow_media_progress || {}
+    const progText = String(renderInfo?.job?.progress || renderInfo?.production_progress || '')
+    const hasIncompleteImageText = progText.includes('Đã xong') && progText.includes('ảnh')
+    if (fmp.phase === 'videos' || (fmp.images_total > 0 && fmp.images_completed >= fmp.images_total)) {
+      allBaseImagesReady = true
+      completedIntroVideos = Number(fmp.videos_completed || 0)
+      requestedIntroVideos = Number(fmp.videos_total || 0)
+    } else if (fmp.phase === 'images' || hasIncompleteImageText) {
+      allBaseImagesReady = false
+    } else if (renderInfo?.current_stage === 'intro_fallback_review' || renderInfo?.current_stage === 'flow_reconcile_stalled') {
+      allBaseImagesReady = true
+    }
+  }
+
+  const renderFallbackTitle = completedIntroVideos > 0
+    ? `Dựng thành phẩm MP4 ngay lập tức (dùng ${completedIntroVideos}/${requestedIntroVideos} video intro đã có + ảnh tĩnh cho các cảnh còn thiếu)`
+    : 'Dựng thành phẩm MP4 ngay lập tức (dùng ảnh tĩnh cho toàn bộ intro)'
   const [progressMsg, setProgressMsg] = useState('')
   const [queueRefreshKey, setQueueRefreshKey] = useState(0)
   const [currentVideoId, setCurrentVideoId] = useState(null)
@@ -3921,6 +3948,7 @@ function App() {
                                         <button
                                           onClick={() => handleIntroReviewDecision('accept_fallback')}
                                           disabled={isRendering}
+                                          title={renderFallbackTitle}
                                           style={{
                                             background: 'rgba(255, 255, 255, 0.1)',
                                             border: '1px solid #bdc3c7',
@@ -4006,27 +4034,29 @@ function App() {
                                       >
                                         ▶️ Tiếp tục
                                       </button>
-                                      <button
-                                        className="btn-secondary"
-                                        onClick={() => handleIntroReviewDecision('accept_fallback')}
-                                        disabled={isRendering || currentVideoIsError}
-                                        title="Dựng thành phẩm MP4 ngay lập tức (sử dụng 3 video đã có + ảnh tĩnh cho các cảnh còn thiếu)"
-                                        style={{
-                                          padding: '4px 14px',
-                                          fontSize: '0.82em',
-                                          background: 'linear-gradient(135deg, #27ae60, #2ecc71)',
-                                          cursor: 'pointer',
-                                          fontWeight: 'bold',
-                                          borderRadius: '4px',
-                                          border: 'none',
-                                          color: '#fff',
-                                          display: 'inline-flex',
-                                          alignItems: 'center',
-                                          gap: '4px'
-                                        }}
-                                      >
-                                        ✅ Dựng MP4 ngay
-                                      </button>
+                                      {renderInfo?.render_mode !== 'stock_video' && allBaseImagesReady && (
+                                        <button
+                                          className="btn-secondary"
+                                          onClick={() => handleIntroReviewDecision('accept_fallback')}
+                                          disabled={isRendering || currentVideoIsError}
+                                          title={renderFallbackTitle}
+                                          style={{
+                                            padding: '4px 14px',
+                                            fontSize: '0.82em',
+                                            background: 'linear-gradient(135deg, #27ae60, #2ecc71)',
+                                            cursor: 'pointer',
+                                            fontWeight: 'bold',
+                                            borderRadius: '4px',
+                                            border: 'none',
+                                            color: '#fff',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '4px'
+                                          }}
+                                        >
+                                          ✅ Dựng MP4 ngay
+                                        </button>
+                                      )}
                                       {renderInfo?.render_mode !== 'stock_video' && (
                                         <button
                                           className="btn-secondary"
@@ -4056,7 +4086,7 @@ function App() {
                                           🎯 Tạo lại từ cảnh...
                                         </button>
                                       )}
-                                      {renderInfo?.render_mode !== 'stock_video' && (
+                                      {renderInfo?.render_mode !== 'stock_video' && allBaseImagesReady && (
                                         <button
                                           className="btn-secondary"
                                           onClick={() => setIntroRegenDialog({ videoId: currentVideoId, videoTitle: videoTitle || `Video #${currentVideoId}`, keepSuccessful: true, isSubmitting: false, error: '', actionSource: 'direct' })}
@@ -4258,12 +4288,12 @@ function App() {
                                           ? '↻ Tiếp tục từ checkpoint'
                                           : '▶️ Tạo tiếp'}
                                       </button>
-                                      {renderInfo?.render_mode !== 'stock_video' && (
+                                      {renderInfo?.render_mode !== 'stock_video' && allBaseImagesReady && (
                                         <button
                                           className="btn-secondary"
                                           onClick={() => handleIntroReviewDecision('accept_fallback')}
                                           disabled={isRendering || currentVideoIsError}
-                                          title="Dựng thành phẩm MP4 ngay lập tức (dùng các video đã có + ảnh tĩnh cho các cảnh còn thiếu)"
+                                          title={renderFallbackTitle}
                                           style={{
                                             padding: '4px 14px',
                                             fontSize: '0.82em',
@@ -4281,7 +4311,7 @@ function App() {
                                           ✅ Dựng MP4 ngay
                                         </button>
                                       )}
-                                      {renderInfo?.render_mode !== 'stock_video' && (
+                                      {renderInfo?.render_mode !== 'stock_video' && allBaseImagesReady && (
                                         <button
                                           className="btn-secondary"
                                           onClick={() => setIntroRegenDialog({ videoId: currentVideoId, videoTitle: videoTitle || `Video #${currentVideoId}`, keepSuccessful: true, isSubmitting: false, error: '', actionSource: 'direct' })}

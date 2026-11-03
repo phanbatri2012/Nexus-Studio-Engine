@@ -43,3 +43,22 @@ test('shows Google Flow on-demand and idle shutdown states', async () => {
   assert.match(source, /tự tắt sau 5 phút rảnh/)
   assert.match(source, /browserStatus\?\.in_use \|\| browserStatus\?\.generation_active/)
 })
+
+
+test('provides fleet multi-account management and per-model quota checks', async () => {
+  const source = await readFile(new URL('./GoogleFlowLogin.jsx', import.meta.url), 'utf8')
+
+  // Check Quota Buttons
+  assert.match(source, /⚡ Kiểm tra hạn mức/)
+  assert.match(source, /⚡ Check hạn mức tất cả/)
+
+  // Fleet Endpoints
+  assert.match(source, /\/api\/flow\/accounts/)
+  assert.match(source, /\/api\/flow\/check-quota/)
+
+  // Model & Agent coverage
+  assert.match(source, /Flow Creative Agent/)
+  assert.match(source, /Nano Banana 2\.1/)
+  assert.match(source, /Omni 1\.1 Flash/)
+  assert.match(source, /Veo 3\.1 – Quality/)
+})

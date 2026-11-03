@@ -19,6 +19,7 @@ CHROME_USER_DATA_DIR = DATA_DIR / "chrome_user_data"
 
 ACCOUNT_PATH = DATA_DIR / "account.json"
 GOOGLE_FLOW_ACCOUNT_PATH = DATA_DIR / "google_flow_account.json"
+GOOGLE_FLOW_ACCOUNTS_PATH = DATA_DIR / "google_flow_accounts.json"
 PROMPTS_PATH = DATA_DIR / "prompts.json"
 MUSE_SETTINGS_PATH = DATA_DIR / "muse_settings.json"
 MUSE_ACCOUNT_CREDENTIALS_PATH = DATA_DIR / "muse_account_credentials.json"

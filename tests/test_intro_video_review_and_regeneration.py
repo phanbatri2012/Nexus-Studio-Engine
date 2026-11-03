@@ -205,3 +205,30 @@ def test_materialize_flow_media_manifest_with_fallbacks(tmp_path):
         if a.get("id"):
             db.delete_video_artifact(a["id"])
 
+
+
+def test_accept_fallback_rejected_when_base_images_incomplete():
+    from fastapi import HTTPException
+    video_id = db.save_video(
+        url="https://youtube.com/watch?v=testincomplete",
+        title="Test Incomplete Images",
+        transcript="Test transcript",
+        generated_script="Test script",
+        prompt_version="test_v1"
+    )
+    try:
+        # Mock _check_video_media_readiness to report 77/137 images
+        mock_readiness = {
+            "all_base_images_ready": False,
+            "total_scenes": 137,
+            "completed_base_images": 77,
+            "requested_intro_videos": 12,
+            "completed_intro_videos": 0,
+        }
+        with patch("nexus_engine.main._check_video_media_readiness", return_value=mock_readiness):
+            with pytest.raises(HTTPException) as exc_info:
+                decide_intro_review(video_id, IntroReviewDecisionRequest(action="accept_fallback"))
+            assert exc_info.value.status_code == 400
+            assert "Chưa hoàn tất toàn bộ ảnh tĩnh cơ sở (77/137 ảnh)" in exc_info.value.detail
+    finally:
+        db.delete_video(video_id)

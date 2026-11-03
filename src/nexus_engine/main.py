@@ -14424,6 +14424,12 @@ def decide_intro_review(video_id: int, request: IntroReviewDecisionRequest):
             request=RegenerateIntroRequest(keep_successful=request.keep_successful),
         )
     elif action == "accept_fallback":
+        readiness = _check_video_media_readiness(video_id)
+        if readiness["total_scenes"] > 0 and not readiness["all_base_images_ready"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Chưa hoàn tất toàn bộ ảnh tĩnh cơ sở ({readiness['completed_base_images']}/{readiness['total_scenes']} ảnh); không thể dựng MP4.",
+            )
         # Cancel any active or paused media generation jobs to prevent conflict
         for j in db.list_system_jobs(video_id=video_id, limit=None):
             if j.get("job_type") in {"flow_media_generation", "muse_media_generation"} and j.get("status") in {"queued", "running", "retry_wait", "paused"}:
@@ -14654,6 +14660,51 @@ def _format_iso_datetime(iso_str: str | None) -> str:
         return str(iso_str)[:19]
 
 
+def _check_video_media_readiness(video_id: int) -> dict:
+    total_scenes = 0
+    completed_base_images = 0
+    requested_intro_videos = 0
+    completed_intro_videos = 0
+    try:
+        from nexus_engine.services import video_production
+        _, plan_payload = video_production.load_visual_scene_plan(video_id)
+        scenes = (plan_payload or {}).get("scenes") or []
+        total_scenes = len(scenes)
+        if total_scenes > 0:
+            artifacts = db.list_video_artifacts(video_id)
+            by_type = {str(a.get("artifact_type") or ""): a for a in artifacts}
+            for idx, sc in enumerate(scenes):
+                img_art = by_type.get(f"scene:{idx}")
+                if (
+                    img_art
+                    and img_art.get("status") == "completed"
+                    and Path(img_art.get("path") or "").is_file()
+                ):
+                    completed_base_images += 1
+
+                if sc.get("is_video") or sc.get("media_type") == "video":
+                    requested_intro_videos += 1
+                    vid_art = by_type.get(f"scene_video:{idx}")
+                    if (
+                        vid_art
+                        and vid_art.get("status") == "completed"
+                        and Path(vid_art.get("path") or "").is_file()
+                        and Path(vid_art.get("path") or "").stat().st_size > 0
+                    ):
+                        completed_intro_videos += 1
+    except Exception:
+        pass
+
+    all_base_images_ready = bool(total_scenes > 0 and completed_base_images >= total_scenes)
+    return {
+        "all_base_images_ready": all_base_images_ready,
+        "total_scenes": total_scenes,
+        "completed_base_images": completed_base_images,
+        "requested_intro_videos": requested_intro_videos,
+        "completed_intro_videos": completed_intro_videos,
+    }
+
+
 @app.get("/api/videos/{video_id}/render-status")
 def get_render_status(video_id: int):
     video = db.get_video(video_id)
@@ -14863,6 +14914,7 @@ def get_render_status(video_id: int):
         "mp4_artifact": safe_mp4_artifact,
         "mp4_details": mp4_details,
         "job": render_job_summary,
+        "media_readiness": _check_video_media_readiness(video_id),
     }
 
 
@@ -16319,6 +16371,7 @@ if __name__ == "__main__":
 from nexus_engine.services import google_flow_account
 from nexus_engine.services import google_flow_browser_service
 from nexus_engine.services.google_flow_login import login_google_flow
+from nexus_engine.services.google_flow_quota import inspect_google_flow_quotas
 from fastapi import File, UploadFile, Form
 import json
 import shutil
@@ -16329,9 +16382,64 @@ FLOW_REFERENCE_STAGING_DIR = DATA_DIR / "flow_staging"
 from pydantic import BaseModel
 
 class GoogleFlowAccountData(BaseModel):
+    id: str = ""
     email: str = ""
     password: str = ""
     totp_secret: str = ""
+    enabled: bool = True
+    plan_tier: str = "Standard"
+
+class GoogleFlowRotationData(BaseModel):
+    auto_rotation_enabled: bool = True
+    rotation_strategy: str = "model_priority"
+
+@app.get("/api/flow/accounts")
+def list_flow_accounts():
+    return {
+        "items": google_flow_account.list_accounts(),
+        "fleet": google_flow_account.get_fleet_summary(),
+        "catalog": google_flow_account.FLOW_MODELS_CATALOG,
+    }
+
+@app.post("/api/flow/accounts")
+def create_or_update_flow_account(payload: GoogleFlowAccountData):
+    try:
+        acc = google_flow_account.upsert_account(payload.model_dump())
+        return {
+            "success": True,
+            "account": {
+                "id": acc.get("id"),
+                "email": acc.get("email"),
+                "profile_name": acc.get("profile_name"),
+                "plan_tier": acc.get("plan_tier"),
+            },
+            "fleet": google_flow_account.get_fleet_summary(),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+@app.delete("/api/flow/accounts/{account_id}")
+def delete_flow_account(account_id: str):
+    success = google_flow_account.delete_account(account_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản để xóa.")
+    return {"success": True, "fleet": google_flow_account.get_fleet_summary()}
+
+@app.post("/api/flow/accounts/{account_id}/activate")
+def activate_flow_account(account_id: str):
+    try:
+        google_flow_account.set_active_account(account_id)
+        return {"success": True, "active_account_id": account_id, "fleet": google_flow_account.get_fleet_summary()}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+@app.put("/api/flow/rotation-settings")
+def update_flow_rotation_settings(payload: GoogleFlowRotationData):
+    doc = google_flow_account.load_accounts_document()
+    doc["auto_rotation_enabled"] = payload.auto_rotation_enabled
+    doc["rotation_strategy"] = payload.rotation_strategy
+    google_flow_account.save_accounts_document(doc)
+    return {"success": True, "fleet": google_flow_account.get_fleet_summary()}
 
 @app.get("/api/flow/account")
 def get_flow_account():
@@ -16409,8 +16517,10 @@ async def check_flow_login():
     usage_lease = None
     try:
         account = google_flow_account.load_account()
+        profile_name = account.get("profile_name", "PROFILE_GOOGLE_FLOW_1")
         usage_lease = await asyncio.to_thread(
-            google_flow_browser_service.acquire_browser_service
+            google_flow_browser_service.acquire_browser_service,
+            profile_name
         )
         result = await _verify_google_flow_browser_session(account)
         return {
@@ -16422,6 +16532,111 @@ async def check_flow_login():
     finally:
         if usage_lease is not None:
             usage_lease.close()
+
+async def _inspect_account_quota_cdp(account: dict) -> dict:
+    from playwright.async_api import async_playwright
+    endpoint = google_flow_browser_service.get_browser_service_endpoint()
+    if not endpoint:
+        raise RuntimeError("Browser Google Flow chưa sẵn sàng.")
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.connect_over_cdp(endpoint)
+        if not browser.contexts:
+            raise RuntimeError("Browser Google Flow chưa có browser context.")
+        context = browser.contexts[0]
+        await google_flow_browser_service.keep_attached_browser_hidden(browser, context)
+        page = context.pages[0] if context.pages else await context.new_page()
+        page.set_default_timeout(30_000)
+        return await inspect_google_flow_quotas(page, account)
+
+@app.post("/api/flow/check-quota")
+@app.post("/api/flow/accounts/{account_id}/check-quota")
+async def check_flow_account_quota(account_id: str = ""):
+    usage_lease = None
+    try:
+        if account_id:
+            account = google_flow_account.get_account(account_id)
+            if not account:
+                raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+        else:
+            account = google_flow_account.get_active_account()
+
+        profile_name = account.get("profile_name", "PROFILE_GOOGLE_FLOW_1")
+        usage_lease = await asyncio.to_thread(
+            google_flow_browser_service.acquire_browser_service,
+            profile_name
+        )
+        result = await _inspect_account_quota_cdp(account)
+        if result.get("success"):
+            google_flow_account.save_account_quotas(
+                account.get("id"),
+                result.get("quotas", {}),
+                plan_tier=result.get("plan_tier", "Standard")
+            )
+        return {
+            "success": True,
+            "account_id": account.get("id"),
+            "plan_tier": result.get("plan_tier"),
+            "quotas": result.get("quotas"),
+            "checked_at": result.get("checked_at"),
+            "fleet": google_flow_account.get_fleet_summary(),
+        }
+    except Exception as e:
+        logger.exception("Lỗi khi kiểm tra hạn mức Google Flow: %s", e)
+        return {"success": False, "error": str(e)}
+    finally:
+        if usage_lease is not None:
+            usage_lease.close()
+
+@app.post("/api/flow/accounts/check-all-quotas")
+async def check_all_flow_quotas():
+    accounts = google_flow_account.list_accounts(include_secrets=True)
+    if not accounts:
+        return {"success": True, "results": [], "fleet": google_flow_account.get_fleet_summary()}
+
+    results = []
+    for acc in accounts:
+        if not acc.get("enabled", True):
+            continue
+        usage_lease = None
+        try:
+            profile_name = acc.get("profile_name", "PROFILE_GOOGLE_FLOW_1")
+            usage_lease = await asyncio.to_thread(
+                google_flow_browser_service.acquire_browser_service,
+                profile_name
+            )
+            inspect_res = await _inspect_account_quota_cdp(acc)
+            if inspect_res.get("success"):
+                google_flow_account.save_account_quotas(
+                    acc.get("id"),
+                    inspect_res.get("quotas", {}),
+                    plan_tier=inspect_res.get("plan_tier", "Standard")
+                )
+            results.append({
+                "account_id": acc.get("id"),
+                "email": acc.get("email"),
+                "success": True,
+                "plan_tier": inspect_res.get("plan_tier"),
+                "quotas": inspect_res.get("quotas"),
+            })
+        except Exception as e:
+            logger.warning("Lỗi check quota cho tài khoản %s: %s", acc.get("id"), e)
+            results.append({
+                "account_id": acc.get("id"),
+                "email": acc.get("email"),
+                "success": False,
+                "error": str(e)
+            })
+        finally:
+            if usage_lease is not None:
+                usage_lease.close()
+            # Brief pause between profiles
+            await asyncio.sleep(1.0)
+
+    return {
+        "success": True,
+        "results": results,
+        "fleet": google_flow_account.get_fleet_summary(),
+    }
 
 @app.post("/api/flow/test-generation")
 def test_flow_generation(confirm_credit_charge: bool = False):

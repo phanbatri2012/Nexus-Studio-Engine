@@ -274,7 +274,7 @@ def _service_environment() -> dict[str, str]:
     return environment
 
 
-def _spawn_service_process() -> None:
+def _spawn_service_process(profile_name: str = "") -> None:
     from nexus_engine.services.win32_window import spawn_service_on_interactive_desktop
 
     python_executable = sys.executable
@@ -285,6 +285,11 @@ def _spawn_service_process() -> None:
     elif venv_python.exists():
         python_executable = str(venv_python)
 
+    target_profile = (
+        profile_name
+        or google_flow_account.get_active_account().get("profile_name")
+        or DEFAULT_GOOGLE_FLOW_PROFILE
+    )
     SERVICE_LOG_DIR.mkdir(parents=True, exist_ok=True)
     stdout_path = SERVICE_LOG_DIR / "google-flow-browser-service.stdout.log"
     stderr_path = SERVICE_LOG_DIR / "google-flow-browser-service.stderr.log"
@@ -294,6 +299,8 @@ def _spawn_service_process() -> None:
             "-m",
             "nexus_engine.services.google_flow_browser_service",
             "--serve",
+            "--profile",
+            target_profile,
         ],
         cwd=PROJECT_ROOT,
         env=_service_environment(),
@@ -312,10 +319,23 @@ def _arm_idle_after_start(status: dict) -> dict:
 
 def start_browser_service(
     timeout: float = SERVICE_START_TIMEOUT_SECONDS,
+    profile_name: str = "",
 ) -> dict:
     """Start the shared browser owner once for manual or leased use."""
+    target_profile = (
+        profile_name
+        or google_flow_account.get_active_account().get("profile_name")
+        or DEFAULT_GOOGLE_FLOW_PROFILE
+    )
     with _manager_lock:
+        state = _read_json(SERVICE_STATE_PATH)
+        current_profile = str(state.get("profile_name") or DEFAULT_GOOGLE_FLOW_PROFILE)
         status = _read_browser_service_status()
+
+        if status["connected"] and current_profile != target_profile:
+            _stop_browser_service_process(timeout)
+            status = _read_browser_service_status()
+
         if status["connected"]:
             result = status
         else:
@@ -325,7 +345,7 @@ def start_browser_service(
                 SERVICE_STATE_PATH.unlink(missing_ok=True)
                 SERVICE_STOP_PATH.unlink(missing_ok=True)
                 SERVICE_ERROR_PATH.unlink(missing_ok=True)
-                _spawn_service_process()
+                _spawn_service_process(target_profile)
                 deadline = time.monotonic() + max(0.0, timeout)
 
             result = status
@@ -666,7 +686,7 @@ def _stop_requested(instance_id: str) -> bool:
     return bool(request) and request.get("instance_id") == instance_id
 
 
-def run_browser_service() -> int:
+def run_browser_service(profile_name: str = DEFAULT_GOOGLE_FLOW_PROFILE) -> int:
     """Own the persistent context until the backend or user requests a stop."""
     from playwright.sync_api import sync_playwright
 
@@ -695,7 +715,8 @@ def run_browser_service() -> int:
         "pid": os.getpid(),
         "instance_id": instance_id,
         "cdp_url": endpoint,
-        "profile_dir": str(google_flow_profile_dir("PROFILE_GOOGLE_FLOW_1").resolve()),
+        "profile_name": profile_name,
+        "profile_dir": str(google_flow_profile_dir(profile_name).resolve()),
         "started_at": _utc_now(),
         "ready": False,
         "window_visible": False,
@@ -720,7 +741,7 @@ def run_browser_service() -> int:
     context = None
     exit_code = 0
     try:
-        profile_dir = google_flow_profile_dir("PROFILE_GOOGLE_FLOW_1")
+        profile_dir = google_flow_profile_dir(profile_name)
         profile_dir.mkdir(parents=True, exist_ok=True)
         for lock_file in profile_dir.glob("Singleton*"):
             try:
@@ -808,10 +829,10 @@ def _wait_before_service_restart(delay_seconds: float, attempt: int) -> bool:
     return True
 
 
-def run_browser_service_with_recovery() -> int:
+def run_browser_service_with_recovery(profile_name: str = DEFAULT_GOOGLE_FLOW_PROFILE) -> int:
     attempt = 0
     while True:
-        exit_code = run_browser_service()
+        exit_code = run_browser_service(profile_name=profile_name)
         if exit_code == 0:
             return 0
         delay = SERVICE_RESTART_BACKOFF_SECONDS[
@@ -839,8 +860,15 @@ _on_demand_lifecycle = OnDemandBrowserLifecycle(
 )
 
 
-def acquire_browser_service():
-    """Acquire one worker lease and lazily start the shared browser."""
+def acquire_browser_service(profile_name: str = ""):
+    """Acquire one worker lease and lazily start the shared browser with target profile."""
+    if profile_name:
+        state = _read_json(SERVICE_STATE_PATH)
+        current_profile = str(state.get("profile_name") or DEFAULT_GOOGLE_FLOW_PROFILE)
+        status = _read_browser_service_status()
+        if status["connected"] and current_profile != profile_name:
+            stop_browser_service(timeout=SERVICE_STOP_TIMEOUT_SECONDS, force=True)
+            start_browser_service(profile_name=profile_name)
     return _on_demand_lifecycle.acquire()
 
 
@@ -852,10 +880,11 @@ def arm_browser_service_idle_watchdog() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--serve", action="store_true")
+    parser.add_argument("--profile", default=DEFAULT_GOOGLE_FLOW_PROFILE)
     arguments = parser.parse_args()
     if not arguments.serve:
         parser.error("--serve is required")
-    return run_browser_service_with_recovery()
+    return run_browser_service_with_recovery(profile_name=arguments.profile)
 
 
 if __name__ == "__main__":
