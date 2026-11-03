@@ -18,6 +18,11 @@ from collections.abc import Callable
 from typing import Any
 
 from nexus_engine.services import database as db, security_logging, trust_builder_safety as safety
+from nexus_engine.services.gpm_youtube_automation import (
+    human_type_text,
+    simulate_post_comment_retention,
+    simulate_pre_comment_dwell,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1436,9 +1441,9 @@ async def action_comment_video(page: Any, comment_text: str) -> dict[str, str]:
 
     logger.info("Thực hiện bình luận video: '%s'", clean_text)
     try:
-        # Scroll to comments section and pause naturally as if reading
+        # Scroll to comments section and dwell naturally as if reading
         await natural_scroll(page, min_scrolls=3, max_scrolls=5)
-        await asyncio.sleep(random.uniform(6.0, 12.0))
+        await simulate_pre_comment_dwell(page, min_seconds=10.0, max_seconds=60.0)
 
         composer_info = await page.evaluate(
             """() => {
@@ -1534,16 +1539,7 @@ async def action_comment_video(page: Any, comment_text: str) -> dict[str, str]:
         if not input_elem:
             return action_result(ACTION_NOT_FOUND, "comment_editor_stale", "Ô soạn thảo không còn khả dụng.")
 
-        await input_elem.scroll_into_view_if_needed()
-        await input_elem.click()
-        await asyncio.sleep(random.uniform(0.3, 0.6))
-
-        for char in clean_text:
-            await input_elem.type(char, delay=random.randint(40, 110))
-            if random.random() < 0.05:
-                await asyncio.sleep(random.uniform(0.1, 0.3))
-
-        await asyncio.sleep(random.uniform(1.0, 2.0))
+        await human_type_text(page, input_elem, clean_text)
 
         submit_info = await page.evaluate(
             r"""expectedText => {
@@ -1617,7 +1613,8 @@ async def action_comment_video(page: Any, comment_text: str) -> dict[str, str]:
                     "comment_confirmation_timeout",
                     "Đã bấm gửi nhưng YouTube chưa xác nhận; sẽ không gửi lại trên video này.",
                 )
-            logger.info("YouTube đã xác nhận bình luận được gửi.")
+            logger.info("YouTube đã xác nhận bình luận được gửi; lưu lại trang xem tiếp video.")
+            await simulate_post_comment_retention(page, min_seconds=60.0, max_seconds=120.0)
             return action_result(ACTION_PERFORMED, "comment_confirmed", "YouTube đã xác nhận bình luận.")
 
         return action_result(ACTION_NOT_FOUND, "comment_submit_stale", "Nút gửi không còn khả dụng.")

@@ -5588,7 +5588,13 @@ def _execute_comment_publish_job(job: dict) -> None:
 
             if video_url:
                 try:
-                    db.update_system_job(job["id"], progress="Đang đăng bình luận qua GPM Profile Browser")
+                    def _report_comment_progress(msg: str) -> None:
+                        try:
+                            db.update_system_job(job["id"], progress=msg)
+                        except Exception:
+                            pass
+
+                    db.update_system_job(job["id"], progress="Đang chuẩn bị đăng bình luận qua GPM Profile Browser")
                     gpm_result = asyncio.run(
                         gpm_youtube_automation.post_comment_reply_via_gpm(
                             gpm_profile_id,
@@ -5596,6 +5602,7 @@ def _execute_comment_publish_job(job: dict) -> None:
                             comment_text=safe_reply,
                             comment_id=comment.get("comment_id") or "",
                             auto_heart=auto_heart,
+                            progress_callback=_report_comment_progress,
                         )
                     )
                     result = {

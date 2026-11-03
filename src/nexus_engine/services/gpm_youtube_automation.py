@@ -9,9 +9,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import urllib.parse
 import urllib.request
 
@@ -248,6 +250,187 @@ async def verify_youtube_login(
             await cleanup_owned_page(context, page, preserve=preserve_page)
 
 
+async def human_type_text(
+    page: Any,
+    element: Any,
+    text: str,
+    *,
+    min_delay_ms: int = 45,
+    max_delay_ms: int = 120,
+    hesitation_probability: float = 0.08,
+    review_pause_range: tuple[float, float] = (2.0, 4.0),
+) -> None:
+    """Type text into an editable element with human-like keystroke variance and pauses."""
+    clean_text = str(text or "").strip()
+    if not clean_text or element is None:
+        return
+
+    try:
+        if hasattr(element, "scroll_into_view_if_needed"):
+            await element.scroll_into_view_if_needed()
+        if hasattr(element, "click"):
+            await element.click()
+    except Exception:
+        pass
+    await asyncio.sleep(random.uniform(0.6, 1.2))
+
+    max_keystrokes = len(clean_text) + 20
+    keystroke_count = 0
+    for char in clean_text:
+        keystroke_count += 1
+        if keystroke_count > max_keystrokes:
+            break
+        delay = random.randint(min_delay_ms, max_delay_ms)
+        await element.type(char, delay=delay)
+        if random.random() < hesitation_probability:
+            await asyncio.sleep(random.uniform(0.2, 0.55))
+
+    pause_min, pause_max = review_pause_range
+    if pause_max > 0:
+        await asyncio.sleep(random.uniform(max(0.5, pause_min), max(pause_min, pause_max)))
+
+
+async def _is_page_closed(page: Any) -> bool:
+    if page is None:
+        return True
+    try:
+        check = getattr(page, "is_closed", None)
+        if callable(check):
+            res = check()
+            if asyncio.iscoroutine(res):
+                res = await res
+            return bool(res)
+    except Exception:
+        return True
+    return False
+
+
+async def simulate_pre_comment_dwell(
+    page: Any,
+    *,
+    min_seconds: float = 10.0,
+    max_seconds: float = 60.0,
+    progress_callback: Callable[[str], None] | None = None,
+) -> float:
+    """Simulate realistic reading and browsing dwell time before interacting with comments."""
+    if await _is_page_closed(page):
+        return 0.0
+
+    target_dwell = random.uniform(max(1.0, min_seconds), max(min_seconds, max_seconds))
+    logger.info("Chờ tự nhiên trước khi bình luận: %.1f giây", target_dwell)
+    if progress_callback:
+        try:
+            progress_callback(f"Đang xem video và đọc bình luận ({int(target_dwell)}s)...")
+        except Exception:
+            pass
+
+    start_time = time.monotonic()
+    deadline = start_time + target_dwell + 5.0
+    max_iterations = int(target_dwell / 1.5) + 20
+    iteration = 0
+
+    while time.monotonic() - start_time < target_dwell and iteration < max_iterations:
+        iteration += 1
+        if time.monotonic() >= deadline:
+            break
+        if await _is_page_closed(page):
+            break
+
+        slice_duration = min(random.uniform(2.5, 5.0), max(0.5, target_dwell - (time.monotonic() - start_time)))
+        if slice_duration <= 0.2:
+            break
+
+        try:
+            action_roll = random.random()
+            if action_roll < 0.35:
+                x = random.randint(250, 750)
+                y = random.randint(250, 550)
+                await page.mouse.move(x, y, steps=random.randint(5, 12))
+            elif action_roll < 0.60:
+                delta_y = random.choice([random.randint(80, 220), -random.randint(60, 160)])
+                await page.mouse.wheel(0, delta_y)
+        except Exception:
+            pass
+
+        await asyncio.sleep(slice_duration)
+
+    elapsed = round(time.monotonic() - start_time, 1)
+    return elapsed
+
+
+async def simulate_post_comment_retention(
+    page: Any,
+    *,
+    min_seconds: float = 60.0,
+    max_seconds: float = 120.0,
+    progress_callback: Callable[[str], None] | None = None,
+) -> float:
+    """Linger on the video page after commenting to accumulate natural session retention and watch time."""
+    if await _is_page_closed(page):
+        return 0.0
+
+    target_retention = random.uniform(max(5.0, min_seconds), max(min_seconds, max_seconds))
+    logger.info("Lưu lại trang và xem tiếp video sau khi bình luận: %.1f giây", target_retention)
+    if progress_callback:
+        try:
+            progress_callback(
+                f"Đã gửi bình luận thành công; đang xem tiếp video ({int(target_retention)}s) trước khi đóng tab..."
+            )
+        except Exception:
+            pass
+
+    start_time = time.monotonic()
+    deadline = start_time + target_retention + 10.0
+    max_iterations = int(target_retention / 3.0) + 30
+    iteration = 0
+    last_report_time = start_time
+
+    try:
+        await page.mouse.wheel(0, -random.randint(300, 600))
+        await asyncio.sleep(1.0)
+    except Exception:
+        pass
+
+    while time.monotonic() - start_time < target_retention and iteration < max_iterations:
+        iteration += 1
+        if time.monotonic() >= deadline:
+            break
+        if await _is_page_closed(page):
+            break
+
+        now = time.monotonic()
+        remaining = max(0, int(target_retention - (now - start_time)))
+        if progress_callback and (now - last_report_time >= 25.0) and remaining > 5:
+            last_report_time = now
+            try:
+                progress_callback(
+                    f"Đã bình luận thành công; đang xem tiếp video (còn {remaining}s) trước khi đóng tab..."
+                )
+            except Exception:
+                pass
+
+        slice_duration = min(random.uniform(4.0, 8.0), max(0.5, target_retention - (now - start_time)))
+        if slice_duration <= 0.3:
+            break
+
+        try:
+            action_roll = random.random()
+            if action_roll < 0.40:
+                x = random.randint(300, 900)
+                y = random.randint(200, 500)
+                await page.mouse.move(x, y, steps=random.randint(6, 15))
+            elif action_roll < 0.65:
+                delta_y = random.choice([random.randint(40, 120), -random.randint(40, 120)])
+                await page.mouse.wheel(0, delta_y)
+        except Exception:
+            pass
+
+        await asyncio.sleep(slice_duration)
+
+    elapsed = round(time.monotonic() - start_time, 1)
+    return elapsed
+
+
 async def post_comment_reply_via_gpm(
     profile_id: str,
     video_url: str,
@@ -255,6 +438,14 @@ async def post_comment_reply_via_gpm(
     comment_id: str = "",
     auto_heart: bool = True,
     timeout_seconds: float = 30.0,
+    *,
+    pre_comment_dwell: bool = True,
+    post_comment_dwell: bool = True,
+    min_pre_dwell: float = 10.0,
+    max_pre_dwell: float = 60.0,
+    min_post_dwell: float = 60.0,
+    max_post_dwell: float = 120.0,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Post a comment reply (and optionally give Creator Heart) to a video watch page using the channel's GPM profile."""
     clean_comment_id = _validate_comment_id(comment_id)
@@ -277,6 +468,15 @@ async def post_comment_reply_via_gpm(
         await page.bring_to_front()
         try:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=int(timeout_seconds * 1000))
+
+            pre_dwell_time = 0.0
+            if pre_comment_dwell:
+                pre_dwell_time = await simulate_pre_comment_dwell(
+                    page,
+                    min_seconds=min_pre_dwell,
+                    max_seconds=max_pre_dwell,
+                    progress_callback=progress_callback,
+                )
 
             # If replying to a specific linked comment
             if clean_comment_id:
@@ -331,8 +531,12 @@ async def post_comment_reply_via_gpm(
                 if not editable:
                     raise GpmAutomationError("Không kích hoạt được ô soạn thảo câu trả lời bình luận.")
 
-                await editable.fill(comment_text)
-                await asyncio.sleep(0.5)
+                if progress_callback:
+                    try:
+                        progress_callback("Đang soạn câu trả lời theo tốc độ người thật...")
+                    except Exception:
+                        pass
+                await human_type_text(page, editable, comment_text)
 
                 submit_button = await page.wait_for_selector(
                     "ytd-comment-reply-dialog-renderer #submit-button button, #reply-dialog #submit-button button, #submit-button button, ytd-button-renderer#submit-button",
@@ -360,8 +564,12 @@ async def post_comment_reply_via_gpm(
                 if not editable:
                     raise GpmAutomationError("Không kích hoạt được ô soạn thảo bình luận.")
 
-                await editable.fill(comment_text)
-                await asyncio.sleep(0.5)
+                if progress_callback:
+                    try:
+                        progress_callback("Đang soạn bình luận theo tốc độ người thật...")
+                    except Exception:
+                        pass
+                await human_type_text(page, editable, comment_text)
 
                 submit_button = await page.wait_for_selector("#submit-button button, ytd-button-renderer#submit-button", timeout=5000)
                 if not submit_button:
@@ -370,12 +578,23 @@ async def post_comment_reply_via_gpm(
                 await submit_button.click()
                 await asyncio.sleep(2.0)
 
+            post_dwell_time = 0.0
+            if post_comment_dwell:
+                post_dwell_time = await simulate_post_comment_retention(
+                    page,
+                    min_seconds=min_post_dwell,
+                    max_seconds=max_post_dwell,
+                    progress_callback=progress_callback,
+                )
+
             return {
                 "success": True,
                 "video_url": target_url,
                 "comment_text": comment_text,
                 "comment_id": clean_comment_id,
                 "hearted": hearted,
+                "pre_dwell_seconds": pre_dwell_time,
+                "post_dwell_seconds": post_dwell_time,
                 "message": "Đã đăng câu trả lời và thả tim thành công qua Profile GPM." if hearted else "Đã đăng câu trả lời thành công qua Profile GPM.",
             }
         except Exception as exc:
@@ -468,6 +687,10 @@ async def pin_top_level_comment_via_gpm(
     comment_id: str,
     expected_channel_id: str,
     timeout_seconds: float = 30.0,
+    post_pin_dwell: bool = True,
+    min_post_dwell: float = 15.0,
+    max_post_dwell: float = 40.0,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Pin one verified top-level comment in the assigned channel profile."""
     clean_comment_id = _validate_comment_id(comment_id)
@@ -562,6 +785,13 @@ async def pin_top_level_comment_via_gpm(
             if not pinned:
                 raise GpmAutomationError(
                     "YouTube chưa xác nhận bình luận mục tiêu đã được ghim."
+                )
+            if post_pin_dwell:
+                await simulate_post_comment_retention(
+                    page,
+                    min_seconds=min_post_dwell,
+                    max_seconds=max_post_dwell,
+                    progress_callback=progress_callback,
                 )
             return {
                 "success": True,
