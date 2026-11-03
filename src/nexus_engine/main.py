@@ -7040,6 +7040,7 @@ def _execute_flow_media_generation_job(job: dict) -> None:
             ((job.get("result") or {}).get("flow_video_pending_since"))
             or ""
         ),
+        fallback_static=bool(payload.get("fallback_static", False)),
     )
     _raise_if_video_job_canceled(job["id"])
     intro_summary = result.get("intro_video_summary") or {}
@@ -7063,7 +7064,8 @@ def _execute_flow_media_generation_job(job: dict) -> None:
 
     requested_count = int(intro_summary.get("requested_count") or 0)
     generated_count = int(intro_summary.get("generated_count") or 0)
-    if requested_count > 0 and generated_count == 0:
+    user_accepted_fallback = bool(payload.get("fallback_static") or payload.get("skip_intro_review"))
+    if requested_count > 0 and generated_count == 0 and not user_accepted_fallback:
         review_progress = (
             f"Toàn bộ {requested_count} video intro đều thất bại (đang dùng ảnh tĩnh). "
             "Cần duyệt thủ công trước khi xuất MP4."
@@ -8769,11 +8771,20 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         recovery_result["reconcile_last_completed_count"] = current_completed
         recovery_result["reconcile_stagnant_count"] = stagnant_count
 
+        if stagnant_count == 10 and not is_image_phase and video_id:
+            logger.warning(
+                "Google Flow đối soát video kẹt 10 lần liên tiếp; tự động kích hoạt tạo Canvas mới cho video %s.",
+                video_id,
+            )
+            current_payload["force_new_flow_project"] = True
+            db.update_system_job(job["id"], payload_json=current_payload)
+            db.request_new_flow_project(video_id)
+
         MAX_CONSECUTIVE_STAGNANT_RECONCILES = 15
         if stagnant_count >= MAX_CONSECUTIVE_STAGNANT_RECONCILES:
             stalled_msg = (
                 f"Google Flow đã thử đối soát {stagnant_count} lần liên tiếp mà không có ảnh/video mới hoàn tất. "
-                "Đã tạm dừng an toàn để bảo vệ quota và tránh vòng lặp vô tận; hãy kiểm tra trạng thái trên Google Flow rồi nhấn Tiếp tục."
+                "Đã tạm dừng an toàn để bảo vệ quota; bạn có thể chọn 'Dùng ảnh tĩnh & Dựng ngay' hoặc 'Đổi Canvas mới & Thử lại'."
             )
             recovery_result["attention_required"] = "flow_reconcile_stalled"
             db.update_system_job(
@@ -11542,6 +11553,21 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
             or (status in {"queued", "paused"} and video_id is None)
         ),
         "can_delete": status != "running",
+        "can_flow_fallback_static": (
+            job_type == "flow_media_generation"
+            and (
+                status in {"paused", "error"}
+                or result.get("attention_required") in {"flow_reconcile_stalled", "flow_video_quota_exhausted"}
+                or bool(result.get("pending_video_scene_indices"))
+            )
+        ),
+        "can_flow_reset_project": (
+            job_type == "flow_media_generation"
+            and (
+                status in {"paused", "error"}
+                or result.get("attention_required") == "flow_reconcile_stalled"
+            )
+        ),
         "attention_required": (
             result.get("attention_required", "")
         ),
@@ -11930,7 +11956,7 @@ def _job_matches_video_search(item: dict, query: str) -> bool:
     return normalized_query in searchable
 
 
-JOB_CENTER_ACTIONS = ("retry", "pause", "resume", "cancel", "force_stop")
+JOB_CENTER_ACTIONS = ("retry", "pause", "resume", "cancel", "force_stop", "fallback_static", "retry_new_flow_project")
 JOB_CENTER_SYSTEM_JOB_TYPES = (
     "video_generation",
     "short_video_generation",
@@ -11944,7 +11970,14 @@ JOB_CENTER_SYSTEM_JOB_TYPES = (
 
 
 def _job_supports_action(item: dict, action: str) -> bool:
-    capability = "can_cancel" if action == "cancel" else f"can_{action}"
+    if action == "cancel":
+        capability = "can_cancel"
+    elif action == "fallback_static":
+        capability = "can_flow_fallback_static"
+    elif action == "retry_new_flow_project":
+        capability = "can_flow_reset_project"
+    else:
+        capability = f"can_{action}"
     return bool(item.get(capability))
 
 
@@ -12377,6 +12410,11 @@ def _run_system_job_center_action(
         if str(job.get("job_type") or "") == "muse_media_generation":
             updated_job = _resume_muse_media_job(job)
         elif str(job.get("job_type") or "") == "flow_media_generation":
+            res = dict(job.get("result") or {})
+            if "reconcile_stagnant_count" in res:
+                res["reconcile_stagnant_count"] = 0
+                res.pop("attention_required", None)
+                db.update_system_job(job_id, result_json=res)
             updated_job = db.resume_system_job(job_id)
             if updated_job and job.get("video_id"):
                 db.update_video_production_state(
@@ -12388,6 +12426,76 @@ def _run_system_job_center_action(
                 )
         else:
             updated_job = db.resume_system_job(job_id)
+    elif action == "fallback_static":
+        if str(job.get("job_type") or "") == "flow_media_generation":
+            cur_payload = dict(job.get("payload") or {})
+            cur_payload["fallback_static"] = True
+            cur_payload["skip_intro_review"] = True
+            cur_result = dict(job.get("result") or {})
+            cur_result["reconcile_stagnant_count"] = 0
+            cur_result.pop("attention_required", None)
+            db.update_system_job(
+                job_id,
+                payload_json=cur_payload,
+                result_json=cur_result,
+                error="",
+                status="queued",
+                progress="Đang chuyển toàn bộ video intro sang dùng ảnh tĩnh...",
+            )
+            updated_job = db.get_system_job(job_id)
+            if updated_job and job.get("video_id"):
+                db.update_video_production_state(
+                    int(job["video_id"]),
+                    render_status="queued",
+                    current_stage="flow_media_generation",
+                    production_progress="Đang chuyển video intro sang ảnh tĩnh để dựng MP4",
+                    blocking_reason="",
+                )
+        else:
+            raise JobCenterActionNotAllowedError("Hành động chỉ áp dụng cho Google Flow media.")
+    elif action == "retry_new_flow_project":
+        if str(job.get("job_type") or "") == "flow_media_generation":
+            cur_payload = dict(job.get("payload") or {})
+            cur_payload["force_new_flow_project"] = True
+            cur_payload.pop("fallback_static", None)
+            cur_result = dict(job.get("result") or {})
+            cur_result["reconcile_stagnant_count"] = 0
+            cur_result.pop("attention_required", None)
+            vid_id = int(job.get("video_id") or cur_payload.get("video_id") or 0)
+            if vid_id:
+                artifacts = db.list_latest_video_artifacts(vid_id, ("scene_video:",))
+                for k, art in artifacts.items():
+                    if art.get("status") in {"queued", "retry_wait", "processing"}:
+                        db.upsert_video_artifact(
+                            video_id=vid_id,
+                            artifact_type=k,
+                            path=str(art.get("path") or ""),
+                            content_hash=str(art.get("content_hash") or ""),
+                            status="failed",
+                            mime_type="video/mp4",
+                            metadata={**(art.get("metadata") or {}), "failure_stage": "reset_new_project", "reason_code": "reset_requested"},
+                        )
+                db.request_new_flow_project(vid_id)
+
+            db.update_system_job(
+                job_id,
+                payload_json=cur_payload,
+                result_json=cur_result,
+                error="",
+                status="queued",
+                progress="Đang khởi tạo Canvas Google Flow mới để sinh lại video intro...",
+            )
+            updated_job = db.get_system_job(job_id)
+            if updated_job and vid_id:
+                db.update_video_production_state(
+                    vid_id,
+                    render_status="queued",
+                    current_stage="flow_media_generation",
+                    production_progress="Đang tạo Canvas Google Flow mới để sinh lại video intro",
+                    blocking_reason="",
+                )
+        else:
+            raise JobCenterActionNotAllowedError("Hành động chỉ áp dụng cho Google Flow media.")
     else:
         updated_job = db.request_cancel_system_job(job_id)
         if str(job.get("job_type")) == "fb_crosspost":
@@ -12835,6 +12943,36 @@ def resume_job(job_id: str):
     except (JobCenterActionNotAllowedError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"success": True}
+
+
+@app.post("/api/jobs/{job_id}/fallback-static")
+def fallback_static_job(job_id: str):
+    try:
+        updated_job = _run_system_job_center_action(
+            job_id,
+            "fallback_static",
+            kick_queues=True,
+        )
+    except JobCenterItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (JobCenterActionNotAllowedError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"success": True, "job": updated_job}
+
+
+@app.post("/api/jobs/{job_id}/retry-new-flow-project")
+def retry_new_flow_project_job(job_id: str):
+    try:
+        updated_job = _run_system_job_center_action(
+            job_id,
+            "retry_new_flow_project",
+            kick_queues=True,
+        )
+    except JobCenterItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (JobCenterActionNotAllowedError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"success": True, "job": updated_job}
 
 
 @app.get("/api/jobs/{job_id}")

@@ -2805,7 +2805,8 @@ def generate_scene_media(
 ) -> dict:
     """Advance one bounded Flow scheduling pass and return once all media is ready."""
     settings = settings or {}
-    enable_intro_video = bool(settings.get("enable_intro_video", True))
+    fallback_static = bool(settings.get("fallback_static", False))
+    enable_intro_video = bool(settings.get("enable_intro_video", True)) and not fallback_static
     try:
         existing_final = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
     except Exception:
@@ -3488,9 +3489,38 @@ def generate_scene_media(
             )
             for index, scene in enumerate(scenes):
                 cancel_check()
+                is_video_candidate = bool(scene.get("is_video") or scene.get("media_type") == "video")
+                if fallback_static and is_video_candidate:
+                    s_idx = int(scene.get("index", index))
+                    if not any(f.get("scene_index") == s_idx for f in summary["fallback_scenes"]):
+                        summary["fallback_scenes"].append(
+                            {
+                                "scene_index": s_idx,
+                                "failure_stage": "user_fallback",
+                                "reason_code": "fallback_static",
+                            }
+                        )
+                    video_artifact_type = f"scene_video:{s_idx}"
+                    video_art = artifact_snapshot.get(video_artifact_type)
+                    if video_art and video_art.get("status") in {"queued", "retry_wait", "processing"}:
+                        artifact_snapshot[video_artifact_type] = db.upsert_video_artifact(
+                            video_id=video_id,
+                            artifact_type=video_artifact_type,
+                            path=str(video_art.get("path") or ""),
+                            content_hash=str(video_art.get("content_hash") or ""),
+                            status="failed",
+                            mime_type="video/mp4",
+                            metadata={
+                                **(video_art.get("metadata") or {}),
+                                "failure_stage": "user_fallback",
+                                "reason_code": "fallback_static",
+                                "terminal": True,
+                            },
+                        )
+                    continue
                 is_video_requested = bool(
                     enable_intro_video
-                    and (scene.get("is_video") or scene.get("media_type") == "video")
+                    and is_video_candidate
                 )
                 if not is_video_requested:
                     continue
@@ -3684,7 +3714,7 @@ def generate_scene_media(
                             },
                         )
             summary["fallback_count"] = len(summary["fallback_scenes"])
-            MAX_RECONCILE_POLLS = 20
+            MAX_RECONCILE_POLLS = 15
             expired_poll_videos = [
                 item for item in list(pending_videos)
                 if int(item.get("reconciliation_poll_count") or 0) >= MAX_RECONCILE_POLLS
@@ -5382,6 +5412,7 @@ def prepare_google_flow_media(
     force_new_project: bool = False,
     force_new_flow_project: bool = False,
     flow_video_pending_since: str = "",
+    fallback_static: bool = False,
 ) -> dict:
     try:
         existing_final = db.get_latest_video_artifact(video_id, "final_mp4", status="ready")
@@ -5416,6 +5447,8 @@ def prepare_google_flow_media(
     runtime_settings = dict(snapshot.get("image_generation_settings") or {})
     if flow_video_pending_since:
         runtime_settings["_flow_video_pending_since"] = flow_video_pending_since
+    if fallback_static:
+        runtime_settings["fallback_static"] = True
     media_result = generate_scene_media(
         video_id=video_id,
         scenes=scenes,

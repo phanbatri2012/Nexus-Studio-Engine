@@ -129,8 +129,10 @@ function formatPipeline(pipeline) {
 }
 
 function supportsAction(job, action) {
-  const capability = action === 'cancel' ? 'can_cancel' : `can_${action}`
-  return Boolean(job?.[capability])
+  if (action === 'cancel') return Boolean(job?.can_cancel)
+  if (action === 'fallback_static') return Boolean(job?.can_flow_fallback_static)
+  if (action === 'retry_new_flow_project') return Boolean(job?.can_flow_reset_project)
+  return Boolean(job?.[`can_${action}`])
 }
 
 function isSelectable(job) {
@@ -562,6 +564,10 @@ function JobCenter({ onOpenVideo, refreshKey }) {
       let endpoint = ''
       if (action === 'force_stop') {
         endpoint = `/api/jobs/${job.raw_id}/force-stop`
+      } else if (action === 'fallback_static') {
+        endpoint = `/api/jobs/${job.raw_id}/fallback-static`
+      } else if (action === 'retry_new_flow_project') {
+        endpoint = `/api/jobs/${job.raw_id}/retry-new-flow-project`
       } else if (job.type === 'youtube_download') {
         endpoint = `/api/youtube-download/jobs/${job.raw_id}/${action}`
       } else {
@@ -1244,6 +1250,28 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     {job.can_resume && (
                       <button className="btn-secondary" disabled={Boolean(actionId)} style={{ padding: '8px 12px' }} onClick={() => runAction(job, 'resume')}>
                         {['youtube_browser_cdp', 'fb_browser_cdp'].includes(job.attention_required) ? 'Kiểm tra lại' : 'Tiếp tục'}
+                      </button>
+                    )}
+                    {job.can_flow_fallback_static && (
+                      <button
+                        className="btn-secondary"
+                        disabled={Boolean(actionId)}
+                        style={{ padding: '8px 12px', borderColor: '#4ade80', color: '#4ade80', fontWeight: '600' }}
+                        title="Dùng ảnh tĩnh làm nền và chuyển thẳng sang dựng video MP4"
+                        onClick={() => runAction(job, 'fallback_static')}
+                      >
+                        🖼️ Dùng ảnh tĩnh & Dựng ngay
+                      </button>
+                    )}
+                    {job.can_flow_reset_project && (
+                      <button
+                        className="btn-secondary"
+                        disabled={Boolean(actionId)}
+                        style={{ padding: '8px 12px', borderColor: '#38bdf8', color: '#38bdf8', fontWeight: '600' }}
+                        title="Tạo Canvas Google Flow mới sạch sẽ để sinh lại video intro"
+                        onClick={() => runAction(job, 'retry_new_flow_project')}
+                      >
+                        🔄 Đổi Canvas mới & Thử lại
                       </button>
                     )}
                     {job.can_cancel && !job.cancel_requested && (
