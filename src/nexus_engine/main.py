@@ -423,9 +423,9 @@ class PromptImageGenerationData(BaseModel):
     video_motion_prompt: str = Field(default="", max_length=8000)
     scene_0_prompt_template: str = Field(default="", max_length=8000)
     scene_body_prompt_template: str = Field(default="", max_length=8000)
-    scene_duration_min_seconds: int = Field(default=25, ge=10, le=90)
-    scene_duration_target_seconds: int = Field(default=30, ge=10, le=90)
-    scene_duration_max_seconds: int = Field(default=35, ge=10, le=90)
+    scene_duration_min_seconds: int = Field(default=25, ge=8, le=90)
+    scene_duration_target_seconds: int = Field(default=30, ge=8, le=90)
+    scene_duration_max_seconds: int = Field(default=35, ge=8, le=90)
 
     model_config = ConfigDict(extra="allow")
 
@@ -14491,6 +14491,28 @@ class IntroReviewDecisionRequest(BaseModel):
     keep_successful: bool = True
 
 
+@app.post("/api/videos/{video_id}/retry-new-flow-canvas")
+def retry_new_flow_canvas_for_video(video_id: int):
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Không tìm thấy video.")
+    jobs = db.list_system_jobs(video_id=video_id, limit=5)
+    flow_job = next((j for j in jobs if j.get("job_type") == "flow_media_generation"), None)
+    if flow_job:
+        _run_system_job_center_action(flow_job["id"], "retry_new_flow_project", kick_queues=True)
+        return {"success": True, "job_id": flow_job["id"], "message": "Đã yêu cầu Canvas Flow mới và kích hoạt lại hàng đợi."}
+    prompt_version = video.get("prompt_version") or ""
+    snapshot = _get_prompt_production_snapshot(prompt_version)
+    db.request_new_flow_project(video_id)
+    job, _ = _enqueue_flow_media_job(
+        video_id=video_id,
+        snapshot=snapshot,
+        mode="resume",
+        force_new_flow_project=True,
+    )
+    return {"success": True, "job_id": job["id"], "message": "Đã tạo Canvas Flow mới và khởi chạy lại."}
+
+
 @app.post("/api/videos/{video_id}/regenerate-intro-videos")
 def trigger_regenerate_intro_videos(video_id: int, request: RegenerateIntroRequest | None = None):
     keep_successful = request.keep_successful if request is not None else True
@@ -14556,7 +14578,9 @@ def decide_intro_review(video_id: int, request: IntroReviewDecisionRequest):
         raise HTTPException(status_code=404, detail="Không tìm thấy video.")
 
     action = str(request.action or "").strip().lower()
-    if action == "retry_intro":
+    if action in {"retry_new_canvas", "retry_new_flow_project"}:
+        return retry_new_flow_canvas_for_video(video_id)
+    elif action == "retry_intro":
         return trigger_regenerate_intro_videos(
             video_id,
             request=RegenerateIntroRequest(keep_successful=request.keep_successful),
@@ -14800,46 +14824,105 @@ def _format_iso_datetime(iso_str: str | None) -> str:
 
 def _check_video_media_readiness(video_id: int) -> dict:
     total_scenes = 0
-    completed_base_images = 0
-    requested_intro_videos = 0
-    completed_intro_videos = 0
+    total_images = 0
+    completed_images = 0
+    total_videos = 0
+    completed_videos = 0
     try:
         from nexus_engine.services import video_production
-        _, plan_payload = video_production.load_visual_scene_plan(video_id)
-        scenes = (plan_payload or {}).get("scenes") or []
+        scenes = []
+        terminal_frame = None
+
+        # 1. Thử tải visual_scene_plan (Google Flow / mặc định)
+        try:
+            _, plan_payload = video_production.load_visual_scene_plan(video_id)
+            scenes = (plan_payload or {}).get("scenes") or []
+        except Exception:
+            scenes = []
+
+        # 2. Nếu chưa có visual_scene_plan, thử tải muse_scene_plan (Muse AI)
+        if not scenes:
+            muse_plan_art = db.get_latest_video_artifact(video_id, "muse_scene_plan", "ready")
+            if muse_plan_art and Path(muse_plan_art.get("path") or "").is_file():
+                try:
+                    muse_payload = json.loads(Path(muse_plan_art["path"]).read_text(encoding="utf-8"))
+                    scenes = (muse_payload or {}).get("scenes") or []
+                    terminal_frame = (muse_payload or {}).get("terminal_frame")
+                except Exception:
+                    pass
+
         total_scenes = len(scenes)
+        artifacts = db.list_video_artifacts(video_id)
+        latest_by_type: dict[str, dict] = {}
+        for a in artifacts:
+            atype = str(a.get("artifact_type") or "")
+            prev = latest_by_type.get(atype)
+            if prev is None or int(a.get("id") or 0) > int(prev.get("id") or 0):
+                latest_by_type[atype] = a
+
         if total_scenes > 0:
-            artifacts = db.list_video_artifacts(video_id)
-            by_type = {str(a.get("artifact_type") or ""): a for a in artifacts}
+            total_images = total_scenes + (1 if isinstance(terminal_frame, dict) else 0)
             for idx, sc in enumerate(scenes):
-                img_art = by_type.get(f"scene:{idx}")
+                # Kiểm tra ảnh (Flow: scene:{idx}, Muse: muse_scene_image:{idx})
+                img_art = latest_by_type.get(f"scene:{idx}") or latest_by_type.get(f"muse_scene_image:{idx}")
                 if (
                     img_art
-                    and img_art.get("status") == "completed"
+                    and img_art.get("status") in {"completed", "ready"}
                     and Path(img_art.get("path") or "").is_file()
                 ):
-                    completed_base_images += 1
+                    completed_images += 1
 
+                # Kiểm tra video (Flow: scene_video:{idx}, Muse: muse_scene_video:{idx})
                 if sc.get("is_video") or sc.get("media_type") == "video":
-                    requested_intro_videos += 1
-                    vid_art = by_type.get(f"scene_video:{idx}")
+                    total_videos += 1
+                    vid_art = latest_by_type.get(f"scene_video:{idx}") or latest_by_type.get(f"muse_scene_video:{idx}")
                     if (
                         vid_art
-                        and vid_art.get("status") == "completed"
+                        and vid_art.get("status") in {"completed", "ready"}
                         and Path(vid_art.get("path") or "").is_file()
                         and Path(vid_art.get("path") or "").stat().st_size > 0
                     ):
-                        completed_intro_videos += 1
+                        completed_videos += 1
+
+            if isinstance(terminal_frame, dict):
+                term_art = latest_by_type.get("muse_terminal_frame")
+                if (
+                    term_art
+                    and term_art.get("status") in {"completed", "ready"}
+                    and Path(term_art.get("path") or "").is_file()
+                ):
+                    completed_images += 1
+        else:
+            # Fallback nếu plan chưa kịp lưu: đếm trực tiếp các artifact hợp lệ
+            completed_images = sum(
+                1
+                for atype, a in latest_by_type.items()
+                if (atype.startswith("scene:") or atype.startswith("muse_scene_image:") or atype == "muse_terminal_frame")
+                and a.get("status") in {"completed", "ready"}
+                and Path(a.get("path") or "").is_file()
+            )
+            completed_videos = sum(
+                1
+                for atype, a in latest_by_type.items()
+                if (atype.startswith("scene_video:") or atype.startswith("muse_scene_video:"))
+                and a.get("status") in {"completed", "ready"}
+                and Path(a.get("path") or "").is_file()
+                and Path(a.get("path") or "").stat().st_size > 0
+            )
     except Exception:
         pass
 
-    all_base_images_ready = bool(total_scenes > 0 and completed_base_images >= total_scenes)
+    all_base_images_ready = bool(total_images > 0 and completed_images >= total_images)
     return {
         "all_base_images_ready": all_base_images_ready,
         "total_scenes": total_scenes,
-        "completed_base_images": completed_base_images,
-        "requested_intro_videos": requested_intro_videos,
-        "completed_intro_videos": completed_intro_videos,
+        "total_images": total_images,
+        "completed_images": completed_images,
+        "total_videos": total_videos,
+        "completed_videos": completed_videos,
+        "completed_base_images": completed_images,
+        "requested_intro_videos": total_videos,
+        "completed_intro_videos": completed_videos,
     }
 
 

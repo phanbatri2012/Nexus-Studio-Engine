@@ -2776,7 +2776,7 @@ export default function Settings({
                   {label}
                   <input
                     type="number"
-                    min="10"
+                    min="8"
                     max="90"
                     value={currentImageGeneration[key]}
                     onChange={event => handlePromptSettingChange(
@@ -2787,6 +2787,13 @@ export default function Settings({
                 </label>
               ))}
             </div>
+
+            {(Number(currentImageGeneration.scene_duration_min_seconds) > Number(currentImageGeneration.scene_duration_target_seconds) ||
+              Number(currentImageGeneration.scene_duration_target_seconds) > Number(currentImageGeneration.scene_duration_max_seconds)) && (
+              <div style={{ color: '#f87171', fontSize: '0.82rem', marginBottom: 12, padding: '6px 10px', background: 'rgba(239, 68, 68, 0.1)', borderRadius: 6, border: '1px solid rgba(239, 68, 68, 0.3)' }}>
+                ⚠️ Lưu ý: Thời lượng cần thỏa mãn: Tối thiểu ≤ Mục tiêu ≤ Tối đa (hệ thống sẽ tự động điều chỉnh khi lưu).
+              </div>
+            )}
 
             {/* Selected Image Model Info Card */}
             {(() => {

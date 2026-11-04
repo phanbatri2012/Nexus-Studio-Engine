@@ -250,8 +250,8 @@ function App() {
 
   if (mediaReadiness) {
     allBaseImagesReady = Boolean(mediaReadiness.all_base_images_ready)
-    completedIntroVideos = Number(mediaReadiness.completed_intro_videos || 0)
-    requestedIntroVideos = Number(mediaReadiness.requested_intro_videos || 0)
+    completedIntroVideos = Number(mediaReadiness.completed_videos ?? mediaReadiness.completed_intro_videos ?? 0)
+    requestedIntroVideos = Number(mediaReadiness.total_videos ?? mediaReadiness.requested_intro_videos ?? 0)
   } else {
     const fmp = renderInfo?.job?.flow_media_progress || {}
     const progText = String(renderInfo?.job?.progress || renderInfo?.production_progress || '')
@@ -267,6 +267,42 @@ function App() {
     }
   }
 
+  const fmp = renderInfo?.job?.flow_media_progress || {}
+  const mmp = renderInfo?.job?.muse_media_progress || {}
+  const museArtifacts = renderInfo?.job?.muse_artifacts || {}
+
+  const totalImages = Number(
+    mediaReadiness?.total_images ??
+    mediaReadiness?.total_scenes ??
+    fmp.images_total ??
+    mmp.images_total ??
+    (mmp.phase === 'images' ? mmp.total : 0) ??
+    0
+  )
+  const completedImages = Number(
+    mediaReadiness?.completed_images ??
+    mediaReadiness?.completed_base_images ??
+    fmp.images_completed ??
+    mmp.images_completed ??
+    museArtifacts.scene_images_ready ??
+    0
+  )
+  const totalVideos = Number(
+    mediaReadiness?.total_videos ??
+    mediaReadiness?.requested_intro_videos ??
+    fmp.videos_total ??
+    mmp.videos_total ??
+    (mmp.phase === 'videos' ? mmp.total : 0) ??
+    0
+  )
+  const completedVideos = Number(
+    mediaReadiness?.completed_videos ??
+    mediaReadiness?.completed_intro_videos ??
+    fmp.videos_completed ??
+    mmp.videos_completed ??
+    museArtifacts.scene_videos_ready ??
+    0
+  )
   const renderFallbackTitle = completedIntroVideos > 0
     ? `Dựng thành phẩm MP4 ngay lập tức (dùng ${completedIntroVideos}/${requestedIntroVideos} video intro đã có + ảnh tĩnh cho các cảnh còn thiếu)`
     : 'Dựng thành phẩm MP4 ngay lập tức (dùng ảnh tĩnh cho toàn bộ intro)'
@@ -1796,6 +1832,32 @@ function App() {
     } catch (error) {
       setIntroRegenDialog(prev => ({ ...(prev || {}), isSubmitting: false, error: error.message }));
       alert('Lỗi tạo lại video intro: ' + error.message);
+    } finally {
+      setIsRendering(false);
+    }
+  };
+
+  const handleRetryNewFlowCanvas = async () => {
+    if (!currentVideoId || isRendering || currentVideoIsError) return;
+    if (!window.confirm("Khởi tạo Canvas Google Flow mới sạch sẽ và sinh lại video intro?\n\nToàn bộ ảnh tĩnh đã tạo sẽ được giữ nguyên 100%.")) return;
+    setIsRendering(true);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/retry-new-flow-canvas`,
+        { method: 'POST' }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể tạo Canvas Flow mới.');
+      }
+      alert(data.message || 'Đã tạo Canvas mới và tiếp tục chạy.');
+      const statusRes = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/render-status`);
+      if (statusRes.ok) {
+        const statusData = await statusRes.json();
+        setRenderInfo(statusData);
+      }
+    } catch (error) {
+      alert('Lỗi: ' + error.message);
     } finally {
       setIsRendering(false);
     }
@@ -3846,58 +3908,127 @@ function App() {
                                 gap: '10px', flexWrap: 'wrap'
                               }}>
                                 <div>
-                                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                                      <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 ({renderInfo?.render_mode === 'stock_video' ? 'Stock Video & Audio' : renderInfo?.render_mode === 'muse_ai' ? 'Muse AI & Subtitles' : 'Google Flow & Subtitles'}):</h4>
-                                      <RenderEngineBadge engine={renderInfo?.render_mode} />
-                                    </div>
-                                    {hasMp4Ready && (
-                                      <div className="media-badge-group">
-                                        <span className="media-pill-badge">{renderInfo?.mp4_details?.resolution || '1080p FHD'}</span>
-                                        <span className="media-pill-badge">{renderInfo?.mp4_details?.fps || '30 FPS'}</span>
-                                        <span className="media-pill-badge">{renderInfo?.mp4_details?.aspect_ratio || '16:9'}</span>
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                        <h4 style={{ color: 'var(--accent)', margin: 0 }}>🎬 Video MP4 ({renderInfo?.render_mode === 'stock_video' ? 'Stock Video & Audio' : renderInfo?.render_mode === 'muse_ai' ? 'Muse AI & Subtitles' : 'Google Flow & Subtitles'}):</h4>
+                                        <RenderEngineBadge engine={renderInfo?.render_mode} />
                                       </div>
-                                    )}
-                                  </div>
-                                  <div style={{
-                                    color: isRenderPaused ? '#f1c40f' : isRenderActive ? '#f39c12' : isRenderError ? '#e74c3c' : isRenderCanceled ? '#e67e22' : hasMp4Ready ? '#2ecc71' : '#aaa',
-                                    fontSize: '0.82em',
-                                    marginTop: '4px',
-                                    lineHeight: '1.4'
-                                  }}>
-                                    {isRenderPaused ? (
-                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                                        <span style={{ fontWeight: 'bold', color: '#f1c40f' }}>⏸️ Đã tạm dừng tại checkpoint</span>
-                                        <span style={{ color: '#f39c12', fontSize: '0.92em', wordBreak: 'break-word' }}>
-                                          {renderInfo?.job?.progress || 'Tác vụ đã dừng an toàn tại checkpoint; nhấn Tiếp tục để chạy tiếp.'}
+                                      {(totalImages > 0 || completedImages > 0) && (
+                                        <span style={{
+                                          fontSize: '0.78em',
+                                          padding: '2px 8px',
+                                          borderRadius: '12px',
+                                          background: 'rgba(56, 178, 172, 0.15)',
+                                          border: '1px solid #38b2ac',
+                                          color: '#81e6d9',
+                                          fontWeight: '600',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }} title="Số ảnh đã tạo thành công / Tổng số ảnh">
+                                          🖼️ {completedImages}/{totalImages || '?'} ảnh
                                         </span>
-                                      </div>
-                                    ) : isRenderActive ? (
-                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
-                                          <span>
-                                            {renderInfo?.phase === 'media_generation' ? '🎨' : '⏳'}{' '}
-                                            {renderInfo?.job?.progress || renderNotification.message || renderInfo?.production_progress || (renderJobStatus === 'running' ? (renderInfo?.render_mode === 'muse_ai' ? 'Đang tạo media Muse AI...' : 'Đang tạo ảnh Google Flow...') : 'Đang trong hàng đợi render...')}
+                                      )}
+                                      {(totalVideos > 0 || completedVideos > 0) && (
+                                        <span style={{
+                                          fontSize: '0.78em',
+                                          padding: '2px 8px',
+                                          borderRadius: '12px',
+                                          background: 'rgba(155, 89, 182, 0.15)',
+                                          border: '1px solid #9b59b6',
+                                          color: '#c39bd3',
+                                          fontWeight: '600',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '4px'
+                                        }} title="Số video đã tạo thành công / Tổng số video">
+                                          🎬 {completedVideos}/{totalVideos || '?'} video
+                                        </span>
+                                      )}
+                                      {hasMp4Ready && (
+                                        <div className="media-badge-group">
+                                          <span className="media-pill-badge">{renderInfo?.mp4_details?.resolution || '1080p FHD'}</span>
+                                          <span className="media-pill-badge">{renderInfo?.mp4_details?.fps || '30 FPS'}</span>
+                                          <span className="media-pill-badge">{renderInfo?.mp4_details?.aspect_ratio || '16:9'}</span>
+                                        </div>
+                                      )}
+                                    </div>
+                                    <div style={{
+                                      color: isRenderPaused ? '#f1c40f' : isRenderActive ? '#f39c12' : isRenderError ? '#e74c3c' : isRenderCanceled ? '#e67e22' : hasMp4Ready ? '#2ecc71' : '#aaa',
+                                      fontSize: '0.82em',
+                                      marginTop: '4px',
+                                      lineHeight: '1.4'
+                                    }}>
+                                      {isRenderPaused ? (
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                            <span style={{ fontWeight: 'bold', color: '#f1c40f' }}>⏸️ Đã tạm dừng tại checkpoint</span>
+                                            {(totalImages > 0 || totalVideos > 0 || completedImages > 0 || completedVideos > 0) && (
+                                              <span style={{
+                                                fontSize: '0.82em',
+                                                color: '#f39c12',
+                                                background: 'rgba(241, 196, 15, 0.12)',
+                                                padding: '2px 8px',
+                                                borderRadius: '4px',
+                                                border: '1px solid rgba(241, 196, 15, 0.3)',
+                                                display: 'inline-flex',
+                                                alignItems: 'center',
+                                                gap: '6px'
+                                              }}>
+                                                📊 Đã tạo: <strong>{completedImages}/{totalImages || '?'}</strong> ảnh · <strong>{completedVideos}/{totalVideos || '?'}</strong> video
+                                              </span>
+                                            )}
+                                          </div>
+                                          <span style={{ color: '#f39c12', fontSize: '0.92em', wordBreak: 'break-word' }}>
+                                            {renderInfo?.job?.progress || 'Tác vụ đã dừng an toàn tại checkpoint; nhấn Tiếp tục để chạy tiếp.'}
                                           </span>
                                         </div>
-                                        {Boolean(renderInfo?.job?.flow_media_progress?.images_total) && (
-                                          <div style={{ color: '#81e6d9', fontSize: '0.88em', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                      ) : isRenderActive ? (
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
                                             <span>
-                                              📊 Tiến độ ảnh: <strong>{renderInfo.job.flow_media_progress.images_completed}</strong>/{renderInfo.job.flow_media_progress.images_total}
-                                              {renderInfo.job.flow_media_progress.images_pending > 0 && ` (còn ${renderInfo.job.flow_media_progress.images_pending} ảnh)`}
+                                              {renderInfo?.phase === 'media_generation' ? '🎨' : '⏳'}{' '}
+                                              {renderInfo?.job?.progress || renderNotification.message || renderInfo?.production_progress || (renderJobStatus === 'running' ? (renderInfo?.render_mode === 'muse_ai' ? 'Đang tạo media Muse AI...' : 'Đang tạo ảnh Google Flow...') : 'Đang trong hàng đợi render...')} 
                                             </span>
                                           </div>
-                                        )}
-                                      </div>
-                                    ) : isRenderError ? (
-                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                                        <span style={{ fontWeight: 'bold', color: '#ff6b6b' }}>❌ Lỗi dựng video MP4</span>
-                                        <span style={{ color: '#ff9999', fontSize: '0.92em', wordBreak: 'break-word' }}>
-                                          {renderInfo?.error_message || renderInfo?.job?.error || 'Tác vụ render thất bại'}
-                                        </span>
-                                      </div>
-                                    ) : isRenderCanceled ? (
-                                      <span>⏹️ Đã dừng: {renderInfo?.job?.progress || renderInfo?.job?.error || 'Tác vụ dựng video đã dừng'}</span>
+                                          {(totalImages > 0 || totalVideos > 0 || completedImages > 0 || completedVideos > 0) && (
+                                            <div style={{ color: '#81e6d9', fontSize: '0.88em', display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                                              <span>
+                                                📊 Ảnh: <strong>{completedImages}</strong>/{totalImages || '?'}
+                                                {totalImages > completedImages && ` (còn ${totalImages - completedImages} ảnh)`}
+                                              </span>
+                                              {(totalVideos > 0 || completedVideos > 0) && (
+                                                <span style={{ color: '#c39bd3' }}>
+                                                  🎬 Video: <strong>{completedVideos}</strong>/{totalVideos || '?'}
+                                                  {totalVideos > completedVideos && ` (còn ${totalVideos - completedVideos} video)`}
+                                                </span>
+                                              )}
+                                            </div>
+                                          )}
+                                        </div>
+                                      ) : isRenderError ? (
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                            <span style={{ fontWeight: 'bold', color: '#ff6b6b' }}>❌ Lỗi dựng video MP4</span>
+                                            {(completedImages > 0 || completedVideos > 0) && (
+                                              <span style={{
+                                                fontSize: '0.82em',
+                                                color: '#ff9999',
+                                                background: 'rgba(231, 76, 60, 0.12)',
+                                                padding: '2px 8px',
+                                                borderRadius: '4px',
+                                                border: '1px solid rgba(231, 76, 60, 0.3)'
+                                              }}>
+                                                Đã lưu: {completedImages}/{totalImages || '?'} ảnh · {completedVideos}/{totalVideos || '?'} video
+                                              </span>
+                                            )}
+                                          </div>
+                                          <span style={{ color: '#ff9999', fontSize: '0.92em', wordBreak: 'break-word' }}>
+                                            {renderInfo?.error_message || renderInfo?.job?.error || 'Tác vụ render thất bại'}
+                                          </span>
+                                        </div>
+                                      ) : isRenderCanceled ? (
+                                        <span>⏹️ Đã dừng: {renderInfo?.job?.progress || renderInfo?.job?.error || 'Tác vụ dựng video đã dừng'}</span>
                                     ) : hasMp4Ready ? (
                                       <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
                                         <span style={{ fontWeight: 'bold' }}>✅ Video MP4 đã render hoàn tất</span>
@@ -3961,6 +4092,26 @@ function App() {
                                         >
                                           ✅ Dùng ảnh tĩnh & Tiếp tục Dựng MP4
                                         </button>
+                                        {renderInfo?.render_mode !== 'stock_video' && (
+                                          <button
+                                            onClick={handleRetryNewFlowCanvas}
+                                            disabled={isRendering}
+                                            title="Khởi tạo Canvas Google Flow mới sạch sẽ và sinh lại video intro (toàn bộ ảnh tĩnh đã tạo được giữ nguyên)"
+                                            style={{
+                                              background: 'linear-gradient(135deg, #0284c7, #0369a1)',
+                                              color: '#fff',
+                                              border: 'none',
+                                              padding: '4px 12px',
+                                              borderRadius: '4px',
+                                              fontSize: '0.82em',
+                                              fontWeight: 'bold',
+                                              cursor: 'pointer',
+                                              boxShadow: '0 2px 4px rgba(2, 132, 199, 0.3)'
+                                            }}
+                                          >
+                                            🔄 Đổi Canvas mới & Thử lại
+                                          </button>
+                                        )}
                                       </div>
                                     </div>
                                   )}
@@ -4055,6 +4206,29 @@ function App() {
                                           }}
                                         >
                                           ✅ Dựng MP4 ngay
+                                        </button>
+                                      )}
+                                      {renderInfo?.render_mode !== 'stock_video' && allBaseImagesReady && (
+                                        <button
+                                          className="btn-secondary"
+                                          onClick={handleRetryNewFlowCanvas}
+                                          disabled={isRendering || currentVideoIsError}
+                                          title="Khởi tạo Canvas Google Flow mới sạch sẽ và sinh lại video intro"
+                                          style={{
+                                            padding: '4px 14px',
+                                            fontSize: '0.82em',
+                                            background: 'rgba(2, 132, 199, 0.2)',
+                                            border: '1px solid #0284c7',
+                                            color: '#38bdf8',
+                                            cursor: 'pointer',
+                                            fontWeight: 'bold',
+                                            borderRadius: '4px',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '4px'
+                                          }}
+                                        >
+                                          🔄 Đổi Canvas mới & Thử lại
                                         </button>
                                       )}
                                       {renderInfo?.render_mode !== 'stock_video' && (

@@ -537,6 +537,32 @@ def normalize_image_generation_settings(value: object) -> dict:
         settings.get("scene_body_prompt_template") if settings.get("scene_body_prompt_template") is not None
         else DEFAULT_IMAGE_GENERATION_SETTINGS["scene_body_prompt_template"]
     ).strip()
+
+    try:
+        min_sec = int(settings.get("scene_duration_min_seconds", 25) or 25)
+    except (TypeError, ValueError):
+        min_sec = 25
+    try:
+        target_sec = int(settings.get("scene_duration_target_seconds", 30) or 30)
+    except (TypeError, ValueError):
+        target_sec = 30
+    try:
+        max_sec = int(settings.get("scene_duration_max_seconds", 35) or 35)
+    except (TypeError, ValueError):
+        max_sec = 35
+
+    min_sec = max(8, min(90, min_sec))
+    target_sec = max(8, min(90, target_sec))
+    max_sec = max(8, min(90, max_sec))
+
+    if target_sec < min_sec:
+        target_sec = min_sec
+    if max_sec < target_sec:
+        max_sec = target_sec
+
+    normalized["scene_duration_min_seconds"] = min_sec
+    normalized["scene_duration_target_seconds"] = target_sec
+    normalized["scene_duration_max_seconds"] = max_sec
     return normalized
 
 
@@ -550,9 +576,7 @@ def validate_image_generation_settings(value: object) -> dict:
         "workflow_profile_id",  # legacy, silently ignored
         "reference_workflow_profile_id",  # legacy, silently ignored
         "seed_mode",  # legacy, silently ignored
-        "scene_duration_min_seconds",  # legacy, silently ignored
-        "scene_duration_target_seconds",  # legacy, silently ignored
-        "scene_duration_max_seconds",  # legacy, silently ignored
+        # scene_duration_min/target/max_seconds are actively supported in DEFAULT_IMAGE_GENERATION_SETTINGS
     }
     unknown = set(settings) - allowed_write_keys
     if unknown:

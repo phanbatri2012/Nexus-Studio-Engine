@@ -2393,6 +2393,7 @@ async def _prepare_media_async(
         image_items = [(scene, False) for scene in plan["scenes"]]
         if isinstance(terminal_frame, dict):
             image_items.append((terminal_frame, True))
+        total_requested_videos = sum(1 for s in plan.get("scenes", []) if s.get("is_video"))
         terminal_frame_artifact: dict | None = None
         image_phase_started = time.monotonic()
         for image_number, (scene, is_terminal) in enumerate(image_items, 1):
@@ -2440,6 +2441,10 @@ async def _prepare_media_async(
                     "phase": "images",
                     "completed": image_number - 1,
                     "total": len(image_items),
+                    "images_completed": image_number - 1,
+                    "images_total": len(image_items),
+                    "videos_completed": 0,
+                    "videos_total": total_requested_videos,
                 },
             )
             image_artifact = await _generate_request(
@@ -2552,6 +2557,10 @@ async def _prepare_media_async(
                     "phase": "videos",
                     "completed": video_number - 1,
                     "total": len(requested_videos),
+                    "images_completed": len(image_items),
+                    "images_total": len(image_items),
+                    "videos_completed": video_number - 1,
+                    "videos_total": len(requested_videos),
                 },
             )
             video_result = await _generate_request(
