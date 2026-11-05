@@ -5,9 +5,34 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
+
+
+MAX_SESSION_COMMANDS = 256
+SESSION_IDLE_TIMEOUT_SECONDS = 900.0
+
+
+def _start_stdin_reader() -> queue.Queue[str | None]:
+    commands: queue.Queue[str | None] = queue.Queue()
+
+    def read_commands() -> None:
+        for _command_index in range(MAX_SESSION_COMMANDS + 1):
+            line = sys.stdin.readline()
+            if not line:
+                commands.put(None)
+                return
+            commands.put(line)
+
+    threading.Thread(
+        target=read_commands,
+        name="vieneu-stdin-reader",
+        daemon=True,
+    ).start()
+    return commands
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -82,7 +107,23 @@ def main() -> int:
     if bool(request.get("apply_watermark")) and tts.watermarker is None:
         raise RuntimeError("Audio watermark was requested but is unavailable.")
     print(json.dumps({"status": "ready"}), flush=True)
-    for line in sys.stdin:
+    commands = _start_stdin_reader()
+    for _command_index in range(MAX_SESSION_COMMANDS):
+        try:
+            line = commands.get(timeout=SESSION_IDLE_TIMEOUT_SECONDS)
+        except queue.Empty:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error": "VieNeu session exceeded its stdin idle timeout.",
+                    }
+                ),
+                flush=True,
+            )
+            return 2
+        if line is None:
+            break
         try:
             command = json.loads(line)
             if command.get("op") == "close":
@@ -99,6 +140,17 @@ def main() -> int:
                 ),
                 flush=True,
             )
+    else:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error": "VieNeu session reached its command limit.",
+                }
+            ),
+            flush=True,
+        )
+        return 2
     return 0
 
 

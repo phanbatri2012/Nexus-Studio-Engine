@@ -8,7 +8,7 @@ import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -197,6 +197,33 @@ class VieNeuRuntimeTests(unittest.TestCase):
             self.assertEqual(session._read_response(timeout=1), {"status": "ready"})
         finally:
             session._executor.shutdown(wait=True)
+
+    def test_session_rejects_excessive_non_protocol_output(self):
+        stream = io.StringIO("engine log\n" * 501)
+        process = SimpleNamespace(stdout=stream, kill=Mock())
+        session = vieneu_tts.VieNeuGenerationSession(
+            job_id="test-session-log-limit",
+            reference_path=Path("reference.wav"),
+            work_dir=Path("work"),
+        )
+        session.process = process
+        session._executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            with self.assertRaisesRegex(vieneu_tts.VieNeuRuntimeError, "quá nhiều log"):
+                session._read_response(timeout=2)
+            process.kill.assert_called_once_with()
+        finally:
+            session._executor.shutdown(wait=True)
+
+    def test_runner_has_bounded_commands_and_idle_timeout(self):
+        source = (ROOT / "scripts" / "vieneu_tts_runner.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("MAX_SESSION_COMMANDS = 256", source)
+        self.assertIn("SESSION_IDLE_TIMEOUT_SECONDS = 900.0", source)
+        self.assertIn("range(MAX_SESSION_COMMANDS)", source)
+        self.assertIn("commands.get(timeout=SESSION_IDLE_TIMEOUT_SECONDS)", source)
+        self.assertNotIn("while True", source)
 
 
 class VieNeuRegistryAndPreviewTests(unittest.TestCase):

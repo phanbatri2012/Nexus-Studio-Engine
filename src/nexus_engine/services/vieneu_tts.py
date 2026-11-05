@@ -389,8 +389,7 @@ class VieNeuGenerationSession:
         if process is None or process.stdout is None or executor is None:
             raise VieNeuRuntimeError("VieNeu-TTS session chưa khởi động.")
         deadline = time.monotonic() + max(1.0, float(timeout))
-        ignored_lines = 0
-        while True:
+        for _ignored_line_index in range(501):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 process.kill()
@@ -408,21 +407,18 @@ class VieNeuGenerationSession:
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
-                ignored_lines += 1
-                if ignored_lines > 500:
-                    process.kill()
-                    raise VieNeuRuntimeError(
-                        "VieNeu-TTS ghi quá nhiều log ngoài giao thức JSON."
-                    )
                 continue
             if not isinstance(payload, dict) or "status" not in payload:
-                ignored_lines += 1
                 continue
             if payload.get("status") == "error":
                 raise VieNeuRuntimeError(
                     str(payload.get("error") or "VieNeu-TTS tạo candidate lỗi.")
                 )
             return payload
+        process.kill()
+        raise VieNeuRuntimeError(
+            "VieNeu-TTS ghi quá nhiều log ngoài giao thức JSON."
+        )
 
     def generate(self, *, text: str, seed: int, output_path: Path) -> dict:
         process = self.process
