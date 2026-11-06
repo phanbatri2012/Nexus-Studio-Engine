@@ -113,6 +113,8 @@ from nexus_engine.services import (
     youtube_pinned_comment,
     youtube_publish_workflow,
     youtube_publisher,
+    vieneu_tts_api,
+    vieneu_tts_worker,
 )
 from nexus_engine.services.proxy_utils import (
     ProxyConfigurationError,
@@ -172,7 +174,7 @@ _tts_preview_sync_locks_guard = threading.Lock()
 _youtube_oauth_states: dict[str, dict] = {}
 _youtube_oauth_states_lock = threading.Lock()
 _prompts_config_lock = threading.Lock()
-_tts_config_lock = threading.Lock()
+_tts_config_lock = voice_config.CONFIG_LOCK
 CHATGPT_BUSY_ERROR = (
     "ChatGPT đang bận với tác vụ khác. Hãy đợi tác vụ hiện tại hoàn tất."
 )
@@ -191,6 +193,7 @@ TTS_PREVIEW_MAX_CHARACTERS = 200
 TTS_PREVIEW_REQUEST_MAX_CHARACTERS = 1000
 TTS_PREVIEW_RETENTION = datetime.timedelta(hours=24)
 TTS_PREVIEW_CLEANUP_INTERVAL_SECONDS = 60 * 60
+TTS_PREVIEW_NAMESPACE = uuid.UUID("daf4300a-039c-4a7f-a2d8-a574d2aa4f80")
 SYSTEM_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 VIDEO_RECOVERY_DELAYS_SECONDS = (30, 120, 300)
 YOUTUBE_RECOVERY_DELAYS_SECONDS = (120, 300, 900)
@@ -546,7 +549,7 @@ class TTSVoiceUpdate(BaseModel):
     provider_voice_id: Optional[str] = Field(
         default=None, min_length=1, max_length=256
     )
-    status: Optional[Literal["active", "archived", "unavailable"]] = None
+    status: Optional[Literal["draft", "active", "archived", "unavailable"]] = None
     config: Optional[dict] = None
     casting_profile: Optional[dict] = None
 
@@ -570,6 +573,7 @@ class TTSPreviewCreateData(BaseModel):
         min_length=1,
         max_length=TTS_PREVIEW_REQUEST_MAX_CHARACTERS,
     )
+    client_request_id: str | None = Field(default=None, min_length=8, max_length=200)
 
 DEFAULT_GPT_PROFILE = "PROFILE_GPT_1"
 
@@ -594,6 +598,7 @@ app = FastAPI(
     openapi_url=None,
 )
 app.include_router(short_video_api.router)
+app.include_router(vieneu_tts_api.router)
 
 
 @app.exception_handler(RequestValidationError)
@@ -6116,6 +6121,12 @@ def resume_background_jobs() -> None:
             "Paused %d Short Video job(s) for explicit checkpoint resume after restart.",
             paused_short_jobs,
         )
+    paused_vieneu_jobs = vieneu_tts_worker.pause_after_restart()
+    if paused_vieneu_jobs:
+        logger.info(
+            "Paused %d VieNeu TTS job(s) for explicit resume after restart.",
+            paused_vieneu_jobs,
+        )
     migrated_flow_jobs = _migrate_legacy_google_flow_render_jobs()
     if migrated_flow_jobs:
         logger.info(
@@ -6211,6 +6222,7 @@ def stop_video_queue_wakeup_timer() -> None:
     if _publish_coordinator is not None:
         _publish_coordinator.stop()
     short_video_worker.stop()
+    vieneu_tts_worker.stop()
     if _radar_coordinator is not None:
         _radar_coordinator.stop()
     chatgpt_browser_service.stop_browser_service()
@@ -15554,6 +15566,14 @@ def _public_provider(provider: dict, health: dict | None = None) -> dict:
         if (task.get("tts_provider_id") or voice_config.GENMAX_PROVIDER_ID)
         == provider_id
     ]
+    provider_jobs = []
+    if provider_id == voice_config.VIENEU_PROVIDER_ID:
+        provider_jobs = db.list_system_jobs(
+            limit=None,
+            job_type=vieneu_tts_worker.JOB_TYPE,
+            statuses={"queued", "running", "retry_wait", "paused"},
+            include_json=False,
+        )
     return {
         "id": provider_id,
         "type": provider.get("type", "external"),
@@ -15563,7 +15583,8 @@ def _public_provider(provider: dict, health: dict | None = None) -> dict:
         "config": provider.get("config") or {},
         "health": health or {"ok": False, "state": "unknown"},
         "queued_jobs": len(active_tasks)
-        + len(db.list_active_tts_previews(provider_id)),
+        + len(db.list_active_tts_previews(provider_id))
+        + len(provider_jobs),
     }
 
 
@@ -15695,6 +15716,11 @@ def set_default_tts_voice(payload: TTSDefaultVoiceData):
 @app.post("/api/tts/voices")
 def create_tts_voice(payload: TTSVoiceCreate):
     provider_id = payload.provider_id.strip().casefold()
+    if provider_id == voice_config.VIENEU_PROVIDER_ID:
+        raise HTTPException(
+            status_code=409,
+            detail="Hãy tạo giọng VieNeu bằng chức năng clone hoặc import profile.",
+        )
     with _tts_config_lock:
         config = voice_config.load_voice_config()
         if not any(provider["id"] == provider_id for provider in config["providers"]):
@@ -15706,6 +15732,8 @@ def create_tts_voice(payload: TTSVoiceCreate):
             "provider_voice_id": payload.provider_voice_id.strip(),
             "status": "active",
             "revision": 1,
+            "active_revision": 1,
+            "draft_revision": None,
             "config": payload.config,
             "casting_profile": payload.casting_profile,
         }
@@ -15734,6 +15762,15 @@ def update_tts_voice(voice_id: str, payload: TTSVoiceUpdate):
         if payload.casting_profile is not None:
             voice["casting_profile"] = payload.casting_profile
         if payload.status is not None:
+            if (
+                voice["provider_id"] == voice_config.VIENEU_PROVIDER_ID
+                and payload.status == "active"
+                and voice.get("active_revision") is None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Hãy kích hoạt một revision VieNeu đã kiểm tra trước.",
+                )
             if payload.status != "active" and config["default_voice_id"] == voice_id:
                 raise HTTPException(
                     status_code=409,
@@ -15741,7 +15778,10 @@ def update_tts_voice(voice_id: str, payload: TTSVoiceUpdate):
                 )
             voice["status"] = payload.status
         if changed_configuration:
-            voice["revision"] = int(voice.get("revision") or 1) + 1
+            next_revision = int(voice.get("revision") or 1) + 1
+            voice["revision"] = next_revision
+            if voice["provider_id"] != voice_config.VIENEU_PROVIDER_ID:
+                voice["active_revision"] = next_revision
         saved = _save_tts_config(config)
     return next(item for item in saved["voices"] if item["id"] == voice_id)
 
@@ -15931,14 +15971,15 @@ def _sync_tts_preview(preview_id: str) -> dict:
                     preview["id"],
                 )
                 config = (preview.get("voice_snapshot") or {}).get("config") or {}
-                audio_utils.validate_spoken_duration(
-                    preview["text"],
-                    duration,
-                    minimum_words_per_minute=float(
-                        config.get("min_words_per_minute") or 105
-                    ),
-                    provider_name="OmniVoice",
-                )
+                if preview["tts_provider_id"] != voice_config.VIENEU_PROVIDER_ID:
+                    audio_utils.validate_spoken_duration(
+                        preview["text"],
+                        duration,
+                        minimum_words_per_minute=float(
+                            config.get("min_words_per_minute") or 105
+                        ),
+                        provider_name="OmniVoice",
+                    )
                 return db.update_tts_preview(
                     preview["id"],
                     status="completed",
@@ -15976,10 +16017,20 @@ def create_tts_preview(payload: TTSPreviewCreateData):
             detail=f"Nội dung nghe thử tối đa {TTS_PREVIEW_MAX_CHARACTERS} ký tự.",
         )
     try:
-        voice, provider = tts.get_voice_context(payload.voice_id)
-        if voice["provider_id"] != voice_config.OMNIVOICE_PROVIDER_ID:
-            raise ValueError("Bản nghe thử tại đây chỉ hỗ trợ giọng OmniVoice.")
-        snapshot = voice_config.build_voice_snapshot(voice)
+        voice, provider = tts.get_voice_context(payload.voice_id, require_active=False)
+        if voice["provider_id"] not in {
+            voice_config.OMNIVOICE_PROVIDER_ID,
+            voice_config.VIENEU_PROVIDER_ID,
+        }:
+            raise ValueError("Bản nghe thử chỉ hỗ trợ giọng local OmniVoice hoặc VieNeu.")
+        if voice["status"] not in {"active", "draft"}:
+            raise ValueError("Giọng đã chọn không sẵn sàng để nghe thử.")
+        if (
+            voice["provider_id"] == voice_config.OMNIVOICE_PROVIDER_ID
+            and voice["status"] != "active"
+        ):
+            raise ValueError("Giọng OmniVoice phải ở trạng thái hoạt động.")
+        snapshot = voice_config.build_voice_snapshot(voice, allow_draft=True)
         preview_voice = {
             **voice,
             "provider_voice_id": snapshot["provider_voice_id"],
@@ -15987,16 +16038,31 @@ def create_tts_preview(payload: TTSPreviewCreateData):
             "config": snapshot.get("config") or {},
         }
         provider.validate_voice(preview_voice)
-        preview_id = str(uuid.uuid4())
-        request_hash = tts.get_request_hash(
-            f"tts-preview:{preview_id}:{text}",
+        preview_id = (
+            str(uuid.uuid5(TTS_PREVIEW_NAMESPACE, payload.client_request_id))
+            if payload.client_request_id
+            else str(uuid.uuid4())
+        )
+        payload_hash = tts.get_request_hash(
+            text,
             voice["id"],
             snapshot,
         )
+        request_hash = hashlib.sha256(
+            f"tts-preview:{preview_id}:{payload_hash}".encode("utf-8")
+        ).hexdigest()
+        existing = db.get_tts_preview(preview_id)
+        if existing is not None:
+            if str(existing.get("request_hash") or "") != request_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="client_request_id đã được dùng với nội dung preview khác.",
+                )
+            return _public_tts_preview(_sync_tts_preview(preview_id))
         task = provider.submit(text, preview_voice, request_hash)
         provider_task_id = str(task.get("id") or "").strip()
         if not provider_task_id:
-            raise RuntimeError("OmniVoice không trả về mã job nghe thử.")
+            raise RuntimeError("Provider TTS không trả về mã job nghe thử.")
         expires_at = (
             datetime.datetime.now(datetime.timezone.utc) + TTS_PREVIEW_RETENTION
         ).isoformat()
@@ -16084,7 +16150,7 @@ def serve_tts_preview_audio(preview_id: str, download: bool = Query(False)):
             "Cache-Control": "no-store",
             "Content-Disposition": (
                 f'{"attachment" if download else "inline"}; '
-                f'filename="omnivoice-preview-{preview["id"]}.wav"'
+                f'filename="tts-preview-{preview["id"]}.wav"'
             ),
         },
     )
