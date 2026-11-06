@@ -238,7 +238,7 @@ class VieNeuRegistryAndPreviewTests(unittest.TestCase):
         self.db_patch.stop()
         self.temp.cleanup()
 
-    def test_draft_profile_allows_preview_but_blocks_create(self):
+    def test_global_draft_voice_blocks_create_until_activation(self):
         config = self.root / "projects"
         config.mkdir()
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
@@ -246,25 +246,36 @@ class VieNeuRegistryAndPreviewTests(unittest.TestCase):
         (config / "project.json").write_text(
             json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
         )
-        technical = {
-            "available": True,
-            "reference_ready": True,
-            "reference_sha256": "a" * 64,
-            "detail": "ready",
-            "runtime": {
-                "available": True,
-                "runtime_revision": "runtime",
-                "model_revision": {"backbone": "model"},
-                "lock_sha256": "b" * 64,
-            },
+        draft_voice = {
+            "id": "bac-ho-ngam-tho",
+            "name": "Bác Hồ ngâm thơ",
+            "provider_id": "vieneu_v3_turbo",
+            "provider_voice_id": "bac-ho-ngam-tho",
+            "status": "draft",
+            "revision": 3,
+            "active_revision": None,
+            "draft_revision": 3,
+            "config": {},
+            "casting_profile": {"usage_modes": ["single_narrator"]},
         }
-        with patch.object(vieneu_tts, "managed_profile_status", return_value=technical):
+        with (
+            patch(
+                "nexus_engine.services.short_video_registry.voice_config.get_voice",
+                side_effect=ValueError("Giọng đọc đã chọn hiện không hoạt động."),
+            ),
+            patch(
+                "nexus_engine.services.short_video_registry.voice_config.load_voice_config",
+                return_value={"voices": [draft_voice]},
+            ),
+        ):
             registry = ShortVideoProjectRegistry(config)
             project = registry.get("bac-ho-ngam-tho")
-            preview_profile = registry.audio_profile_for_preview("bac-ho-ngam-tho")
         self.assertFalse(project["available"])
-        self.assertFalse(project["audio_profile_summary"]["create_ready"])
-        self.assertEqual(preview_profile["profile_id"], "bac-ho-ngam-tho-v1")
+        voice_dependency = next(
+            item for item in project["dependencies"] if item["id"] == "voice"
+        )
+        self.assertFalse(voice_dependency["available"])
+        self.assertIsNone(project["audio_profile_summary"])
         with self.assertRaisesRegex(ValueError, "Dependency"):
             registry.snapshot_for_create("bac-ho-ngam-tho")
 

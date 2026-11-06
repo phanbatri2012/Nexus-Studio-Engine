@@ -34,6 +34,7 @@ CHARACTER_MANIFEST_PATH = (
 def manifest_data():
     data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     data.pop("audio_profile", None)
+    data.pop("audio_generation_policy", None)
     data["profile_version"] = "1.0.0"
     data["voice_profile"] = {
         "provider": "omnivoice",
