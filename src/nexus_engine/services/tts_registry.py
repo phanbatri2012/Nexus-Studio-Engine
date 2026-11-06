@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import tempfile
 import uuid
 import wave
 from abc import ABC, abstractmethod
@@ -9,11 +11,16 @@ from pathlib import Path
 
 from nexus_engine.paths import AUDIO_DIR
 from nexus_engine.services import omnivoice_client
+from nexus_engine.services import security_logging
 from nexus_engine.services import tts_service as genmax_service
 from nexus_engine.services import voice_config
+from nexus_engine.services import vieneu_tts
+from nexus_engine.services import vieneu_tts_worker
+from nexus_engine.services import vieneu_voice_profiles
 
 
 OMNIVOICE_TASK_PREFIX = "omnivoice:"
+VIENEU_TASK_PREFIX = vieneu_tts_worker.TASK_PREFIX
 PREVIEW_AUDIO_DIR = AUDIO_DIR / "previews"
 
 
@@ -177,9 +184,168 @@ class OmniVoiceProvider(TTSProvider):
         )
 
 
+class VieNeuProvider(TTSProvider):
+    id = voice_config.VIENEU_PROVIDER_ID
+
+    @staticmethod
+    def _snapshot(voice: dict, *, allow_draft: bool = False) -> dict:
+        if voice.get("profile") and voice.get("voice_id"):
+            return voice
+        return voice_config.build_voice_snapshot(voice, allow_draft=allow_draft)
+
+    @staticmethod
+    def _normalize_job(job: dict) -> dict:
+        status = {
+            "queued": "queued",
+            "running": "processing",
+            "retry_wait": "queued",
+            "paused": "paused",
+            "done": "completed",
+            "failed": "failed",
+            "error": "failed",
+            "canceled": "canceled",
+        }.get(str(job.get("status") or ""), "processing")
+        result = job.get("result") or {}
+        return {
+            "id": vieneu_tts_worker.task_id(str(job.get("id") or "")),
+            "status": status,
+            "progress": str(job.get("progress") or ""),
+            "error": str(job.get("error") or ""),
+            "result": {
+                "audio_url": (
+                    f"vieneu://{job.get('id')}" if status == "completed" else ""
+                ),
+                "duration_seconds": result.get("duration_seconds"),
+            },
+        }
+
+    def health(self, *, test_connection: bool = False) -> dict:
+        runtime = vieneu_tts.runtime_status(verify_hashes=True)
+        worker = vieneu_tts_worker.status()
+        probe_ok = None
+        probe_error = ""
+        if test_connection and runtime.get("available"):
+            try:
+                voice = next(
+                    item
+                    for item in voice_config.load_voice_config().get("voices") or []
+                    if item.get("provider_id") == self.id
+                    and (item.get("active_revision") or item.get("draft_revision"))
+                )
+                revision = int(
+                    voice.get("active_revision") or voice.get("draft_revision") or 0
+                )
+                reference = vieneu_voice_profiles.reference_path(voice["id"], revision)
+                with tempfile.TemporaryDirectory(prefix="vieneu-health-") as temporary:
+                    work_dir = Path(temporary)
+                    with vieneu_tts.VieNeuGenerationSession(
+                        job_id=f"vieneu-health-{uuid.uuid4()}",
+                        reference_path=reference,
+                        work_dir=work_dir,
+                        timeout_seconds=180,
+                    ) as session:
+                        session.generate(
+                            text="Xin chào.",
+                            seed=20261106,
+                            output_path=work_dir / "probe.wav",
+                        )
+                probe_ok = True
+            except Exception as exc:
+                probe_ok = False
+                probe_error = str(security_logging.redact_sensitive(exc))
+        healthy = bool(runtime.get("available")) and probe_ok is not False
+        return {
+            "ok": healthy,
+            "state": "ready" if healthy else "unavailable",
+            "configured": bool(vieneu_tts.resolve_runtime_home()),
+            "busy": bool(worker.get("current_job_id")),
+            "runtime_revision": runtime.get("runtime_revision") or "",
+            "model_revision": runtime.get("model_revision") or {},
+            "backend": "onnx",
+            "precision": "fp32",
+            "max_parallel_jobs": 1,
+            "connection_tested": bool(test_connection),
+            "probe_ok": probe_ok,
+            "error": probe_error or (
+                "" if runtime.get("available") else runtime.get("detail") or ""
+            ),
+        }
+
+    def validate_voice(self, voice: dict) -> None:
+        snapshot = self._snapshot(
+            voice,
+            allow_draft=str(voice.get("status") or "") == "draft",
+        )
+        profile = snapshot.get("profile") or {}
+        status = vieneu_voice_profiles.revision_status(
+            str(profile.get("voice_id") or snapshot.get("voice_id") or ""),
+            int(profile.get("revision") or snapshot.get("voice_revision") or 0),
+            verify_runtime=True,
+        )
+        if not status.get("available"):
+            raise ValueError(str(status.get("detail") or "Voice VieNeu chưa sẵn sàng."))
+        if status.get("reference_sha256") != profile.get("reference_sha256"):
+            raise ValueError("Reference VieNeu không khớp voice snapshot.")
+
+    def submit(self, text: str, voice: dict, request_hash: str) -> dict:
+        snapshot = self._snapshot(
+            voice,
+            allow_draft=str(voice.get("status") or "") == "draft",
+        )
+        self.validate_voice(snapshot)
+        job = vieneu_tts_worker.enqueue(
+            text=text,
+            voice_snapshot=snapshot,
+            request_hash=request_hash,
+            title=f"Tạo audio · {snapshot.get('voice_name') or 'VieNeu'}",
+        )
+        return self._normalize_job(job)
+
+    def poll(self, task_id: str) -> dict:
+        from nexus_engine.services import database as db
+
+        job = db.get_system_job(vieneu_tts_worker.raw_job_id(task_id))
+        if not job or job.get("job_type") != vieneu_tts_worker.JOB_TYPE:
+            raise ValueError("Task VieNeu không tồn tại.")
+        return self._normalize_job(job)
+
+    def cancel(self, task_id: str) -> dict:
+        return self._normalize_job(vieneu_tts_worker.cancel(task_id))
+
+    def recover(self, task_id: str) -> dict:
+        return self._normalize_job(vieneu_tts_worker.recover(task_id))
+
+    def list_remote_voices(self) -> dict:
+        voices = [
+            {
+                "id": voice["provider_voice_id"],
+                "voice_id": voice["id"],
+                "name": voice["name"],
+                "status": voice["status"],
+                "active_revision": voice.get("active_revision"),
+                "draft_revision": voice.get("draft_revision"),
+                "revisions": [
+                    vieneu_voice_profiles.public_revision(item)
+                    for item in vieneu_voice_profiles.list_revisions(voice["id"])
+                ],
+            }
+            for voice in voice_config.load_voice_config()["voices"]
+            if voice["provider_id"] == self.id
+        ]
+        return {"profiles": voices, "samples": []}
+
+    def download_audio(self, task_id: str, destination: Path) -> Path:
+        source = vieneu_tts_worker.audio_path(task_id)
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        return destination
+
+
 PROVIDERS: dict[str, TTSProvider] = {
     GenmaxProvider.id: GenmaxProvider(),
     OmniVoiceProvider.id: OmniVoiceProvider(),
+    VieNeuProvider.id: VieNeuProvider(),
 }
 
 
@@ -250,6 +416,19 @@ def get_request_hash(
         "voice_revision": int(voice.get("revision") or 1),
         "settings": voice.get("config") or {},
     }
+    if voice["provider_id"] == voice_config.VIENEU_PROVIDER_ID and voice_snapshot:
+        profile = voice_snapshot.get("profile") or {}
+        request_data.update(
+            {
+                "profile_revision": int(
+                    profile.get("revision")
+                    or voice_snapshot.get("voice_revision")
+                    or 1
+                ),
+                "reference_sha256": str(profile.get("reference_sha256") or ""),
+                "model_revision": voice_snapshot.get("model_revision") or {},
+            }
+        )
     canonical = json.dumps(
         request_data,
         ensure_ascii=False,
@@ -275,6 +454,10 @@ def split_text_for_tts(
             return []
         if len(normalized) > genmax_service.MAX_TTS_TOTAL_CHARS:
             raise ValueError("Kịch bản vượt giới hạn an toàn cho một lượt tạo audio.")
+        return [normalized]
+    if voice["provider_id"] == voice_config.VIENEU_PROVIDER_ID:
+        normalized = str(text or "").strip()
+        vieneu_tts_worker.split_text(normalized)
         return [normalized]
     return genmax_service.split_text_for_tts(
         text,
@@ -313,7 +496,11 @@ def submit_tts_task(
     request_hash: str = "",
 ) -> dict:
     if voice_snapshot:
-        voice = _voice_for_hash(voice_id, voice_snapshot)
+        voice = {
+            **_voice_for_hash(voice_id, voice_snapshot),
+            **voice_snapshot,
+            "status": "active",
+        }
         provider = get_provider(voice["provider_id"])
     else:
         voice, provider = get_voice_context(voice_id)
@@ -330,6 +517,8 @@ def _provider_for_task(task_id: str, provider_id: str = "") -> TTSProvider:
         return get_provider(provider_id)
     if str(task_id or "").startswith(OMNIVOICE_TASK_PREFIX):
         return get_provider(voice_config.OMNIVOICE_PROVIDER_ID)
+    if str(task_id or "").startswith(VIENEU_TASK_PREFIX):
+        return get_provider(voice_config.VIENEU_PROVIDER_ID)
     return get_provider(voice_config.GENMAX_PROVIDER_ID)
 
 
@@ -369,7 +558,7 @@ def find_matching_task(
 def materialize_audio(task: dict, video_id: int, request_hash: str) -> tuple[str, float | None]:
     task_id = str(task.get("id") or "")
     provider = _provider_for_task(task_id)
-    if isinstance(provider, OmniVoiceProvider):
+    if hasattr(provider, "download_audio"):
         destination = AUDIO_DIR / f"video_{video_id}_{request_hash[:16]}.wav"
         provider.download_audio(task_id, destination)
         with wave.open(str(destination), "rb") as source:
@@ -390,8 +579,8 @@ def discard_materialized_audio(video_id: int, request_hash: str) -> None:
 def materialize_preview_audio(task: dict, preview_id: str) -> tuple[str, float]:
     task_id = str(task.get("id") or "")
     provider = _provider_for_task(task_id)
-    if not isinstance(provider, OmniVoiceProvider):
-        raise ValueError("Bản nghe thử này không thuộc OmniVoice.")
+    if not hasattr(provider, "download_audio"):
+        raise ValueError("Provider không hỗ trợ tải bản nghe thử.")
     normalized_preview_id = str(uuid.UUID(str(preview_id)))
     PREVIEW_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     destination = PREVIEW_AUDIO_DIR / f"{normalized_preview_id}.wav"
@@ -400,7 +589,7 @@ def materialize_preview_audio(task: dict, preview_id: str) -> tuple[str, float]:
         with wave.open(str(destination), "rb") as source:
             duration = source.getnframes() / source.getframerate()
         if duration <= 0:
-            raise ValueError("OmniVoice trả về bản nghe thử rỗng.")
+            raise ValueError("Provider trả về bản nghe thử rỗng.")
         return destination.name, duration
     except Exception:
         destination.unlink(missing_ok=True)

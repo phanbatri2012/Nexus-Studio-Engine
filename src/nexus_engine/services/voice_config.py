@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
 import uuid
 from copy import deepcopy
 
@@ -10,17 +11,19 @@ from nexus_engine.paths import DATA_DIR
 from nexus_engine.services.secret_store import write_private_text
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 GENMAX_PROVIDER_ID = "genmax"
 OMNIVOICE_PROVIDER_ID = "omnivoice"
+VIENEU_PROVIDER_ID = "vieneu_v3_turbo"
 DEFAULT_VOICE_ID = "e1d9617c-045c-4072-8d17-9be0ec113723"
 DEFAULT_VOICE_NAME = "Giọng mặc định hiện tại"
 VOICE_CONFIG_PATH = DATA_DIR / "voices.json"
+CONFIG_LOCK = threading.RLock()
 MAX_VOICE_OPTIONS = 200
 MAX_PROVIDER_OPTIONS = 20
 MAX_VOICE_ID_LENGTH = 128
 MAX_PROVIDER_VOICE_ID_LENGTH = 256
-VOICE_STATUSES = {"active", "archived", "unavailable"}
+VOICE_STATUSES = {"draft", "active", "archived", "unavailable"}
 CASTING_GENDERS = {"any", "male", "female"}
 CASTING_AGE_GROUPS = {"any", "young", "adult", "senior"}
 CASTING_USAGE_MODES = {"single_narrator", "multi_host", "multi_guest"}
@@ -196,6 +199,27 @@ def _default_providers() -> list[dict]:
                 "idle_unload_seconds": 900,
             },
         },
+        {
+            "id": VIENEU_PROVIDER_ID,
+            "type": "local_on_demand",
+            "display_name": "VieNeu v3 Turbo",
+            "enabled": True,
+            "health": "unknown",
+            "capabilities": {
+                "remote_voices": False,
+                "voice_clone": True,
+                "preview": True,
+                "standalone_generation": True,
+                "billable": False,
+                "parallel_jobs": False,
+            },
+            "config": {
+                "backend": "onnx",
+                "precision": "fp32",
+                "sample_rate": 48000,
+                "max_parallel_jobs": 1,
+            },
+        },
     ]
 
 
@@ -214,6 +238,8 @@ def _default_config() -> dict:
                 "provider_voice_id": DEFAULT_VOICE_ID,
                 "status": "active",
                 "revision": 1,
+                "active_revision": 1,
+                "draft_revision": None,
                 "config": {},
                 "casting_profile": normalize_casting_profile({}),
             }
@@ -241,6 +267,8 @@ def _legacy_to_v2(data: dict) -> dict:
                 "provider_voice_id": raw_voice.get("id", ""),
                 "status": "active",
                 "revision": 1,
+                "active_revision": 1,
+                "draft_revision": None,
                 "config": {},
                 "casting_profile": normalize_casting_profile({}),
             }
@@ -248,6 +276,34 @@ def _legacy_to_v2(data: dict) -> dict:
             if isinstance(raw_voice, dict)
         ],
     }
+
+
+def _migrate_to_current(data: dict) -> dict:
+    version = int(data.get("schema_version") or 1)
+    migrated = _legacy_to_v2(data) if version < 2 else deepcopy(data)
+    providers = migrated.get("providers")
+    if not isinstance(providers, list):
+        providers = []
+    existing_provider_ids = {
+        str(provider.get("id") or "").strip().casefold()
+        for provider in providers
+        if isinstance(provider, dict)
+    }
+    for provider in _default_providers():
+        if provider["id"] not in existing_provider_ids:
+            providers.append(provider)
+    migrated["providers"] = providers
+    for voice in migrated.get("voices") or []:
+        if not isinstance(voice, dict):
+            continue
+        revision = max(1, int(voice.get("revision") or 1))
+        status = str(voice.get("status") or "active").strip().casefold()
+        if "active_revision" not in voice:
+            voice["active_revision"] = revision if status != "draft" else None
+        if "draft_revision" not in voice:
+            voice["draft_revision"] = revision if status == "draft" else None
+    migrated["schema_version"] = SCHEMA_VERSION
+    return migrated
 
 
 def _validate_public_config(config: object, label: str) -> dict:
@@ -268,7 +324,7 @@ def validate_voice_config(data: dict) -> dict:
     if not isinstance(data, dict):
         raise ValueError("Voice configuration must be an object.")
     if int(data.get("schema_version") or 1) < SCHEMA_VERSION:
-        data = _legacy_to_v2(data)
+        data = _migrate_to_current(data)
 
     raw_providers = data.get("providers")
     if not isinstance(raw_providers, list) or not raw_providers:
@@ -345,6 +401,27 @@ def validate_voice_config(data: dict) -> dict:
             raise ValueError("Mã giọng trong cùng nhà cung cấp không được trùng nhau.")
         seen_ids.add(voice_id)
         seen_provider_keys.add(provider_key)
+        raw_active_revision = raw_voice.get("active_revision")
+        raw_draft_revision = raw_voice.get("draft_revision")
+        active_revision = (
+            max(1, int(raw_active_revision))
+            if raw_active_revision not in (None, "")
+            else None
+        )
+        draft_revision = (
+            max(1, int(raw_draft_revision))
+            if raw_draft_revision not in (None, "")
+            else None
+        )
+        if status == "draft" and draft_revision is None:
+            draft_revision = revision
+        if status == "active" and active_revision is None:
+            active_revision = revision
+        if status == "active" and active_revision is None:
+            raise ValueError(f"Giọng '{voice_name}' thiếu revision đang hoạt động.")
+        if status == "draft" and draft_revision is None:
+            raise ValueError(f"Giọng '{voice_name}' thiếu draft revision.")
+        effective_revision = active_revision or draft_revision or revision
         voices.append(
             {
                 "id": voice_id,
@@ -352,7 +429,9 @@ def validate_voice_config(data: dict) -> dict:
                 "provider_id": provider_id,
                 "provider_voice_id": provider_voice_id,
                 "status": status,
-                "revision": revision,
+                "revision": effective_revision,
+                "active_revision": active_revision,
+                "draft_revision": draft_revision,
                 "config": _validate_public_config(raw_voice.get("config") or {}, "giọng"),
                 "casting_profile": normalize_casting_profile(
                     raw_voice.get("casting_profile")
@@ -380,7 +459,10 @@ def validate_voice_config(data: dict) -> dict:
 def _backup_legacy_config(raw_data: dict) -> None:
     if int(raw_data.get("schema_version") or 1) >= SCHEMA_VERSION:
         return
-    backup_path = VOICE_CONFIG_PATH.with_name(f"{VOICE_CONFIG_PATH.name}.v1.bak")
+    old_version = max(1, int(raw_data.get("schema_version") or 1))
+    backup_path = VOICE_CONFIG_PATH.with_name(
+        f"{VOICE_CONFIG_PATH.name}.v{old_version}.bak"
+    )
     if VOICE_CONFIG_PATH.exists() and not backup_path.exists():
         shutil.copy2(VOICE_CONFIG_PATH, backup_path)
 
@@ -428,7 +510,12 @@ def get_voice(voice_id: str = "", *, include_inactive: bool = True) -> dict:
     raise ValueError("Giọng đọc đã chọn không có trong cấu hình.")
 
 
-def build_voice_snapshot(voice: dict) -> dict:
+def build_voice_snapshot(
+    voice: dict,
+    *,
+    revision: int | None = None,
+    allow_draft: bool = False,
+) -> dict:
     voice_id = str(voice.get("id") or "").strip()
     provider_id = str(
         voice.get("provider_id") or GENMAX_PROVIDER_ID
@@ -446,7 +533,16 @@ def build_voice_snapshot(voice: dict) -> dict:
         effective_config["denoise"] = False
     else:
         effective_config = raw_config
-    return {
+    selected_revision = revision
+    if selected_revision is None:
+        selected_revision = voice.get("active_revision")
+        if selected_revision in (None, "") and allow_draft:
+            selected_revision = voice.get("draft_revision")
+    selected_revision = max(
+        1,
+        int(selected_revision or voice.get("revision") or 1),
+    )
+    snapshot = {
         "voice_id": voice_id,
         "voice_name": str(voice.get("name") or "Giọng đã lưu").strip(),
         # A missing provider denotes a pre-v2 row, which was always Genmax.
@@ -454,9 +550,19 @@ def build_voice_snapshot(voice: dict) -> dict:
         "provider_voice_id": str(
             voice.get("provider_voice_id") or voice_id
         ).strip(),
-        "voice_revision": int(voice.get("revision") or 1),
+        "voice_revision": selected_revision,
         "config": effective_config,
         "casting_profile": normalize_casting_profile(
             voice.get("casting_profile")
         ),
     }
+    if provider_id == VIENEU_PROVIDER_ID:
+        from nexus_engine.services import vieneu_voice_profiles
+
+        snapshot.update(
+            vieneu_voice_profiles.build_voice_snapshot_fields(
+                voice_id=voice_id,
+                revision=selected_revision,
+            )
+        )
+    return snapshot
