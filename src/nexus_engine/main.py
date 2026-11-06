@@ -15179,6 +15179,8 @@ def get_video(video_id: int):
         for channel in db.list_youtube_channels()
     }
     _add_video_default_youtube_channel(video, prompt_data, channels_by_id)
+    task = db.get_audio_task(video_id)
+    video["audio_task"] = _audio_task_response(task) if task else None
     return video
 
 @app.delete("/api/videos/{video_id}")

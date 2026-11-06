@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
 import { formatDateTimeAMPM } from './publicationTime.js'
 import BackgroundCanvas, { BACKGROUND_MODES } from './BackgroundCanvas'
@@ -231,7 +231,38 @@ function App() {
   const [isCancelingAudio, setIsCancelingAudio] = useState(false)
   const [audioStatus, setAudioStatus] = useState('not_started')
   const [audioMissingSegments, setAudioMissingSegments] = useState(0)
+  const [audioCompletedSegments, setAudioCompletedSegments] = useState(0)
+  const [audioSegmentCount, setAudioSegmentCount] = useState(0)
+  const [audioTaskError, setAudioTaskError] = useState('')
   const [audioRoleStreams, setAudioRoleStreams] = useState(null)
+
+  const isAudioActive = Boolean(isGenAudio || audioStatus === 'pending' || audioStatus === 'processing')
+  const audioPercent = audioSegmentCount > 0
+    ? Math.min(100, Math.round((audioCompletedSegments / audioSegmentCount) * 100))
+    : 0
+
+  const applyAudioTask = useCallback((task) => {
+    if (!task) {
+      setAudioStatus('not_started')
+      setAudioMissingSegments(0)
+      setAudioCompletedSegments(0)
+      setAudioSegmentCount(0)
+      setAudioTaskError('')
+      setAudioRoleStreams(null)
+      setIsGenAudio(false)
+      return
+    }
+    const status = task.status || 'not_started'
+    setAudioStatus(status)
+    setAudioMissingSegments(task.missing_segments || 0)
+    setAudioCompletedSegments(Number(task.completed_segments) || 0)
+    setAudioSegmentCount(Number(task.segment_count) || 0)
+    setAudioTaskError(task.error || '')
+    setAudioRoleStreams(task.role_streams || null)
+    setAudioTaskVoiceName(task.voice_name || '')
+    setAudioTaskProviderId(task.tts_provider_id || 'genmax')
+    setIsGenAudio(status === 'pending' || status === 'processing')
+  }, [])
   const [renderInfo, setRenderInfo] = useState(null)
   const [isRendering, setIsRendering] = useState(false)
   const [isCancelingRender, setIsCancelingRender] = useState(false)
@@ -689,13 +720,8 @@ function App() {
         const data = await response.json();
         if (stopped || !data.success) return;
 
+        applyAudioTask(data.audio_task);
         const status = data.audio_task?.status || 'not_started';
-        setAudioStatus(status);
-        setAudioMissingSegments(data.audio_task?.missing_segments || 0);
-        setAudioRoleStreams(data.audio_task?.role_streams || null);
-        setAudioTaskVoiceName(data.audio_task?.voice_name || '');
-        setAudioTaskProviderId(data.audio_task?.tts_provider_id || 'genmax');
-        setIsGenAudio(status === 'pending' || status === 'processing');
 
         if (status === 'completed') {
           const videoResponse = await fetch(
@@ -1011,9 +1037,11 @@ function App() {
       setCurrentVideoPublications(data.publications || []);
       setCurrentVideoDefaultChannelTitle(data.default_youtube_channel_title || '');
       setCurrentVideoHasCheckpoint(Boolean(data.has_checkpoint));
-      setAudioStatus('not_started');
-      setAudioMissingSegments(0);
-      setAudioRoleStreams(null);
+      if (data.audio_task) {
+        applyAudioTask(data.audio_task);
+      } else {
+        applyAudioTask(null);
+      }
       setRenderInfo(null);
       setIsRendering(false);
       setErrorMsg('');
@@ -1045,8 +1073,7 @@ function App() {
     setCurrentVideoPublications([]);
     setCurrentVideoDefaultChannelTitle('');
     setCurrentVideoHasCheckpoint(false);
-    setAudioStatus('not_started');
-    setAudioMissingSegments(0);
+    applyAudioTask(null);
     setRenderInfo(null);
     setIsRendering(false);
     setErrorMsg('');
@@ -1528,17 +1555,13 @@ function App() {
       const data = await res.json();
       if (data.audio_review) setAudioReview(data.audio_review);
       if (!data.success) {
-        setAudioStatus(data.audio_task?.status || 'not_started');
-        setAudioMissingSegments(data.audio_task?.missing_segments || 0);
+        applyAudioTask(data.audio_task);
         alert('Lỗi: ' + (data.detail || data.error || 'Không thể tạo audio.'));
         return;
       }
 
+      applyAudioTask(data.audio_task);
       const status = data.audio_task?.status || 'pending';
-      setAudioStatus(status);
-      setAudioMissingSegments(data.audio_task?.missing_segments || 0);
-      setAudioTaskVoiceName(data.audio_task?.voice_name || '');
-      setAudioTaskProviderId(data.audio_task?.tts_provider_id || 'genmax');
       keepPolling = status === 'pending' || status === 'processing';
       if (status === 'completed') {
         const videoResponse = await fetch(
@@ -1582,10 +1605,7 @@ function App() {
       if (!response.ok || !data.success) {
         throw new Error(data.detail || data.error || 'Không thể retry audio.');
       }
-      setAudioStatus(data.audio_task?.status || 'pending');
-      setAudioMissingSegments(data.audio_task?.missing_segments || 0);
-      setAudioTaskVoiceName(data.audio_task?.voice_name || '');
-      setAudioTaskProviderId(data.audio_task?.tts_provider_id || audioTaskProviderId);
+      applyAudioTask(data.audio_task);
     } catch (error) {
       setIsGenAudio(false);
       alert('Lỗi: ' + error.message);
@@ -1637,12 +1657,8 @@ function App() {
       if (!response.ok || !data.success) {
         throw new Error(data.detail || data.error || 'Không thể tạo lại audio.');
       }
+      applyAudioTask(data.audio_task);
       const status = data.audio_task?.status || 'pending';
-      setAudioStatus(status);
-      setAudioMissingSegments(data.audio_task?.missing_segments || 0);
-      setAudioTaskVoiceName(data.audio_task?.voice_name || voiceName);
-      setAudioTaskProviderId(data.audio_task?.tts_provider_id || providerId);
-      setIsGenAudio(status === 'pending' || status === 'processing');
       if (status === 'completed') {
         const videoResponse = await fetch(
           `http://127.0.0.1:8080/api/videos/${currentVideoId}`
@@ -1710,10 +1726,7 @@ function App() {
       if (!response.ok || !data.success) {
         throw new Error(data.detail || data.error || 'Không thể tạo lại vai này.');
       }
-      const status = data.audio_task?.status || 'pending';
-      setAudioStatus(status);
-      setAudioRoleStreams(data.audio_task?.role_streams || null);
-      setIsGenAudio(status === 'pending' || status === 'processing');
+      applyAudioTask(data.audio_task);
     } catch (error) {
       setIsGenAudio(false);
       alert('Lỗi: ' + error.message);
@@ -1732,9 +1745,7 @@ function App() {
         throw new Error(data.detail || data.error || 'Không thể ghép audio.');
       }
       alert('Đã ghép Audio Master thành công!');
-      const status = data.audio_task?.status || 'completed';
-      setAudioStatus(status);
-      setAudioRoleStreams(data.audio_task?.role_streams || null);
+      applyAudioTask(data.audio_task);
       const videoResponse = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}`);
       const video = await videoResponse.json();
       setResultText(video.generated_script);
@@ -3237,7 +3248,7 @@ function App() {
                             }
                             disabled={
                               currentVideoIsError ||
-                              isGenAudio ||
+                              isAudioActive ||
                               isLoadingAudioReview ||
                               (audioStatus === 'failed'
                                 ? audioReview?.status !== 'approved'
@@ -3245,21 +3256,21 @@ function App() {
                             }
                             style={{
                               padding: '4px 14px', borderRadius: '4px',
-                              cursor: (currentVideoIsError || isGenAudio || isLoadingAudioReview || Boolean(audioReview && !audioReview.can_approve)) ? 'not-allowed' : 'pointer',
+                              cursor: (currentVideoIsError || isAudioActive || isLoadingAudioReview || Boolean(audioReview && !audioReview.can_approve)) ? 'not-allowed' : 'pointer',
                               border: '1px solid #1abc9c',
-                              background: (currentVideoIsError || isGenAudio || isLoadingAudioReview) ? '#333' : 'rgba(26,188,156,0.2)',
-                              color: (currentVideoIsError || isGenAudio || isLoadingAudioReview) ? '#888' : '#1abc9c',
+                              background: (currentVideoIsError || isAudioActive || isLoadingAudioReview) ? '#333' : 'rgba(26,188,156,0.2)',
+                              color: (currentVideoIsError || isAudioActive || isLoadingAudioReview) ? '#888' : '#1abc9c',
                               fontWeight: 'bold'
                             }}
                           >
-                            {isGenAudio
+                            {isAudioActive
                               ? audioStatus === 'interrupted'
                                 ? '⏳ Đang tiếp tục Audio...'
-                                : '⏳ Đang chờ Genmax...'
+                                : `⏳ Đang tạo Audio... ${audioSegmentCount > 0 ? `${audioCompletedSegments}/${audioSegmentCount} (${audioPercent}%)` : ''}`
                               : audioStatus === 'interrupted'
                                 ? `🔄 Tiếp tục Audio${audioMissingSegments ? ` (còn ${audioMissingSegments} phần)` : ''}`
                               : audioStatus === 'failed'
-                                ? '⚠️ Retry Audio (sẽ tốn credit)'
+                                ? '⚠️ Retry Audio'
                                 : audioReview?.status === 'blocked'
                                   ? '⛔ Kịch bản cần sửa'
                                   : '🔎 Kiểm tra tự động & tạo Audio'}
@@ -3422,8 +3433,20 @@ function App() {
                           {/* 2. Audio Voice-over */}
                           <div
                             style={{
-                              background: isGenAudio ? 'rgba(245, 176, 65, 0.08)' : 'rgba(255, 255, 255, 0.03)',
-                              border: isGenAudio ? '1px solid rgba(245, 176, 65, 0.4)' : '1px solid rgba(255, 255, 255, 0.08)',
+                              background: isAudioActive
+                                ? 'rgba(245, 176, 65, 0.08)'
+                                : (audioUrl || audioStatus === 'completed')
+                                ? 'rgba(46, 204, 113, 0.06)'
+                                : (audioStatus === 'failed' || audioStatus === 'interrupted')
+                                ? 'rgba(231, 76, 60, 0.08)'
+                                : 'rgba(255, 255, 255, 0.03)',
+                              border: isAudioActive
+                                ? '1px solid rgba(245, 176, 65, 0.4)'
+                                : (audioUrl || audioStatus === 'completed')
+                                ? '1px solid rgba(46, 204, 113, 0.3)'
+                                : (audioStatus === 'failed' || audioStatus === 'interrupted')
+                                ? '1px solid rgba(231, 76, 60, 0.4)'
+                                : '1px solid rgba(255, 255, 255, 0.08)',
                               borderRadius: '8px',
                               padding: '10px 12px',
                               display: 'flex',
@@ -3433,24 +3456,87 @@ function App() {
                             }}
                           >
                             <div>
-                              <div style={{ fontSize: '0.76em', color: '#888', fontWeight: '600', marginBottom: '4px' }}>
-                                🎙️ 2. AUDIO VOICE-OVER
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                                <span style={{ fontSize: '0.76em', color: '#888', fontWeight: '600' }}>
+                                  🎙️ 2. AUDIO VOICE-OVER
+                                </span>
+                                {(audioTaskProviderId || currentVideoProviderId) && (
+                                  <span style={{
+                                    fontSize: '0.7em',
+                                    padding: '1px 5px',
+                                    borderRadius: '4px',
+                                    background: 'rgba(56, 189, 248, 0.15)',
+                                    color: '#38bdf8',
+                                    border: '1px solid rgba(56, 189, 248, 0.3)',
+                                    fontWeight: '600'
+                                  }}>
+                                    {voiceProviderName(audioTaskProviderId || currentVideoProviderId)}
+                                  </span>
+                                )}
                               </div>
                               <div style={{
                                 fontSize: '0.85em',
                                 fontWeight: '600',
-                                color: isGenAudio ? '#f5b041' : (audioUrl || audioStatus === 'completed') ? '#2ecc71' : (audioStatus === 'failed' || audioStatus === 'interrupted') ? '#ff6b6b' : '#888'
-                              }}>
-                                {isGenAudio
-                                  ? `⏳ Đang tạo audio... ${audioMissingSegments > 0 ? `(còn ${audioMissingSegments} đoạn)` : ''}`
+                                color: isAudioActive
+                                  ? '#f5b041'
                                   : (audioUrl || audioStatus === 'completed')
-                                    ? '✅ Audio đã hoàn thành'
+                                    ? '#2ecc71'
                                     : (audioStatus === 'failed' || audioStatus === 'interrupted')
-                                      ? '❌ Lỗi tạo audio'
-                                      : '⚪ Chưa tạo audio'}
+                                      ? '#ff6b6b'
+                                      : '#888'
+                              }}>
+                                {isAudioActive ? (
+                                  <div>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                      <span>⏳ Đang tạo audio...</span>
+                                      <span style={{ fontSize: '0.9em', color: '#fbbf24' }}>
+                                        {audioSegmentCount > 0 ? `${audioCompletedSegments}/${audioSegmentCount} đoạn (${audioPercent}%)` : ''}
+                                      </span>
+                                    </div>
+                                    <div style={{
+                                      width: '100%',
+                                      height: '6px',
+                                      background: 'rgba(255, 255, 255, 0.1)',
+                                      borderRadius: '3px',
+                                      overflow: 'hidden',
+                                      margin: '6px 0 4px'
+                                    }}>
+                                      <div style={{
+                                        width: `${Math.max(4, audioPercent)}%`,
+                                        height: '100%',
+                                        background: 'linear-gradient(90deg, #f59e0b, #10b981)',
+                                        borderRadius: '3px',
+                                        transition: 'width 0.3s ease'
+                                      }} />
+                                    </div>
+                                    {audioRoleStreams && (
+                                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', fontSize: '0.76em', color: '#94a3b8', marginTop: '2px' }}>
+                                        {audioRoleStreams.MC && (
+                                          <span>🎙️ MC: {audioRoleStreams.MC.completed}/{audioRoleStreams.MC.total} ({audioRoleStreams.MC.percent}%)</span>
+                                        )}
+                                        {audioRoleStreams.KHACH_1 && (
+                                          <span>🗣️ Khách: {audioRoleStreams.KHACH_1.completed}/{audioRoleStreams.KHACH_1.total} ({audioRoleStreams.KHACH_1.percent}%)</span>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                ) : (audioUrl || audioStatus === 'completed') ? (
+                                  `✅ Audio đã hoàn thành ${audioSegmentCount > 0 ? `(${audioSegmentCount}/${audioSegmentCount} đoạn)` : ''}`
+                                ) : (audioStatus === 'failed' || audioStatus === 'interrupted') ? (
+                                  <div>
+                                    <div>❌ Lỗi tạo audio {audioCompletedSegments > 0 ? `(dừng ở ${audioCompletedSegments}/${audioSegmentCount})` : ''}</div>
+                                    {audioTaskError && (
+                                      <div style={{ fontSize: '0.75em', color: '#ff8888', marginTop: '2px', fontWeight: 'normal' }}>
+                                        {audioTaskError}
+                                      </div>
+                                    )}
+                                  </div>
+                                ) : (
+                                  '⚪ Chưa tạo audio'
+                                )}
                               </div>
                             </div>
-                            {isGenAudio && (
+                            {isAudioActive && (
                               <div style={{ marginTop: '4px' }}>
                                 <button
                                   onClick={handleCancelAudio}
@@ -3620,7 +3706,7 @@ function App() {
                       <span style={{color: '#ff4b4b'}}>{errorMsg}</span>
                     ) : (
                       <>
-                        {activeTab === 'summary' && audioUrl && (
+                        {activeTab === 'summary' && (audioUrl || isAudioActive || audioRoleStreams || ['processing', 'pending', 'interrupted', 'failed'].includes(audioStatus)) && (
                           <div className="result-panel" style={{ padding: '20px' }}>
                             <div style={{
                               display: 'flex', justifyContent: 'space-between',
@@ -3656,6 +3742,36 @@ function App() {
                                     width: '100%',
                                     marginBottom: '6px'
                                   }}>
+                                    {!audioUrl && isAudioActive && (
+                                      <div style={{
+                                        background: 'linear-gradient(135deg, rgba(245, 176, 65, 0.1) 0%, rgba(16, 185, 129, 0.08) 100%)',
+                                        border: '1px solid rgba(245, 176, 65, 0.35)',
+                                        borderRadius: '8px',
+                                        padding: '10px 14px',
+                                        marginBottom: '4px'
+                                      }}>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', flexWrap: 'wrap', gap: '6px' }}>
+                                          <span style={{ color: '#fbbf24', fontSize: '13px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                            ⏳ Đang tổng hợp giọng nói AI ({voiceProviderName(audioTaskProviderId || currentVideoProviderId)})...
+                                          </span>
+                                          <span style={{ color: '#34d399', fontSize: '13px', fontWeight: 'bold' }}>
+                                            {audioSegmentCount > 0 ? `${audioCompletedSegments} / ${audioSegmentCount} đoạn (${audioPercent}%)` : 'Đang xử lý...'}
+                                          </span>
+                                        </div>
+                                        <div style={{ width: '100%', height: '8px', background: 'rgba(255,255,255,0.1)', borderRadius: '4px', overflow: 'hidden' }}>
+                                          <div style={{
+                                            width: `${Math.max(2, audioPercent)}%`,
+                                            height: '100%',
+                                            background: 'linear-gradient(90deg, #f59e0b, #10b981)',
+                                            borderRadius: '4px',
+                                            transition: 'width 0.3s ease'
+                                          }} />
+                                        </div>
+                                        <div style={{ fontSize: '11px', color: '#94a3b8', marginTop: '6px' }}>
+                                          Các đoạn thoại đang được tạo tuần tự/song song và tự động ghép nối thành file Master khi hoàn tất.
+                                        </div>
+                                      </div>
+                                    )}
                                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
                                       <span style={{ color: '#38bdf8', fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>
                                         👥 Quản Lý Luồng Audio Theo Nhân Vật (Dual-Stream Pipeline):
@@ -3713,6 +3829,17 @@ function App() {
                                           <div style={{ fontSize: '11px', color: '#cbd5e1', display: 'flex', justifyContent: 'space-between' }}>
                                             <span>Đoạn: {audioRoleStreams.MC.completed}/{audioRoleStreams.MC.total}</span>
                                             <span>{audioRoleStreams.MC.percent}%</span>
+                                          </div>
+                                        )}
+                                        {audioRoleStreams?.MC && (
+                                          <div style={{ width: '100%', height: '4px', background: 'rgba(255, 255, 255, 0.1)', borderRadius: '2px', overflow: 'hidden', marginTop: '2px' }}>
+                                            <div style={{
+                                              width: `${audioRoleStreams.MC.percent || 0}%`,
+                                              height: '100%',
+                                              background: '#fbbf24',
+                                              borderRadius: '2px',
+                                              transition: 'width 0.3s ease'
+                                            }} />
                                           </div>
                                         )}
                                         <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '2px' }}>
@@ -3782,6 +3909,17 @@ function App() {
                                           <div style={{ fontSize: '11px', color: '#cbd5e1', display: 'flex', justifyContent: 'space-between' }}>
                                             <span>Đoạn: {audioRoleStreams.KHACH_1.completed}/{audioRoleStreams.KHACH_1.total}</span>
                                             <span>{audioRoleStreams.KHACH_1.percent}%</span>
+                                          </div>
+                                        )}
+                                        {audioRoleStreams?.KHACH_1 && (
+                                          <div style={{ width: '100%', height: '4px', background: 'rgba(255, 255, 255, 0.1)', borderRadius: '2px', overflow: 'hidden', marginTop: '2px' }}>
+                                            <div style={{
+                                              width: `${audioRoleStreams.KHACH_1.percent || 0}%`,
+                                              height: '100%',
+                                              background: '#34d399',
+                                              borderRadius: '2px',
+                                              transition: 'width 0.3s ease'
+                                            }} />
                                           </div>
                                         )}
                                         <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '2px' }}>
@@ -3874,31 +4012,35 @@ function App() {
                                     {isCancelingAudio ? '⏳ Đang dừng...' : '⏹️ Dừng tạo Audio'}
                                   </button>
                                 )}
-                                <button
-                                  className="btn-secondary"
-                                  style={{ padding: '4px 12px', fontSize: '0.8em', display: 'flex', alignItems: 'center', gap: '5px' }}
-                                  onClick={handleDownloadAudio}
-                                >
-                                  📥 Tải Audio MP3
-                                </button>
+                                {audioUrl && (
+                                  <button
+                                    className="btn-secondary"
+                                    style={{ padding: '4px 12px', fontSize: '0.8em', display: 'flex', alignItems: 'center', gap: '5px' }}
+                                    onClick={handleDownloadAudio}
+                                  >
+                                    📥 Tải Audio MP3
+                                  </button>
+                                )}
                               </div>
                             </div>
-                            <audio
-                              controls
-                              src={audioUrl}
-                              style={{width: '100%'}}
-                              onLoadedMetadata={(event) => {
-                                const durationSeconds = event.currentTarget.duration
-                                if (
-                                  currentVideoId &&
-                                  Number.isFinite(durationSeconds) &&
-                                  durationSeconds > 0
-                                ) {
-                                  saveAudioDuration(currentVideoId, durationSeconds)
-                                    .catch(error => console.error('Failed to save audio duration', error))
-                                }
-                              }}
-                            />
+                            {audioUrl ? (
+                              <audio
+                                controls
+                                src={audioUrl}
+                                style={{width: '100%'}}
+                                onLoadedMetadata={(event) => {
+                                  const durationSeconds = event.currentTarget.duration
+                                  if (
+                                    currentVideoId &&
+                                    Number.isFinite(durationSeconds) &&
+                                    durationSeconds > 0
+                                  ) {
+                                    saveAudioDuration(currentVideoId, durationSeconds)
+                                      .catch(error => console.error('Failed to save audio duration', error))
+                                  }
+                                }}
+                              />
+                            ) : null}
 
                             {/* MP4 Render & Video Preview */}
                             <div style={{ marginTop: '16px', paddingTop: '14px', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
