@@ -19,6 +19,7 @@ from nexus_engine.services import (
     short_video_audio_preview,
     short_video_pipeline,
     short_video_worker,
+    voice_config,
 )
 from nexus_engine.services.short_video_registry import registry
 
@@ -71,6 +72,15 @@ def _public_profile_snapshot(profile: dict) -> dict:
         if isinstance(reference, dict):
             reference.pop("path", None)
         audio_profile.pop("runtime_lock_sha256", None)
+    voice_profile = safe.get("resolved_voice_profile")
+    if isinstance(voice_profile, dict):
+        reference = voice_profile.get("reference")
+        if isinstance(reference, dict):
+            reference.pop("path", None)
+        transcript = voice_profile.get("transcript")
+        if isinstance(transcript, dict):
+            transcript.pop("path", None)
+        voice_profile.pop("runtime_lock_sha256", None)
     return safe
 
 
@@ -79,6 +89,24 @@ def _public_project(project: dict) -> dict:
     summary = public.pop("audio_profile_summary", None)
     if isinstance(summary, dict):
         public["audio_profile"] = summary
+    configured_voice = public.get("voice_profile") or {}
+    if configured_voice.get("selectable"):
+        provider_id = str(configured_voice.get("provider") or "").casefold()
+        try:
+            public["voice_options"] = [
+                {
+                    "id": str(voice.get("id") or ""),
+                    "name": str(voice.get("name") or ""),
+                    "provider_id": provider_id,
+                    "active_revision": voice.get("active_revision"),
+                }
+                for voice in voice_config.load_voice_config().get("voices") or []
+                if voice.get("status") == "active"
+                and str(voice.get("provider_id") or "").casefold() == provider_id
+                and voice_config.voice_allows_usage(voice, "single_narrator")
+            ]
+        except Exception:
+            public["voice_options"] = []
     public.pop("source", None)
     public["errors"] = [
         security_logging.redact_sensitive(error)
@@ -494,8 +522,13 @@ def create_short_video_item(key: str, request: CreateShortVideoRequest):
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     title, poem = _validate_create_input(snapshot, request.title, request.poem)
-    if isinstance(snapshot.get("audio_profile"), dict) or isinstance(
-        snapshot.get("character_profile"), dict
+    resolved_provider = str(
+        (snapshot.get("resolved_voice_snapshot") or {}).get("provider_id") or ""
+    )
+    if (
+        isinstance(snapshot.get("audio_profile"), dict)
+        or resolved_provider == "vieneu_v3_turbo"
+        or isinstance(snapshot.get("character_profile"), dict)
     ):
         try:
             item_dir = short_video_pipeline.prepare_item_directory(normalized_key, item_id)

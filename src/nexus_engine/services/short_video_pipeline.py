@@ -237,14 +237,28 @@ def _validate_profile(item: dict) -> tuple[dict, dict, dict]:
             raise ShortVideoPipelineError("Snapshot Audio Profile thiếu reference.")
     else:
         voice_profile = profile.get("voice_profile") or {}
-        if voice_profile.get("provider") != "omnivoice":
-            raise ShortVideoPipelineError("Short Video cũ không có provider audio hợp lệ.")
-        if voice_snapshot.get("provider_id") != "omnivoice":
-            raise ShortVideoPipelineError("Voice snapshot không thuộc OmniVoice.")
+        configured_provider = str(voice_profile.get("provider") or "")
+        if configured_provider not in {"omnivoice", vieneu_tts.SUPPORTED_PROVIDER}:
+            raise ShortVideoPipelineError("Short Video không có provider audio hợp lệ.")
+        if voice_snapshot.get("provider_id") != configured_provider:
+            raise ShortVideoPipelineError("Voice snapshot không thuộc provider đã cấu hình.")
         if voice_snapshot.get("voice_id") != voice_profile.get("voice_id"):
             raise ShortVideoPipelineError("Voice snapshot không khớp manifest.")
         if voice_snapshot.get("voice_name") != voice_profile.get("voice_name"):
             raise ShortVideoPipelineError("Tên giọng snapshot không khớp manifest.")
+        if configured_provider == vieneu_tts.SUPPORTED_PROVIDER:
+            if profile.get("audio_generation_policy") != "bac_ho_poetry_v1":
+                raise ShortVideoPipelineError("Project VieNeu chưa khai báo policy ngâm thơ.")
+            resolved_voice = profile.get("resolved_voice_profile") or {}
+            if resolved_voice.get("voice_id") != voice_snapshot.get("voice_id"):
+                raise ShortVideoPipelineError("Snapshot voice profile VieNeu không khớp voice.")
+            if int(resolved_voice.get("revision") or 0) != int(
+                voice_snapshot.get("voice_revision") or 0
+            ):
+                raise ShortVideoPipelineError("Snapshot voice profile VieNeu không khớp revision.")
+            reference = resolved_voice.get("reference") or {}
+            if not reference.get("path") or not reference.get("sha256"):
+                raise ShortVideoPipelineError("Snapshot voice profile VieNeu thiếu reference.")
     visual = profile.get("visual_profile") or {}
     visual_provider = str(visual.get("provider") or "muse")
     available_providers = visual.get("available_providers") or [visual_provider]
@@ -450,7 +464,11 @@ def _ensure_vieneu_audio(
             audio_state["duration_seconds"] = round(duration, 3)
             return duration
 
-    resolved = profile.get("resolved_audio_profile") or {}
+    resolved = (
+        profile.get("resolved_audio_profile")
+        or profile.get("resolved_voice_profile")
+        or {}
+    )
     reference = resolved.get("reference") or {}
     reference_path = _resolve_artifact(item_dir, str(reference.get("path") or ""))
     if (
@@ -768,7 +786,9 @@ def _ensure_audio(
     voice_snapshot: dict,
     max_duration: float,
 ) -> float:
-    if isinstance(profile.get("resolved_audio_profile"), dict):
+    if isinstance(profile.get("resolved_audio_profile"), dict) or isinstance(
+        profile.get("resolved_voice_profile"), dict
+    ):
         return _ensure_vieneu_audio(
             checkpoint=checkpoint,
             item_dir=item_dir,

@@ -20,7 +20,7 @@ from pydantic import (
 )
 
 from nexus_engine.paths import SHORT_VIDEO_PROJECTS_CONFIG_DIR
-from nexus_engine.services import vieneu_tts, voice_config
+from nexus_engine.services import vieneu_tts, vieneu_voice_profiles, voice_config
 from nexus_engine.services.short_video_character_profiles import (
     ShortVideoCharacterProfileRegistry,
     character_profile_registry,
@@ -78,7 +78,7 @@ class InputSchema(BaseModel):
 class VoiceProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    provider: Literal["omnivoice"]
+    provider: Literal["omnivoice", "vieneu_v3_turbo"]
     voice_id: str = Field(min_length=1, max_length=200)
     voice_name: str = Field(min_length=1, max_length=200)
     selectable: bool = False
@@ -185,6 +185,7 @@ class ShortVideoProjectManifest(BaseModel):
     render_profile: RenderProfile
     review_policy: ReviewPolicy
     character_profile: CharacterProfileDependency | None = None
+    audio_generation_policy: Literal["bac_ho_poetry_v1"] | None = None
 
     @field_validator("key")
     @classmethod
@@ -197,6 +198,14 @@ class ShortVideoProjectManifest(BaseModel):
     def validate_audio_provider(self) -> "ShortVideoProjectManifest":
         if (self.voice_profile is None) == (self.audio_profile is None):
             raise ValueError("Manifest phải khai báo đúng một voice_profile hoặc audio_profile")
+        if (
+            self.audio_generation_policy == "bac_ho_poetry_v1"
+            and (
+                self.voice_profile is None
+                or self.voice_profile.provider != vieneu_tts.SUPPORTED_PROVIDER
+            )
+        ):
+            raise ValueError("bac_ho_poetry_v1 yêu cầu voice_profile VieNeu.")
         return self
 
 
@@ -303,12 +312,12 @@ def _dependency_status(
                     ]
                     voice_ok = bool(selectable_voices)
                     voice_detail = (
-                        f"{len(selectable_voices)} giọng OmniVoice đang hoạt động."
+                        f"{len(selectable_voices)} giọng {voice_profile.provider} đang hoạt động."
                         if voice_ok
-                        else "Không có giọng OmniVoice đang hoạt động."
+                        else f"Không có giọng {voice_profile.provider} đang hoạt động."
                     )
                 except Exception:
-                    voice_detail = "Không thể kiểm tra danh sách giọng OmniVoice."
+                    voice_detail = "Không thể kiểm tra danh sách giọng của provider."
             else:
                 voice_detail = str(exc)
         except Exception as exc:
@@ -392,7 +401,22 @@ class ShortVideoProjectRegistry:
             (f"audio:{name}", mtime, size)
             for name, mtime, size in vieneu_tts.revision_signature()
         )
-        return (*project_signature, *character_signature, *audio_signature)
+        voice_catalog_signature = ()
+        if voice_config.VOICE_CONFIG_PATH.is_file():
+            voice_stat = voice_config.VOICE_CONFIG_PATH.stat()
+            voice_catalog_signature = (
+                (
+                    "voice-catalog:voices.json",
+                    voice_stat.st_mtime_ns,
+                    voice_stat.st_size,
+                ),
+            )
+        return (
+            *project_signature,
+            *character_signature,
+            *audio_signature,
+            *voice_catalog_signature,
+        )
 
     def _load(self) -> None:
         signature = self._current_signature()
@@ -401,7 +425,7 @@ class ShortVideoProjectRegistry:
         entries: list[dict] = []
         by_key: dict[str, list[dict]] = {}
         for path_name, _mtime, _size in signature:
-            if path_name.startswith("character:"):
+            if path_name.startswith(("character:", "audio:", "voice-catalog:")):
                 continue
             path = self.directory / path_name
             fallback_key = path.stem.split(".v", 1)[0]
@@ -561,7 +585,12 @@ class ShortVideoProjectRegistry:
                 str(voice.get("provider_id") or "").casefold()
                 != str(configured_voice.get("provider") or "").casefold()
             ):
-                raise ValueError("Giọng dự án phải thuộc provider OmniVoice.")
+                provider_name = (
+                    "OmniVoice"
+                    if configured_voice.get("provider") == "omnivoice"
+                    else "VieNeu"
+                )
+                raise ValueError(f"Giọng đã chọn không thuộc provider {provider_name} của dự án.")
             if not voice_config.voice_allows_usage(voice, "single_narrator"):
                 raise ValueError("Giọng đã chọn không được phép dùng cho video một người đọc.")
             snapshot["voice_profile"] = {
@@ -620,13 +649,19 @@ class ShortVideoProjectRegistry:
 
     def snapshot_audio_profile(self, snapshot: dict, item_dir: Path) -> dict:
         profile = snapshot.get("audio_profile")
-        if not isinstance(profile, dict):
+        if isinstance(profile, dict):
+            snapshot["resolved_audio_profile"] = vieneu_tts.snapshot_profile(
+                project_key=str(snapshot.get("key") or ""),
+                profile=profile,
+                item_dir=item_dir,
+            )
             return snapshot
-        snapshot["resolved_audio_profile"] = vieneu_tts.snapshot_profile(
-            project_key=str(snapshot.get("key") or ""),
-            profile=profile,
-            item_dir=item_dir,
-        )
+        voice_snapshot = snapshot.get("resolved_voice_snapshot") or {}
+        if voice_snapshot.get("provider_id") == vieneu_tts.SUPPORTED_PROVIDER:
+            snapshot["resolved_voice_profile"] = vieneu_voice_profiles.snapshot_revision(
+                voice_snapshot=voice_snapshot,
+                item_dir=item_dir,
+            )
         return snapshot
 
     def snapshot_character_profile(self, snapshot: dict, item_dir: Path) -> dict:
