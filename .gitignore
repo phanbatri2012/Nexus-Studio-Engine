@@ -48,4 +48,5 @@ job.json
 /probe_*.py
 /recovered_*.txt
 /scratch_*.py
+/.codex*
 /scratch/

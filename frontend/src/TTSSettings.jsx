@@ -26,9 +26,13 @@ function providerLabel(providerId, providers) {
 function healthLabel(provider) {
   if (!provider.enabled) return 'Đã tắt'
   const health = provider.health || {}
-  if (!health.ok) return health.state === 'unconfigured' ? 'Chưa cấu hình' : 'Chưa sẵn sàng'
+  if (provider.id === 'vieneu_v3_turbo' && health.state === 'starting') return 'Đang khởi động VieNeu'
   if (health.busy) return 'Đang tạo audio'
-  if (provider.id === 'vieneu_v3_turbo') return 'Sẵn sàng · VieNeu API'
+  if (!health.ok) return health.state === 'unconfigured' ? 'Chưa cấu hình' : 'Chưa sẵn sàng'
+  if (provider.id === 'vieneu_v3_turbo') {
+    if (health.state === 'idle') return 'Idle · tự khởi động khi dùng'
+    return health.running ? 'Sẵn sàng · VieNeu API' : 'Đang khởi động VieNeu'
+  }
   if (health.state === 'loading') return 'Đang nạp model'
   if (health.model_loaded) return 'Model đã nạp'
   return provider.type === 'local' ? 'Đang nghỉ' : 'Hoạt động'
@@ -293,9 +297,9 @@ export default function TTSSettings() {
 
     <div className="tts-provider-grid">{providers.map(provider => <article className={`tts-card ${provider.health?.ok ? 'healthy' : 'offline'}`} key={provider.id}>
       <div className="tts-card-title"><div><h2>{provider.display_name}</h2><span className="tts-provider-kind">
-        {provider.id === 'vieneu_v3_turbo' ? 'Local API · model và giọng do VieNeu quản lý' : provider.type === 'local' ? 'Local · worker riêng' : 'Cloud · có credit'}
+        {provider.id === 'vieneu_v3_turbo' ? 'Local API on-demand · tự tắt sau khi dùng' : provider.type === 'local' ? 'Local · worker riêng' : 'Cloud · có credit'}
       </span></div><span className="tts-health">{healthLabel(provider)}</span></div>
-      {provider.id === 'vieneu_v3_turbo' && <small>Clone, reference, revision và tuning được quản lý trực tiếp trong VieNeu.</small>}
+      {provider.id === 'vieneu_v3_turbo' && <small>Clone, reference, revision và tuning được quản lý trực tiếp trong VieNeu; Nexus chỉ bật runtime khi có tác vụ.</small>}
       {provider.health?.error && <small className="tts-error-inline">{provider.health.error}</small>}
       <div className="tts-actions"><button className="tts-button" onClick={() => run(`provider-${provider.id}`, () => api(`/providers/${provider.id}/test`, { method: 'POST' }), `Đã kiểm tra ${provider.display_name}.`)}>Kiểm tra engine</button>
         <label className="tts-toggle"><input type="checkbox" checked={provider.enabled} onChange={event => run(`provider-${provider.id}`, () => api(`/providers/${provider.id}`, {

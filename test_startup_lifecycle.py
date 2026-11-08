@@ -162,6 +162,21 @@ class StartupLifecycleTests(unittest.TestCase):
         )
         self.assertIn("Waiting for all 3 core services", script)
 
+    def test_vieneu_runtime_is_on_demand_and_stopped_only_from_owned_state(self):
+        startup_script = STARTUP_SCRIPT.read_text(encoding="utf-8")
+        stop_script = STOP_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("VieNeu TTS API:          On demand", startup_script)
+        self.assertNotIn("Start-VieNeu", startup_script)
+        self.assertIn("$vieneuConfigured", startup_script)
+        self.assertIn('runtime\\apps\\openai_speech.py', startup_script)
+        self.assertIn('$vieneuServiceStateFile = Join-Path $dataRoot "vieneu_runtime.json"', stop_script)
+        self.assertIn("function Get-OwnedVieNeuServiceInfo", stop_script)
+        self.assertIn('module -ne "apps.openai_speech"', stop_script)
+        self.assertIn('$commandLine -notmatch "(?:^|\\s)-m\\s+apps\\.openai_speech', stop_script)
+        self.assertIn("$servicePorts = @(8080, 5173, 8011)", stop_script)
+        self.assertNotIn("$servicePorts = @(8080, 5173, 8011, 8000)", stop_script)
+
     def test_startup_does_not_probe_browser_cdp_endpoints(self):
         script = STARTUP_SCRIPT.read_text(encoding="utf-8")
 

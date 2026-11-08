@@ -23,6 +23,7 @@ $dataRoot = Join-Path $projectRoot "data"
 $chromeUserDataRoot = Join-Path $dataRoot "chrome_user_data"
 $legacyChromeUserDataRoot = Join-Path $legacyProjectRoot "data\chrome_user_data"
 $museServiceStateFile = Join-Path $dataRoot "muse_studio_service.json"
+$vieneuServiceStateFile = Join-Path $dataRoot "vieneu_runtime.json"
 $servicePorts = @(8080, 5173, 8011)
 $omniVoiceRoot = if ($env:NEXUS_OMNIVOICE_ROOT) {
     [System.IO.Path]::GetFullPath($env:NEXUS_OMNIVOICE_ROOT).TrimEnd("\")
@@ -222,6 +223,56 @@ function Get-OwnedMuseServiceInfo {
     }
 }
 
+function Get-OwnedVieNeuServiceInfo {
+    param([object[]]$Processes)
+
+    if (-not (Test-Path -LiteralPath $vieneuServiceStateFile -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $state = Get-Content -LiteralPath $vieneuServiceStateFile -Raw | ConvertFrom-Json
+        if (
+            -not $state.owned -or
+            [int]$state.pid -le 0 -or
+            [string]::IsNullOrWhiteSpace([string]$state.runtime_root) -or
+            [string]$state.module -ne "apps.openai_speech"
+        ) {
+            return $null
+        }
+        $runtimeRoot = [System.IO.Path]::GetFullPath([string]$state.runtime_root).TrimEnd("\")
+        $expectedPython = [System.IO.Path]::GetFullPath(
+            (Join-Path $runtimeRoot ".venv\Scripts\python.exe")
+        )
+        $process = $Processes | Where-Object { [int]$_.ProcessId -eq [int]$state.pid } | Select-Object -First 1
+        if (-not $process) {
+            return $null
+        }
+        $commandLine = [string]$process.CommandLine
+        $executablePath = [string]$process.ExecutablePath
+        $pythonMatches = (
+            -not [string]::IsNullOrWhiteSpace($executablePath) -and
+            [System.IO.Path]::GetFullPath($executablePath).Equals(
+                $expectedPython,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        )
+        if (
+            -not $pythonMatches -or
+            $commandLine -notmatch "(?:^|\s)-m\s+apps\.openai_speech(?:\s|$)"
+        ) {
+            Write-Warning "VieNeu runtime marker does not match PID $($state.pid); the process will not be stopped."
+            return $null
+        }
+        return [pscustomobject]@{
+            process_id = [int]$state.pid
+        }
+    }
+    catch {
+        Write-Warning "VieNeu runtime marker is invalid; no external process will be stopped."
+        return $null
+    }
+}
+
 function Request-BrowserServiceStop {
     param([string]$ServiceName)
 
@@ -261,6 +312,10 @@ try {
     if ($ownedMuseService) {
         $null = $rootIds.Add([int]$ownedMuseService.process_id)
         $null = $museRootIds.Add([int]$ownedMuseService.process_id)
+    }
+    $ownedVieNeuService = Get-OwnedVieNeuServiceInfo $processes
+    if ($ownedVieNeuService) {
+        $null = $rootIds.Add([int]$ownedVieNeuService.process_id)
     }
 
     # 1. Listeners on service ports: 8080 (backend), 5173 (frontend), 8011 (omnivoice)
@@ -316,6 +371,9 @@ try {
         if (Test-Path -LiteralPath $museServiceStateFile -PathType Leaf) {
             Remove-Item -LiteralPath $museServiceStateFile -Force -ErrorAction SilentlyContinue
         }
+        if (Test-Path -LiteralPath $vieneuServiceStateFile -PathType Leaf) {
+            Remove-Item -LiteralPath $vieneuServiceStateFile -Force -ErrorAction SilentlyContinue
+        }
         Write-Host "Nexus Studio Engine is not running." -ForegroundColor Yellow
         exit 0
     }
@@ -370,7 +428,7 @@ try {
         }
     }
 
-    Write-Step "Stopping backend, frontend, OmniVoice, owned Muse2API, and project browser services ($($targetIds.Count) processes)..."
+    Write-Step "Stopping backend, frontend, OmniVoice, owned on-demand services, and project browser services ($($targetIds.Count) processes)..."
     foreach ($processId in @($targetIds) | Sort-Object -Descending) {
         Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
@@ -410,6 +468,7 @@ try {
         (Join-Path $dataRoot "google_flow_browser_service.json"),
         (Join-Path $dataRoot "google_flow_browser_service.stop.json"),
         $museServiceStateFile,
+        $vieneuServiceStateFile,
         (Join-Path $omniVoiceRoot "data\worker.pid")
     )
     foreach ($sf in $stateFiles) {
@@ -429,7 +488,7 @@ try {
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    Write-Host "[Nexus Studio Engine] All services, including Radar and Trust Builder schedulers, have stopped cleanly. Ports 8080, 5173, and 8011 are free." -ForegroundColor Green
+    Write-Host "[Nexus Studio Engine] All services, including owned on-demand runtimes, have stopped cleanly. Ports 8080, 5173, and 8011 are free." -ForegroundColor Green
     exit 0
 }
 catch {

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from nexus_engine.paths import VIENEU_TTS_JOBS_DIR
 from nexus_engine.services import database as db
-from nexus_engine.services import security_logging, vieneu_tts
+from nexus_engine.services import security_logging, vieneu_runtime, vieneu_tts
 from nexus_engine.services.production_coordinator import ProductionCoordinator
 
 
@@ -68,6 +68,17 @@ def _assert_not_canceled(job_id: str) -> dict:
 
 
 def _execute(job: dict) -> None:
+    job_id = raw_job_id(str(job["id"]))
+    db.update_system_job(
+        job_id,
+        progress="Đang khởi động VieNeu",
+        resume_from_step="provider_startup",
+    )
+    with vieneu_runtime.acquire():
+        _execute_with_runtime(job)
+
+
+def _execute_with_runtime(job: dict) -> None:
     job_id = raw_job_id(str(job["id"]))
     payload = job.get("payload") or {}
     text = str(payload.get("text") or "").strip()
@@ -176,19 +187,23 @@ def stop() -> None:
         coordinator = _COORDINATOR
     if coordinator is not None:
         coordinator.stop()
+    vieneu_runtime.shutdown_owned_service(force=True)
 
 
 def status() -> dict:
     with _LOCK:
         coordinator = _COORDINATOR
     if coordinator is None:
-        return {
+        result = {
             "running": False,
             "ready": False,
             "current_job_id": "",
             "registered_job_types": [JOB_TYPE],
         }
-    return coordinator.status()
+    else:
+        result = coordinator.status()
+    result["runtime"] = vieneu_runtime.status(probe=False)
+    return result
 
 
 def enqueue(

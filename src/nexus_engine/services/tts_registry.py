@@ -14,7 +14,7 @@ from nexus_engine.services import omnivoice_client
 from nexus_engine.services import security_logging
 from nexus_engine.services import tts_service as genmax_service
 from nexus_engine.services import voice_config
-from nexus_engine.services import vieneu_tts
+from nexus_engine.services import vieneu_runtime, vieneu_tts
 from nexus_engine.services import vieneu_tts_worker
 
 
@@ -219,22 +219,43 @@ class VieNeuProvider(TTSProvider):
         }
 
     def health(self, *, test_connection: bool = False) -> dict:
-        runtime = vieneu_tts.api_health()
+        if test_connection:
+            with vieneu_runtime.acquire():
+                runtime = vieneu_runtime.status(probe=True)
+        else:
+            runtime = vieneu_runtime.status(probe=True)
         worker = vieneu_tts_worker.status()
-        healthy = bool(runtime.get("available"))
+        ready = bool(runtime.get("ready"))
+        starting = runtime.get("state") == "starting"
+        on_demand_idle = bool(
+            runtime.get("configured") and runtime.get("state") == "idle"
+        )
+        healthy = ready or starting or on_demand_idle
         return {
             "ok": healthy,
-            "state": "ready" if healthy else "unavailable",
-            "configured": runtime.get("code") != "api_unconfigured",
+            "state": (
+                "ready"
+                if ready
+                else "starting"
+                if starting
+                else "idle"
+                if on_demand_idle
+                else runtime.get("state", "unavailable")
+            ),
+            "configured": bool(runtime.get("configured")),
             "busy": bool(worker.get("current_job_id")),
             "runtime_revision": "",
             "model_revision": {},
             "backend": runtime.get("backend") or "",
             "precision": "",
             "max_parallel_jobs": 1,
+            "on_demand": True,
+            "running": bool(runtime.get("running")),
+            "owned": bool(runtime.get("owned")),
+            "idle_shutdown_at": runtime.get("idle_shutdown_at") or "",
             "connection_tested": bool(test_connection),
-            "probe_ok": healthy if test_connection else None,
-            "error": "" if healthy else runtime.get("detail") or "",
+            "probe_ok": ready if test_connection else None,
+            "error": "" if healthy else runtime.get("error") or "",
         }
 
     def validate_voice(self, voice: dict) -> None:
@@ -242,10 +263,10 @@ class VieNeuProvider(TTSProvider):
             voice,
             allow_draft=str(voice.get("status") or "") == "draft",
         )
-        remote = vieneu_tts.api_voice(str(snapshot.get("provider_voice_id") or ""))
-        expected_revision = int(snapshot.get("provider_voice_revision") or 0)
-        if expected_revision and int(remote.get("revision") or 1) != expected_revision:
-            raise ValueError("Revision giọng trên VieNeu đã đổi so với snapshot.")
+        if not str(snapshot.get("provider_voice_id") or "").strip():
+            raise ValueError("Giọng VieNeu thiếu provider_voice_id.")
+        if int(snapshot.get("provider_voice_revision") or 0) < 1:
+            raise ValueError("Revision giọng VieNeu không hợp lệ.")
 
     def submit(self, text: str, voice: dict, request_hash: str) -> dict:
         snapshot = self._snapshot(
@@ -276,7 +297,8 @@ class VieNeuProvider(TTSProvider):
         return self._normalize_job(vieneu_tts_worker.recover(task_id))
 
     def list_remote_voices(self) -> dict:
-        voices = vieneu_tts.api_voices()
+        with vieneu_runtime.acquire():
+            voices = vieneu_tts.api_voices()
         return {"profiles": voices, "samples": []}
 
     def download_audio(self, task_id: str, destination: Path) -> Path:

@@ -557,12 +557,12 @@ def build_voice_snapshot(
         ),
     }
     if provider_id == VIENEU_PROVIDER_ID:
-        from nexus_engine.services import vieneu_tts
-
-        remote = vieneu_tts.api_voice(snapshot["provider_voice_id"])
-        snapshot["provider_voice_revision"] = max(
-            1,
-            int(remote.get("revision") or 1),
+        # VieNeu is an on-demand runtime.  Snapshot creation must remain local so
+        # requests can enter the durable queue while the provider is stopped.
+        # The worker validates this expected revision against /v1/voices after it
+        # has acquired a runtime lease and started the API.
+        snapshot["provider_voice_revision"] = selected_revision
+        snapshot["provider_voice_source"] = str(
+            voice.get("provider_voice_source") or "catalog"
         )
-        snapshot["provider_voice_source"] = str(remote.get("source") or "")
     return snapshot

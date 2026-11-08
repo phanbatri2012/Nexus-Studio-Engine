@@ -142,7 +142,12 @@ def extract_video_id(url: str) -> str:
     else:
         raise ValueError("Could not extract video ID from URL")
 
-def _get_transcript_with_ytdlp(url: str, *, proxy_url: str | None = None) -> str:
+def _get_transcript_with_ytdlp(
+    url: str,
+    *,
+    proxy_url: str | None = None,
+    allow_foreign: bool = False,
+) -> str:
     url = validate_youtube_video_url(url)
     ydl_opts = {
         'skip_download': True,
@@ -168,8 +173,12 @@ def _get_transcript_with_ytdlp(url: str, *, proxy_url: str | None = None) -> str
 
         target_fmt = None
         available_languages = _preferred_language_codes(subs)
+        has_vi = any(l == "vi" or l.startswith("vi-") for l in available_languages if l in subs)
         for lang in available_languages:
             if lang in subs:
+                # If only English is available in yt-dlp, defer to transcript_api first (which can translate to Vietnamese)
+                if not has_vi and not allow_foreign and (lang == "en" or lang.startswith("en-")):
+                    continue
                 for fmt in subs[lang]:
                     if fmt['ext'] == 'json3':
                         target_fmt = fmt
@@ -178,7 +187,7 @@ def _get_transcript_with_ytdlp(url: str, *, proxy_url: str | None = None) -> str
                     break
 
         if not target_fmt:
-            if subs:
+            if subs and allow_foreign:
                 raise TranscriptUnavailable(
                     "Video có transcript nhưng chưa có track tiếng Việt hoặc tiếng Anh phù hợp.",
                     code="unsupported_transcript_language",
@@ -357,6 +366,11 @@ def get_video_transcript(
         try:
             return _get_transcript_with_transcript_api(url, proxy_url=proxy_url)
         except Exception as fallback_error:
+            # If transcript_api failed to translate or retrieve, retry yt-dlp allowing foreign track as last resort
+            try:
+                return _get_transcript_with_ytdlp(url, proxy_url=proxy_url, allow_foreign=True)
+            except Exception:
+                pass
             classified_fallback = _classify_transcript_failure(fallback_error)
             if isinstance(classified_fallback, TranscriptUnavailable):
                 raise classified_fallback from fallback_error

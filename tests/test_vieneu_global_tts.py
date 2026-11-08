@@ -14,6 +14,28 @@ from nexus_engine.services import vieneu_tts, vieneu_tts_worker, voice_config
 
 
 class VieNeuVoiceRegistryTests(unittest.TestCase):
+    def test_snapshot_uses_catalog_revision_without_starting_vieneu(self):
+        voice = {
+            "id": "local-voice",
+            "name": "Local voice",
+            "provider_id": voice_config.VIENEU_PROVIDER_ID,
+            "provider_voice_id": "BH_1",
+            "revision": 2,
+            "active_revision": 2,
+            "draft_revision": None,
+            "config": {},
+        }
+        with patch.object(
+            vieneu_tts,
+            "api_voice",
+            side_effect=AssertionError("snapshot must stay offline"),
+        ) as api_voice:
+            snapshot = voice_config.build_voice_snapshot(voice)
+
+        api_voice.assert_not_called()
+        self.assertEqual(snapshot["provider_voice_revision"], 2)
+        self.assertEqual(snapshot["provider_voice_id"], "BH_1")
+
     def test_api_health_distinguishes_missing_configuration(self):
         with (
             patch.dict("os.environ", {}, clear=True),

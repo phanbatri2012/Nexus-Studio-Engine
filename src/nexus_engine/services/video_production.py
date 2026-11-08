@@ -3840,6 +3840,79 @@ def _format_srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
+def _extract_script_context_for_whisper(video_id: int) -> tuple[str, dict[str, str]]:
+    """Extract initial_prompt vocabulary and a canonical entity map from video script."""
+    video = db.get_video(video_id) or {}
+    script = str(video.get("generated_script") or "")
+    title = str(video.get("generated_title") or video.get("title") or "")
+
+    prompt_tokens: list[str] = []
+    if title:
+        prompt_tokens.append(title.strip())
+
+    entity_map: dict[str, str] = {}
+    if script:
+        clean = re.sub(r"###\s*\[[^\]]+\]", " ", script)
+        clean = re.sub(r"\[[A-Z0-9_]+\]:?", " ", clean)
+
+        tokens = clean.split()
+        current_entity: list[str] = []
+        for raw_tok in tokens:
+            has_boundary_punct = bool(re.search(r'''[.,!?;:"'()\[\]]$''', raw_tok))
+            tok = re.sub(r"^[^\w]+|[^\w]+$", "", raw_tok)
+            if tok and tok[0].isupper() and not tok.isupper():
+                current_entity.append(tok)
+                if has_boundary_punct:
+                    if len(current_entity) >= 2:
+                        full_entity = " ".join(current_entity)
+                        unacc = remove_vietnamese_accents(full_entity.lower())
+                        if len(unacc) >= 4 and unacc not in entity_map:
+                            entity_map[unacc] = full_entity
+                    current_entity = []
+            else:
+                if len(current_entity) >= 2:
+                    full_entity = " ".join(current_entity)
+                    unacc = remove_vietnamese_accents(full_entity.lower())
+                    if len(unacc) >= 4 and unacc not in entity_map:
+                        entity_map[unacc] = full_entity
+                current_entity = []
+        if len(current_entity) >= 2:
+            full_entity = " ".join(current_entity)
+            unacc = remove_vietnamese_accents(full_entity.lower())
+            if len(unacc) >= 4 and unacc not in entity_map:
+                entity_map[unacc] = full_entity
+
+    for entity in list(entity_map.values())[:20]:
+        if entity not in prompt_tokens:
+            prompt_tokens.append(entity)
+
+    initial_prompt = ", ".join(prompt_tokens)
+    if len(initial_prompt) > 350:
+        initial_prompt = initial_prompt[:350]
+
+    return initial_prompt, entity_map
+
+
+def _restore_script_entities(text: str, entity_map: dict[str, str]) -> str:
+    """Align transcribed text tokens with canonical entities from the script."""
+    if not entity_map or not text:
+        return text
+    restored = text
+    for unacc_key, canonical in sorted(entity_map.items(), key=lambda x: -len(x[0])):
+        words_count = len(unacc_key.split())
+        tokens = restored.split()
+        for i in range(len(tokens) - words_count + 1):
+            window = " ".join(tokens[i : i + words_count])
+            clean_window = re.sub(r"^[^\w]+|[^\w]+$", "", window)
+            if remove_vietnamese_accents(clean_window.lower()) == unacc_key:
+                prefix = window[: len(window) - len(clean_window.lstrip())]
+                suffix = window[len(clean_window.rstrip()) :]
+                replacement = prefix + canonical + suffix
+                tokens[i : i + words_count] = [replacement] + [""] * (words_count - 1)
+        restored = " ".join(t for t in tokens if t)
+    return restored
+
+
 def create_srt(audio_path: Path, video_id: int, progress) -> tuple[Path, str]:
     global _WHISPER_DEVICE, _WHISPER_MODEL
     audio_hash = _sha256_file(audio_path)
@@ -3861,9 +3934,14 @@ def create_srt(audio_path: Path, video_id: int, progress) -> tuple[Path, str]:
 
     import time
 
+    initial_prompt, entity_map = _extract_script_context_for_whisper(video_id)
+
     def transcribe(model, device_name="CPU"):
+        transcribe_kwargs: dict[str, Any] = {"language": "vi", "vad_filter": True}
+        if initial_prompt:
+            transcribe_kwargs["initial_prompt"] = initial_prompt
         segments, info = model.transcribe(
-            str(audio_path), language="vi", vad_filter=True
+            str(audio_path), **transcribe_kwargs
         )
         results = []
         total_duration = getattr(info, "duration", None) or 0
@@ -3925,6 +4003,8 @@ def create_srt(audio_path: Path, video_id: int, progress) -> tuple[Path, str]:
             text = re.sub(r"\s+", " ", str(segment.text or "")).strip()
             if not text:
                 continue
+            if entity_map:
+                text = _restore_script_entities(text, entity_map)
             rendered.append(
                 f"{index}\n{_format_srt_time(segment.start)} --> "
                 f"{_format_srt_time(segment.end)}\n{text}\n"
@@ -4188,9 +4268,22 @@ def _write_segment_srt(
     scene_start = float(scene["start"])
     scene_end = float(scene["end"])
     rendered = []
+    max_cap_end = max((float(c.get("end") or 0.0) for c in source_segments), default=0.0)
     for caption in source_segments:
-        start = max(scene_start, float(caption["start"]))
-        end = min(scene_end, float(caption["end"]))
+        cap_start = float(caption["start"])
+        cap_end = float(caption["end"])
+        if cap_end <= scene_start or cap_start >= scene_end:
+            continue
+        # Deduplication: Assign each caption to the scene containing its temporal midpoint,
+        # preventing duplicated subtitles across adjacent scenes when a caption crosses boundaries.
+        cap_mid = (cap_start + cap_end) / 2.0
+        if not (scene_start <= cap_mid < scene_end):
+            # Special case for final scene to include any remaining audio captions
+            if not (scene_end >= max_cap_end - 0.05 and cap_mid >= scene_start):
+                continue
+
+        start = max(scene_start, cap_start)
+        end = min(scene_end, cap_end)
         if end <= start:
             continue
         rendered.append(
@@ -4259,7 +4352,7 @@ def _segment_filter(
     output_label = "current"
     if subtitle_path is not None:
         filters.append(
-            f"[{output_label}]subtitles=filename='{_escape_subtitle_path(subtitle_path)}'[out]"
+            f"[{output_label}]subtitles=filename='{_escape_subtitle_path(subtitle_path)}':force_style='FontName=Arial,FontSize=20,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2.5,Shadow=1,Alignment=2,MarginV=45'[out]"
         )
         output_label = "out"
     return ";".join(filters), output_label
@@ -4314,7 +4407,7 @@ def _video_segment_filter(
     output_label = "v_clean"
     if subtitle_path is not None:
         filters.append(
-            f"[{output_label}]subtitles=filename='{_escape_subtitle_path(subtitle_path)}'[out]"
+            f"[{output_label}]subtitles=filename='{_escape_subtitle_path(subtitle_path)}':force_style='FontName=Arial,FontSize=20,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2.5,Shadow=1,Alignment=2,MarginV=45'[out]"
         )
         output_label = "out"
     return ";".join(filters), output_label

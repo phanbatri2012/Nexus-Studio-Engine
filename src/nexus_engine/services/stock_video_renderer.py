@@ -729,6 +729,38 @@ def build_background_playlist(
     return playlist, durations
 
 
+def _shift_srt_timestamp(ts_str: str, shift_seconds: float) -> str:
+    """Shift SRT timestamp (00:00:01,230) forward by shift_seconds."""
+    h, m, s = ts_str.strip().replace(",", ".").split(":")
+    total = int(h) * 3600 + int(m) * 60 + float(s) + shift_seconds
+    total = max(0.0, total)
+    ms = int(round(total * 1000))
+    hours, remainder = divmod(ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _create_time_shifted_srt(source_srt: Path, dest_srt: Path, shift_seconds: float = 3.0) -> bool:
+    """Create a new SRT file shifted by shift_seconds to align with delayed audio."""
+    if not source_srt.is_file():
+        return False
+    content = source_srt.read_text(encoding="utf-8-sig")
+    lines = content.splitlines()
+    new_lines = []
+    ts_pattern = re.compile(r"^(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})")
+    for line in lines:
+        match = ts_pattern.match(line.strip())
+        if match:
+            start_str = _shift_srt_timestamp(match.group(1), shift_seconds)
+            end_str = _shift_srt_timestamp(match.group(2), shift_seconds)
+            new_lines.append(f"{start_str} --> {end_str}")
+        else:
+            new_lines.append(line)
+    dest_srt.write_text("\n".join(new_lines), encoding="utf-8")
+    return True
+
+
 def produce_stock_video(
     video_id: int,
     snapshot: dict,
@@ -798,8 +830,25 @@ def produce_stock_video(
 
     logger.info("Stock Video: Video ID %s audio duration is %.2fs (file: %s)", video_id, audio_duration, audio_path.name)
 
-    # 2e. Subtitles are explicitly omitted for stock video flow
+    # 2e. Prepare subtitles aligned with delayed audio (+3.0s)
     srt_path: Path | None = None
+    burn_subs = bool(
+        (snapshot.get("pipeline") or {}).get("captions", True)
+        and (snapshot.get("image_generation_settings") or {}).get("burn_subtitles", True)
+    )
+    if burn_subs:
+        try:
+            from nexus_engine.services.video_production import create_srt
+            progress("Đang chuẩn bị phụ đề cho video...", "captions")
+            srt_master, _ = create_srt(audio_path, video_id, progress)
+            if srt_master and srt_master.is_file():
+                shifted_srt_path = scratch_dir / f"shifted_{video_id}.srt"
+                if _create_time_shifted_srt(srt_master, shifted_srt_path, shift_seconds=3.0):
+                    srt_path = shifted_srt_path
+                    logger.info("Stock Video: Subtitles prepared and shifted by +3.0s: %s", srt_path.name)
+        except Exception as e:
+            logger.warning("Không thể chuẩn bị phụ đề cho Stock Video: %s", e)
+            srt_path = None
 
     # 3. Locate thumbnail images: thumb_no_text (for 3s full intro) and thumb_path (for PiP)
     thumb_no_text_path: Path | None = None
@@ -959,6 +1008,7 @@ def produce_stock_video(
     chosen_wave_color = secrets.choice(WAVE_COLORS_PALETTE)
     bar_start_offset = (WAVE_BAR_PITCH - WAVE_BAR_WIDTH) // 2
     bar_end_offset = bar_start_offset + WAVE_BAR_WIDTH - 1
+    v_last_label = "v_comp" if srt_path else "final_v"
 
     filter_complex = (
         f"[0:v]settb=AVTB,setpts=N/({TARGET_FPS}*TB),fps={TARGET_FPS},"
@@ -973,8 +1023,16 @@ def produce_stock_video(
         f"[bg][v_intro_faded]overlay=0:0:enable='between(t,0,3)':eof_action=repeat[v_intro];"
         f"[v_intro][wave]overlay={w_x}:{w_y}:enable='gte(t,3)':eof_action=pass[v_wave];"
         f"[v_wave][3:v]overlay={t_x}:{t_y}:enable='gte(t,3)':eof_action=repeat[v_thumb];"
-        f"[v_thumb][4:v]overlay={c_x}:{c_y}:enable='gte(t,3)':eof_action=repeat[final_v]"
+        f"[v_thumb][4:v]overlay={c_x}:{c_y}:enable='gte(t,3)':eof_action=repeat[{v_last_label}]"
     )
+    if srt_path:
+        esc_srt = _escape_subtitle_path(srt_path)
+        sub_style = (
+            "FontName=Arial,FontSize=20,Bold=1,PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,BorderStyle=1,Outline=2.5,Shadow=1,"
+            "Alignment=2,MarginV=45"
+        )
+        filter_complex += f";[v_comp]subtitles=filename='{esc_srt}':force_style='{sub_style}'[final_v]"
 
     # 10. Target Output Path
     timestamp_str = time.strftime("%Y%m%d_%H%M%S")
@@ -1126,7 +1184,7 @@ def produce_stock_video(
         "artifact": artifact,
         "render_mode": "stock_video",
         "video_path": str(output_path),
-        "captions_path": None,
+        "captions_path": str(srt_path) if srt_path else None,
         "duration": total_duration,
         "corner": corner,
         "icon": "center_waveform",

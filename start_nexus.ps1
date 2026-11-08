@@ -43,6 +43,20 @@ else {
         (Join-Path (Split-Path $projectRoot -Parent) "omnivoice")
     ).TrimEnd("\")
 }
+$vieneuRoot = if ($env:NEXUS_VIENEU_ROOT) {
+    [System.IO.Path]::GetFullPath($env:NEXUS_VIENEU_ROOT).TrimEnd("\")
+}
+else {
+    [System.IO.Path]::GetFullPath(
+        (Join-Path (Split-Path $projectRoot -Parent) "VieNeu‑TTS v3_Turbo")
+    ).TrimEnd("\")
+}
+$vieneuPython = Join-Path $vieneuRoot ".venv\Scripts\python.exe"
+$vieneuApiModule = Join-Path $vieneuRoot "runtime\apps\openai_speech.py"
+$vieneuConfigured = (
+    (Test-Path -LiteralPath $vieneuPython -PathType Leaf) -and
+    (Test-Path -LiteralPath $vieneuApiModule -PathType Leaf)
+)
 
 $ffmpegDir = Join-Path $dataRoot "tools\ffmpeg"
 if (Test-Path -LiteralPath $ffmpegDir) {
@@ -777,6 +791,11 @@ try {
     Write-Host " [OK] Competitor Radar:       Ready (delayed scan, no startup GPM launch)" -ForegroundColor Green
     Write-Host " [OK] Trust Builder Scheduler: Ready (delayed first run, no startup GPM launch)" -ForegroundColor Green
     Write-Host " [i]  Muse2API:               On demand (starts with the first Muse job)" -ForegroundColor Cyan
+    if ($vieneuConfigured) {
+        Write-Host " [i]  VieNeu TTS API:          On demand (starts with a VieNeu job, stops after idle)" -ForegroundColor Cyan
+    } else {
+        Write-Host " [!]  VieNeu TTS API:          Runtime missing at $vieneuRoot" -ForegroundColor Yellow
+    }
     Write-Host " [OK] Frontend Web UI:        $frontendUrl" -ForegroundColor Green
     if ($omniVoiceReady) {
         Write-Host " [OK] OmniVoice TTS Server:   $omniVoiceUrl" -ForegroundColor Green
