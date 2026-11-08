@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -9,8 +10,6 @@ from nexus_engine.paths import SHORT_VIDEO_DIR
 from nexus_engine.services import (
     database as db,
     security_logging,
-    short_video_audio,
-    short_video_renderer,
     vieneu_tts,
 )
 
@@ -68,22 +67,18 @@ def execute(job: dict) -> None:
         return
 
     profile = payload.get("audio_profile") or {}
-    project_key = str(preview.get("project_key") or "")
-    profile_version = int(profile.get("profile_version") or 1)
-    reference_path, status = vieneu_tts.profile_source_reference(
-        project_key,
-        profile_version,
-    )
-    runtime = status.get("runtime") or {}
-    if str(runtime.get("lock_sha256") or "") != str(
-        profile.get("runtime_lock_sha256") or ""
-    ):
-        raise ShortVideoAudioPreviewError("Runtime VieNeu đã đổi so với request preview.")
-    if str(status.get("reference_sha256") or "") != str(
-        profile.get("reference_sha256") or ""
-    ):
-        raise ShortVideoAudioPreviewError("Reference VieNeu đã đổi so với request preview.")
-    lines = short_video_audio.prepare_poem_lines(str(preview.get("poem_excerpt") or ""))
+    voice_snapshot = job.get("voice_snapshot") or payload.get("voice_snapshot") or {}
+    provider_voice_id = str(
+        voice_snapshot.get("provider_voice_id")
+        or profile.get("provider_voice_id")
+        or ""
+    ).strip()
+    if not provider_voice_id:
+        raise ShortVideoAudioPreviewError(
+            "Preview legacy chưa có voice ID trên VieNeu; hãy tạo preview mới."
+        )
+    poem_excerpt = str(preview.get("poem_excerpt") or "").strip()
+    lines = [line for line in poem_excerpt.splitlines() if line.strip()]
     if not lines or len(lines) > 4:
         raise ShortVideoAudioPreviewError("Preview phải có từ một đến bốn dòng thơ.")
     db.update_short_video_audio_preview(preview_id, status="processing", error="")
@@ -92,46 +87,24 @@ def execute(job: dict) -> None:
         progress="Đang tạo bản nghe thử VieNeu",
         resume_from_step="audio_preview",
     )
-    selected: list[tuple[Path, int]] = []
+    seed = int.from_bytes(
+        hashlib.sha256(f"{preview_id}:{provider_voice_id}".encode("utf-8")).digest()[:4],
+        "big",
+    )
     with vieneu_tts.VieNeuGenerationSession(
         job_id=str(job["id"]),
-        reference_path=reference_path,
+        provider_voice_id=provider_voice_id,
         work_dir=directory,
+        cancel_check=lambda: _check_canceled(str(job["id"])),
     ) as session:
-        for line in lines:
-            _check_canceled(str(job["id"]))
-            line_path = directory / f"line_{int(line['index']):03d}.wav"
-            if not line_path.is_file():
-                seed = short_video_audio.deterministic_seed(
-                    item_id=preview_id,
-                    audio_revision=0,
-                    line_index=int(line["index"]),
-                    variant=1,
-                )
-                session.generate(
-                    text=str(line["synthesis_text"]),
-                    seed=seed,
-                    output_path=line_path,
-                )
-            metrics = short_video_audio.analyze_wav(line_path)
-            if not metrics.get("technical_ok"):
-                raise ShortVideoAudioPreviewError(
-                    f"Candidate preview dòng {int(line['index']) + 1} không đạt QC kỹ thuật."
-                )
-            selected.append((line_path, int(line["gap_ms"])))
-            db.update_system_job(
-                str(job["id"]),
-                progress=f"Đã tạo dòng {int(line['index']) + 1}/{len(lines)} của bản nghe thử",
-                resume_from_step=f"audio_preview_line_{line['index']}",
-            )
-    source_path = directory / "preview.source.wav"
-    short_video_renderer.assemble_poem_audio(
-        lines=selected,
-        source_destination=source_path,
-        final_destination=final_path,
-        job_id=str(job["id"]),
-    )
-    duration = short_video_renderer.probe_duration(final_path)
+        receipt = session.generate(
+            text=poem_excerpt,
+            seed=seed,
+            output_path=final_path,
+        )
+    duration = float(receipt.get("duration_seconds") or 0)
+    if duration <= 0:
+        raise ShortVideoAudioPreviewError("VieNeu không trả duration hợp lệ cho preview.")
     db.update_short_video_audio_preview(
         preview_id,
         status="completed",

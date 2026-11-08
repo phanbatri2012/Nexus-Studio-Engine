@@ -77,11 +77,11 @@ test('parses primary routes across all 15 menus correctly', () => {
 })
 
 test('parses and builds Short Video project deep links', () => {
-  const parsed = parseRoute('/short-video/bac-ho-ngam-tho/review')
+  const parsed = parseRoute('/short-video/poetry-demo/review')
   assert.equal(parsed.viewId, 'shortvideo')
-  assert.equal(parsed.subPath, 'bac-ho-ngam-tho/review')
-  assert.deepEqual(parsed.segments, ['bac-ho-ngam-tho', 'review'])
-  assert.equal(buildPath('shortvideo', 'bac-ho-ngam-tho/outputs'), '/short-video/bac-ho-ngam-tho/outputs')
+  assert.equal(parsed.subPath, 'poetry-demo/review')
+  assert.deepEqual(parsed.segments, ['poetry-demo', 'review'])
+  assert.equal(buildPath('shortvideo', 'poetry-demo/outputs'), '/short-video/poetry-demo/outputs')
   assert.equal(buildPath('shortvideo', '', { tab: 'jobs' }), '/short-video?tab=jobs')
 })
 

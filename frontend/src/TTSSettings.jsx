@@ -28,7 +28,7 @@ function healthLabel(provider) {
   const health = provider.health || {}
   if (!health.ok) return health.state === 'unconfigured' ? 'Chưa cấu hình' : 'Chưa sẵn sàng'
   if (health.busy) return 'Đang tạo audio'
-  if (provider.id === 'vieneu_v3_turbo') return 'Sẵn sàng · on-demand'
+  if (provider.id === 'vieneu_v3_turbo') return 'Sẵn sàng · VieNeu API'
   if (health.state === 'loading') return 'Đang nạp model'
   if (health.model_loaded) return 'Model đã nạp'
   return provider.type === 'local' ? 'Đang nghỉ' : 'Hoạt động'
@@ -67,16 +67,6 @@ export default function TTSSettings() {
   const [sampleDuration, setSampleDuration] = useState(0)
   const [sampleUrl, setSampleUrl] = useState('')
   const [sampleReferenceText, setSampleReferenceText] = useState('')
-  const [vieneuFile, setVieneuFile] = useState(null)
-  const [vieneuUrl, setVieneuUrl] = useState('')
-  const [vieneuName, setVieneuName] = useState('')
-  const [vieneuTarget, setVieneuTarget] = useState('new')
-  const [vieneuStart, setVieneuStart] = useState(0)
-  const [vieneuEnd, setVieneuEnd] = useState(8)
-  const [vieneuDuration, setVieneuDuration] = useState(0)
-  const [vieneuTranscript, setVieneuTranscript] = useState('')
-  const [folderFiles, setFolderFiles] = useState([])
-  const [folderName, setFolderName] = useState('')
   const [previewVoiceId, setPreviewVoiceId] = useState('')
   const [previewText, setPreviewText] = useState('Xin chào, đây là bản nghe thử giọng local của Nexus Studio Engine.')
   const [preview, setPreview] = useState(null)
@@ -88,14 +78,11 @@ export default function TTSSettings() {
   const previewRef = useRef(null)
 
   const load = useCallback(async () => {
-    const [providerData, voiceData, profileData, generationData] = await Promise.all([
-      api('/providers'), api('/voices'), api('/providers/vieneu_v3_turbo/profiles'), api('/generations'),
+    const [providerData, voiceData, generationData] = await Promise.all([
+      api('/providers'), api('/voices'), api('/generations'),
     ])
-    const profiles = new Map((profileData.items || []).map(item => [item.id, item]))
     setProviders(providerData.items || [])
-    setVoices((voiceData.items || []).map(voice => profiles.has(voice.id)
-      ? { ...voice, ...profiles.get(voice.id) }
-      : voice))
+    setVoices(voiceData.items || [])
     setDefaultVoiceId(voiceData.default_voice_id || '')
     setGenerations(generationData.items || [])
   }, [])
@@ -103,8 +90,7 @@ export default function TTSSettings() {
   useEffect(() => { load().catch(err => setError(err.message)) }, [load])
   useEffect(() => () => {
     if (sampleUrl) URL.revokeObjectURL(sampleUrl)
-    if (vieneuUrl) URL.revokeObjectURL(vieneuUrl)
-  }, [sampleUrl, vieneuUrl])
+  }, [sampleUrl])
 
   const previewVoices = useMemo(() => voices.filter(voice =>
     (voice.provider_id === 'omnivoice' && voice.status === 'active') ||
@@ -112,9 +98,6 @@ export default function TTSSettings() {
   ), [voices])
   const activeVieneuVoices = useMemo(() => voices.filter(voice =>
     voice.provider_id === 'vieneu_v3_turbo' && voice.status === 'active'
-  ), [voices])
-  const allVieneuVoices = useMemo(() => voices.filter(voice =>
-    voice.provider_id === 'vieneu_v3_turbo'
   ), [voices])
 
   useEffect(() => {
@@ -259,40 +242,6 @@ export default function TTSSettings() {
     setSampleFile(null); setSampleUrl(''); setSampleReferenceText('')
   }, 'Đã tạo profile OmniVoice.')
 
-  const chooseVieneu = event => {
-    const file = event.target.files?.[0] || null
-    if (vieneuUrl) URL.revokeObjectURL(vieneuUrl)
-    setVieneuFile(file); setVieneuName(file ? file.name.replace(/\.[^.]+$/, '') : '')
-    setVieneuStart(0); setVieneuEnd(8); setVieneuDuration(0)
-    setVieneuUrl(file ? URL.createObjectURL(file) : '')
-  }
-  const saveVieneuProfile = () => run('save-vieneu', async () => {
-    if (!vieneuFile) throw new Error('Hãy chọn file audio VieNeu.')
-    const duration = Number(vieneuEnd) - Number(vieneuStart)
-    if (duration < 3 || duration > 8) throw new Error('Reference VieNeu phải dài 3–8 giây.')
-    const form = new FormData()
-    form.append('file', vieneuFile); form.append('start_seconds', String(vieneuStart))
-    form.append('end_seconds', String(vieneuEnd)); form.append('transcript', vieneuTranscript.trim())
-    if (vieneuTarget === 'new') {
-      if (!vieneuName.trim()) throw new Error('Hãy nhập tên giọng VieNeu.')
-      form.append('name', vieneuName.trim())
-      await api('/providers/vieneu_v3_turbo/voices', { method: 'POST', body: form })
-    } else {
-      await api(`/voices/${vieneuTarget}/revisions`, { method: 'POST', body: form })
-    }
-    setVieneuFile(null); setVieneuUrl(''); setVieneuTranscript('')
-  }, vieneuTarget === 'new' ? 'Đã tạo draft voice VieNeu.' : 'Đã tạo draft revision VieNeu.')
-
-  const importVieneuFolder = () => run('import-vieneu', async () => {
-    if (!folderFiles.length) throw new Error('Hãy chọn thư mục profile.')
-    if (!folderName.trim()) throw new Error('Hãy nhập tên giọng.')
-    const form = new FormData()
-    folderFiles.forEach(file => form.append('files', file, file.webkitRelativePath || file.name))
-    form.append('name', folderName.trim()); form.append('start_seconds', '0'); form.append('end_seconds', '8')
-    await api('/providers/vieneu_v3_turbo/import', { method: 'POST', body: form })
-    setFolderFiles([]); setFolderName('')
-  }, 'Đã import profile VieNeu vào kho quản lý.')
-
   const createPreview = async () => {
     const text = previewText.trim()
     if (!previewVoiceId || !text) { setError('Hãy chọn giọng và nhập nội dung nghe thử.'); return }
@@ -331,7 +280,7 @@ export default function TTSSettings() {
   const queuedCount = providers.reduce((sum, provider) => sum + (provider.queued_jobs || 0), 0)
 
   return <div className="tts-page">
-    <div className="tts-heading"><div><h1>Giọng đọc &amp; TTS</h1><p>Quản lý Genmax, OmniVoice và VieNeu v3 Turbo.</p></div>
+    <div className="tts-heading"><div><h1>Giọng đọc &amp; TTS</h1><p>Quản lý Genmax, OmniVoice; Nexus chỉ gọi VieNeu API để tạo audio.</p></div>
       <button className="tts-button" onClick={() => run('refresh', async () => {}, 'Đã làm mới.')}>↻ Làm mới</button></div>
 
     <div className="tts-summary"><span>🎙️ Hoạt động: <b>{activeCount}</b></span><span>📦 Lưu trữ: <b>{archivedCount}</b></span>
@@ -344,11 +293,9 @@ export default function TTSSettings() {
 
     <div className="tts-provider-grid">{providers.map(provider => <article className={`tts-card ${provider.health?.ok ? 'healthy' : 'offline'}`} key={provider.id}>
       <div className="tts-card-title"><div><h2>{provider.display_name}</h2><span className="tts-provider-kind">
-        {provider.id === 'vieneu_v3_turbo' ? 'Local · ONNX CPU · on-demand' : provider.type === 'local' ? 'Local · worker riêng' : 'Cloud · có credit'}
+        {provider.id === 'vieneu_v3_turbo' ? 'Local API · model và giọng do VieNeu quản lý' : provider.type === 'local' ? 'Local · worker riêng' : 'Cloud · có credit'}
       </span></div><span className="tts-health">{healthLabel(provider)}</span></div>
-      {provider.id === 'vieneu_v3_turbo' && provider.health?.ok && <small>
-        Runtime {provider.health.runtime_revision || '—'} · FP32 · tối đa {provider.health.max_parallel_jobs || 1} job
-      </small>}
+      {provider.id === 'vieneu_v3_turbo' && <small>Clone, reference, revision và tuning được quản lý trực tiếp trong VieNeu.</small>}
       {provider.health?.error && <small className="tts-error-inline">{provider.health.error}</small>}
       <div className="tts-actions"><button className="tts-button" onClick={() => run(`provider-${provider.id}`, () => api(`/providers/${provider.id}/test`, { method: 'POST' }), `Đã kiểm tra ${provider.display_name}.`)}>Kiểm tra engine</button>
         <label className="tts-toggle"><input type="checkbox" checked={provider.enabled} onChange={event => run(`provider-${provider.id}`, () => api(`/providers/${provider.id}`, {
@@ -385,15 +332,11 @@ export default function TTSSettings() {
     <section className="tts-card tts-create-grid"><div><h2>Thêm giọng Genmax</h2><input value={newGenmax.name} onChange={event => setNewGenmax(value => ({ ...value, name: event.target.value }))} placeholder="Tên hiển thị" /><input value={newGenmax.provider_voice_id} onChange={event => setNewGenmax(value => ({ ...value, provider_voice_id: event.target.value }))} placeholder="Voice ID Genmax" /><button className="tts-button primary" onClick={createGenmaxVoice}>＋ Thêm giọng</button></div>
       <div><h2>Tạo profile OmniVoice</h2><input type="file" accept="audio/*,.wav,.mp3,.flac,.ogg" onChange={chooseSample} />{sampleUrl && <audio controls src={sampleUrl} onLoadedMetadata={event => { const duration = event.currentTarget.duration; if (Number.isFinite(duration)) { setSampleDuration(duration); setSampleEnd(Math.min(10, duration)) } }} />}
         <input value={sampleName} onChange={event => setSampleName(event.target.value)} placeholder="Tên giọng" /><textarea value={sampleReferenceText} onChange={event => setSampleReferenceText(event.target.value)} placeholder="Transcript chính xác" rows="3" /><div className="tts-time-range"><label>Bắt đầu<input type="number" value={sampleStart} onChange={event => setSampleStart(event.target.value)} /></label><label>Kết thúc<input type="number" value={sampleEnd} onChange={event => setSampleEnd(event.target.value)} /></label></div><small>{sampleDuration ? `${sampleDuration.toFixed(1)} giây` : ''}</small><button className="tts-button primary" onClick={cloneSample}>Tạo profile</button></div>
-      <div><h2>Tạo hoặc cập nhật VieNeu</h2><select value={vieneuTarget} onChange={event => setVieneuTarget(event.target.value)}><option value="new">Tạo voice mới</option>{allVieneuVoices.map(voice => <option key={voice.id} value={voice.id}>Revision mới · {voice.name}</option>)}</select>
-        <input type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg" onChange={chooseVieneu} />{vieneuUrl && <audio controls src={vieneuUrl} onLoadedMetadata={event => { const duration = event.currentTarget.duration; if (Number.isFinite(duration)) { setVieneuDuration(duration); setVieneuEnd(Math.min(8, duration)) } }} />}
-        {vieneuTarget === 'new' && <input value={vieneuName} onChange={event => setVieneuName(event.target.value)} placeholder="Tên giọng VieNeu" />}<textarea rows="3" value={vieneuTranscript} onChange={event => setVieneuTranscript(event.target.value)} placeholder="Transcript (tùy chọn)" /><div className="tts-time-range"><label>Bắt đầu<input type="number" min="0" step="0.1" value={vieneuStart} onChange={event => setVieneuStart(event.target.value)} /></label><label>Kết thúc<input type="number" min="3" max="8" step="0.1" value={vieneuEnd} onChange={event => setVieneuEnd(event.target.value)} /></label></div><small>{vieneuDuration ? `${vieneuDuration.toFixed(1)} giây · chọn 3–8 giây` : 'Reference VieNeu: 3–8 giây, mono 48 kHz sau chuẩn hóa.'}</small><button className="tts-button primary" onClick={saveVieneuProfile}>Lưu draft profile</button></div>
-      <div><h2>Import thư mục VieNeu</h2><input type="file" multiple webkitdirectory="" directory="" onChange={event => { const selected = [...(event.target.files || [])]; setFolderFiles(selected); setFolderName(selected[0]?.webkitRelativePath?.split('/')[0] || '') }} /><input value={folderName} onChange={event => setFolderName(event.target.value)} placeholder="Tên giọng" /><small>{folderFiles.length ? `${folderFiles.length} file đã chọn` : 'Chọn thư mục có một reference audio và transcript tùy chọn.'}</small><button className="tts-button primary" onClick={importVieneuFolder}>Import vào Nexus</button></div>
+      <div><h2>Quản lý giọng VieNeu</h2><p>Hãy clone, cập nhật reference, tuning và revision trong giao diện/API của VieNeu. Nexus chỉ lưu ánh xạ voice ID để chọn giọng và tạo audio.</p></div>
     </section>
 
     <section className="tts-card"><div className="tts-list-tools"><h2>Danh mục giọng</h2><input type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Tìm tên hoặc Voice ID…" /><select value={filter} onChange={event => setFilter(event.target.value)}><option value="all">Tất cả</option>{providers.map(provider => <option key={provider.id} value={provider.id}>{provider.display_name}</option>)}<option value="archived">Đã lưu trữ</option></select></div>
       <div className="tts-voice-list">{visibleVoices.map(voice => <div className="tts-voice" key={voice.id}><div><strong>{voice.name}</strong><span className={`tts-provider-badge ${voice.provider_id}`}>{providerLabel(voice.provider_id, providers)}</span><small>{voice.provider_voice_id} · revision {voice.revision} · {voice.status}{voice.provider_id === 'vieneu_v3_turbo' && ` · active ${voice.active_revision || '—'} · draft ${voice.draft_revision || '—'}`}</small>
-        {voice.provider_id === 'vieneu_v3_turbo' && <div className="tts-revisions">{(voice.revisions || []).map(revision => <span key={revision.revision}>r{revision.revision} · {revision.duration_seconds || '—'}s <audio controls preload="none" src={`${API}/voices/${voice.id}/reference-audio?revision=${revision.revision}`} />{voice.draft_revision === revision.revision && <button className="tts-button primary" onClick={() => run(`activate-${voice.id}`, () => api(`/voices/${voice.id}/revisions/${revision.revision}/activate`, { method: 'POST' }), `Đã kích hoạt ${voice.name} revision ${revision.revision}.`)}>Kích hoạt</button>}</span>)}</div>}
         <div className="tts-casting-profile"><span className="tts-casting-label">Được dùng cho</span>{[['single_narrator', 'Đơn giọng'], ['multi_host', 'MC'], ['multi_guest', 'Khách']].map(([mode, label]) => <label className="tts-toggle" key={mode}><input type="checkbox" checked={(voice.casting_profile?.usage_modes || []).includes(mode)} onChange={event => toggleUsageMode(voice, mode, event.target.checked)} /> {label}</label>)}
           <label>Giới tính<select value={voice.casting_profile?.gender || 'any'} onChange={event => patchCasting(voice, { gender: event.target.value })}><option value="any">Linh hoạt</option><option value="male">Nam</option><option value="female">Nữ</option></select></label>
           <label>Nhóm tuổi<select value={voice.casting_profile?.age_group || 'any'} onChange={event => patchCasting(voice, { age_group: event.target.value })}><option value="any">Linh hoạt</option><option value="young">Trẻ</option><option value="adult">Trưởng thành</option><option value="senior">Lớn tuổi</option></select></label>

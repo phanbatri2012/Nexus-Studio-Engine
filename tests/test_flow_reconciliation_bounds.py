@@ -95,6 +95,50 @@ def test_cached_terminal_failed_scene_raises_immediately():
         mock_db.upsert_video_artifact.assert_not_called()
 
 
+
+def test_force_new_flow_project_bypasses_cached_terminal_failure():
+    from unittest.mock import AsyncMock
+    mock_db = MagicMock()
+    mock_scene = {"index": 11, "name": "Scene 12"}
+    existing_meta = {
+        "generation_attempt": 6,
+        "terminal": True,
+        "reason_code": "flow_max_attempts_exceeded",
+        "error": "Cảnh 12 đã vượt quá giới hạn thử tối đa (5 lần).",
+    }
+    existing_artifact = {
+        "content_hash": "hash123",
+        "status": "failed",
+        "metadata": existing_meta,
+    }
+    mock_worker = MagicMock()
+    from nexus_engine.services.google_flow_worker import FlowImagePending
+    mock_worker.generate_scene = AsyncMock(side_effect=FlowImagePending("Simulated submission", reason_code="pending"))
+
+    with patch.object(video_production, "db", mock_db), \
+         patch.object(video_production, "_cached_reference_hash", return_value="refhash"), \
+         patch.object(video_production, "_scene_hash", return_value="hash123"), \
+         patch.object(video_production, "SCENES_DIR", Path("e:/yt/Tool/Nexus_Studio_Engine/data/scenes")):
+
+        with pytest.raises(FlowImagePending):
+            import asyncio
+            asyncio.run(
+                video_production._generate_scene_image_async(
+                    video_id=999,
+                    scene=mock_scene,
+                    scene_count=20,
+                    profile={},
+                    settings={},
+                    reference_path=None,
+                    reference_id="",
+                    progress=MagicMock(),
+                    cancel_check=MagicMock(),
+                    worker=mock_worker,
+                    force_new_flow_project=True,
+                    artifact_snapshot={"scene:11": existing_artifact},
+                )
+            )
+
 def test_circuit_breaker_stagnant_reconciles_pauses_job():
     from nexus_engine.main import _handle_production_job_error
 

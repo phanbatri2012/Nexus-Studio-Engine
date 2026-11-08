@@ -826,5 +826,56 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(meta["snippet"]["description"].startswith(script_title))
 
 
+
+    async def test_extract_edit_page_schedule_text_from_fast_path(self):
+        from nexus_engine.services.browser_youtube_uploader import _extract_edit_page_schedule_text
+        mock_page = AsyncMock()
+        mock_page.evaluate.side_effect = [
+            "Chế độ hiển thị Đã lên lịch 11 thg 11, 2026",  # fast_text
+            "11:45 AM",  # popup_text
+        ]
+        res = await _extract_edit_page_schedule_text(mock_page)
+        self.assertIn("11 thg 11, 2026", res)
+        self.assertIn("11:45 AM", res)
+
+    async def test_extract_edit_page_schedule_text_popup_click_fallback(self):
+        from nexus_engine.services.browser_youtube_uploader import _extract_edit_page_schedule_text
+        mock_page = AsyncMock()
+        mock_trigger = AsyncMock()
+        mock_page.query_selector.return_value = mock_trigger
+        mock_page.evaluate.side_effect = [
+            "Chế độ hiển thị Đã lên lịch",  # 1. fast_text (no digits)
+            "",  # 2. popup_text
+            "Lên lịch 11 thg 11, 2026 11:45 AM",  # 3. opened_text
+            None,  # 4. _dismiss_dropdown_safely evaluate
+            None,  # 5. cancel click evaluate
+        ]
+        res = await _extract_edit_page_schedule_text(mock_page)
+        self.assertIn("11 thg 11, 2026", res)
+        self.assertIn("11:45 AM", res)
+        mock_trigger.click.assert_awaited_once()
+
+    def test_schedule_verification_with_extracted_edit_page_details(self):
+        from nexus_engine.services.browser_youtube_uploader import _detect_schedule_verification
+        target_dt = dt.datetime(2026, 11, 11, 11, 45, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        body_text = "Chế độ hiển thị\nĐã lên lịch"
+        mock_html = "<html><body>Chế độ hiển thị Đã lên lịch</body></html>"
+
+        # When dropdown is collapsed, body_text alone does not match time
+        is_sched, is_matching = _detect_schedule_verification(body_text, mock_html, target_dt)
+        self.assertTrue(is_sched)
+        self.assertFalse(is_matching)
+
+        # When combined with extracted popup details, it matches completely
+        extracted_popup = "Lên lịch 11 thg 11, 2026 lúc 11:45"
+        is_sched_full, is_matching_full = _detect_schedule_verification(
+            f"{body_text} {extracted_popup}",
+            mock_html,
+            target_dt
+        )
+        self.assertTrue(is_sched_full)
+        self.assertTrue(is_matching_full)
+
+
 if __name__ == "__main__":
     unittest.main()

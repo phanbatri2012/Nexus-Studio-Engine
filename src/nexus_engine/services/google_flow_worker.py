@@ -1043,6 +1043,16 @@ class GoogleFlowWorker:
                 )) {
                     return {present: false, choices: []};
                 }
+                // Do not treat credit approval dialogs as blocking conversational choices.
+                // These must be handled by handle_confirmation_prompts.
+                const isCreditConfirmation = radios.some((radio) => {
+                    const text = String(radio.textContent || '').toLowerCase();
+                    return text.includes('phê duyệt') || text.includes('approve') ||
+                           text.includes('luôn phê duyệt') || text.includes('always approve');
+                });
+                if (isCreditConfirmation) {
+                    return {present: false, choices: []};
+                }
                 return {
                     present: true,
                     choices: radios.map((radio) =>
@@ -1578,27 +1588,39 @@ class GoogleFlowWorker:
         """Automatically approve credit spend or assistant confirmation prompts, strictly prioritizing 'Always approve'."""
         # Priority 1: Always approve (Luôn phê duyệt) - remembers permission for entire session
         always_approve_selectors = [
+            "[role='radiogroup'] [role='radio']:has-text('Luôn phê duyệt')",
+            "[role='radio']:has-text('Luôn phê duyệt')",
+            ".option-row:has-text('Luôn phê duyệt')",
+            "span.option-label:has-text('Luôn phê duyệt')",
             "[role='button']:has-text('Luôn phê duyệt')",
             "div.chat-action-button:has-text('Luôn phê duyệt')",
-            "div:has-text('Luôn phê duyệt')",
             "button:has-text('Luôn phê duyệt')",
             "[aria-label*='Luôn phê duyệt' i]",
+            "[role='radiogroup'] [role='radio']:has-text('Always approve')",
+            "[role='radio']:has-text('Always approve')",
+            ".option-row:has-text('Always approve')",
+            "span.option-label:has-text('Always approve')",
             "[role='button']:has-text('Always approve')",
             "div.chat-action-button:has-text('Always approve')",
-            "div:has-text('Always approve')",
             "button:has-text('Always approve')",
             "[aria-label*='Always approve' i]",
         ]
 
         # Priority 2: Single approve (Phê duyệt) - fallback if 'Always approve' is not present
         single_approve_selectors = [
+            "[role='radiogroup'] [role='radio']:has-text('Phê duyệt'):not(:has-text('Luôn'))",
+            "[role='radio']:has-text('Phê duyệt'):not(:has-text('Luôn'))",
+            ".option-row:has-text('Phê duyệt'):not(:has-text('Luôn'))",
+            "span.option-label:has-text('Phê duyệt'):not(:has-text('Luôn'))",
             "[role='button']:has-text('Phê duyệt')",
-            "div:has-text('Phê duyệt')",
             "button:has-text('Phê duyệt')",
             "button:has-text('Xác nhận')",
             "[aria-label*='Phê duyệt' i]",
+            "[role='radiogroup'] [role='radio']:has-text('Approve'):not(:has-text('Always'))",
+            "[role='radio']:has-text('Approve'):not(:has-text('Always'))",
+            ".option-row:has-text('Approve'):not(:has-text('Always'))",
+            "span.option-label:has-text('Approve'):not(:has-text('Always'))",
             "[role='button']:has-text('Approve')",
-            "div:has-text('Approve')",
             "button:has-text('Approve')",
             "[aria-label*='Approve' i]",
         ]
@@ -1632,6 +1654,36 @@ class GoogleFlowWorker:
                     return True
             except Exception:
                 continue
+
+        # Priority 3: Direct JS click for radio options if overlay/shadow DOM obscures locators
+        try:
+            clicked_js = await self.page.evaluate(r'''() => {
+                const radios = Array.from(document.querySelectorAll(
+                    "[role='radio'], .option-row, flow-a2ui-multiple-choice [role='radio']"
+                ));
+                for (const r of radios) {
+                    const text = (r.textContent || '').trim().toLowerCase();
+                    if (text.includes('luôn phê duyệt') || text.includes('always approve')) {
+                        r.click();
+                        return 'always';
+                    }
+                }
+                for (const r of radios) {
+                    const text = (r.textContent || '').trim().toLowerCase();
+                    if ((text.includes('phê duyệt') || text.includes('approve')) &&
+                        !text.includes('luôn') && !text.includes('always')) {
+                        r.click();
+                        return 'single';
+                    }
+                }
+                return null;
+            }''')
+            if clicked_js:
+                logger.info("Found confirmation radio via JS evaluation ('%s'), clicked successfully.", clicked_js)
+                await asyncio.sleep(0.5)
+                return True
+        except Exception:
+            pass
 
         return False
 

@@ -587,5 +587,68 @@ class BrowserYouTubeUploaderTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+    async def test_human_like_delay_disabled_returns_zero(self):
+        delay = await uploader._human_like_delay(30.0, 60.0, enabled=False)
+        self.assertEqual(delay, 0.0)
+
+        delay_zero = await uploader._human_like_delay(0.0, 0.0)
+        self.assertEqual(delay_zero, 0.0)
+
+    async def test_human_like_delay_executes_within_range(self):
+        progress_calls = []
+
+        def mock_progress(msg, step, pct):
+            progress_calls.append((msg, step, pct))
+
+        cancel_called = 0
+
+        def mock_cancel():
+            nonlocal cancel_called
+            cancel_called += 1
+
+        with (
+            patch("random.uniform", return_value=35.0),
+            patch("asyncio.sleep", AsyncMock()) as mock_sleep,
+            patch("time.monotonic", side_effect=[100.0, 100.0, 101.0, 136.0]),
+        ):
+            delay = await uploader._human_like_delay(
+                30.0,
+                60.0,
+                reason="test_filling",
+                cancel_check=mock_cancel,
+                progress=mock_progress,
+                current_progress_pct=45,
+                enabled=True,
+            )
+
+        self.assertEqual(delay, 35.0)
+        self.assertGreater(cancel_called, 0)
+        self.assertGreater(len(progress_calls), 0)
+        self.assertEqual(progress_calls[0][1], "human_delay")
+        self.assertEqual(progress_calls[0][2], 45)
+        self.assertIn("test_filling", progress_calls[0][0])
+        mock_sleep.assert_awaited()
+
+    async def test_human_like_delay_respects_cancellation(self):
+        class CancelledTestException(Exception):
+            pass
+
+        def mock_cancel():
+            raise CancelledTestException("User cancelled job")
+
+        with (
+            patch("random.uniform", return_value=40.0),
+            patch("asyncio.sleep", AsyncMock()),
+            patch("time.monotonic", side_effect=[100.0, 100.0]),
+        ):
+            with self.assertRaises(CancelledTestException):
+                await uploader._human_like_delay(
+                    30.0,
+                    60.0,
+                    cancel_check=mock_cancel,
+                    enabled=True,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

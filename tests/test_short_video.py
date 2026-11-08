@@ -25,10 +25,9 @@ from nexus_engine.services.short_video_registry import ShortVideoProjectRegistry
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST_PATH = ROOT / "config" / "short_video_projects" / "bac-ho-ngam-tho.v1.json"
-CHARACTER_MANIFEST_PATH = (
-    ROOT / "config" / "short_video_character_profiles" / "bac-ho.v1.json"
-)
+FIXTURE_DIR = ROOT / "tests" / "fixtures" / "short_video"
+MANIFEST_PATH = FIXTURE_DIR / "poetry-demo.v1.json"
+CHARACTER_MANIFEST_PATH = FIXTURE_DIR / "historical-character.v1.json"
 
 
 def manifest_data():
@@ -39,9 +38,8 @@ def manifest_data():
     data["voice_profile"] = {
         "provider": "omnivoice",
         "voice_id": "66cb0b63-125b-4615-8600-e918c56a9c7d",
-        "voice_name": "bac_ho_doc_tho_1",
+        "voice_name": "fixture_narrator_1",
         "selectable": True,
-        "title_pause_ms": 900,
         "single_task": True,
     }
     return data
@@ -54,7 +52,7 @@ def vieneu_manifest_data():
 def voice_record():
     return {
         "id": "66cb0b63-125b-4615-8600-e918c56a9c7d",
-        "name": "bac_ho_doc_tho_1",
+        "name": "fixture_narrator_1",
         "provider_id": "omnivoice",
         "provider_voice_id": "voice-profile",
         "revision": 1,
@@ -106,7 +104,7 @@ def active_character_profile(config_dir: Path, assets_dir: Path) -> dict:
             )
         era["references"] = references
     config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "bac-ho.v1.json").write_text(
+    (config_dir / "historical-character.v1.json").write_text(
         json.dumps(data, ensure_ascii=False), encoding="utf-8"
     )
     return data
@@ -125,7 +123,7 @@ def snapshot_character_profile(root: Path) -> dict:
     assets_dir = root / "character-assets"
     active_character_profile(config_dir, assets_dir)
     registry = ShortVideoCharacterProfileRegistry(config_dir, assets_dir)
-    return registry.snapshot_for_item("bac-ho", 1, root / "item")
+    return registry.snapshot_for_item("historical-character", 1, root / "item")
 
 
 class ShortVideoRegistryTests(unittest.TestCase):
@@ -138,6 +136,27 @@ class ShortVideoRegistryTests(unittest.TestCase):
             )
         return temp, ShortVideoProjectRegistry(directory)
 
+    def test_missing_config_directory_is_empty(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            registry = ShortVideoProjectRegistry(Path(temp_dir) / "missing")
+            self.assertEqual(registry.list_projects(), [])
+
+    def test_registry_hot_reloads_after_last_manifest_is_deleted(self):
+        temp, registry = self._registry(manifest_data())
+        try:
+            with patch(
+                "nexus_engine.services.short_video_registry.voice_config.get_voice",
+                return_value=voice_record(),
+            ):
+                self.assertEqual(
+                    [project["key"] for project in registry.list_projects()],
+                    ["poetry-demo"],
+                )
+                next(Path(temp.name).glob("*.json")).unlink()
+                self.assertEqual(registry.list_projects(), [])
+        finally:
+            temp.cleanup()
+
     def test_valid_manifest_resolves_voice_dependency(self):
         temp, registry = self._registry(manifest_data())
         try:
@@ -145,7 +164,7 @@ class ShortVideoRegistryTests(unittest.TestCase):
                 "nexus_engine.services.short_video_registry.voice_config.get_voice",
                 return_value=voice_record(),
             ):
-                project = registry.get("bac-ho-ngam-tho")
+                project = registry.get("poetry-demo")
             self.assertTrue(project["available"])
             self.assertEqual(project["pipeline_profile"]["id"], "poem_to_short_v1")
             self.assertEqual(project["visual_profile"]["aspect_ratio"], "9:16")
@@ -171,7 +190,7 @@ class ShortVideoRegistryTests(unittest.TestCase):
                 ),
             ):
                 snapshot = registry.snapshot_for_create(
-                    "bac-ho-ngam-tho",
+                    "poetry-demo",
                     visual_provider="google_flow",
                 )
             self.assertEqual(snapshot["visual_profile"]["provider"], "google_flow")
@@ -195,7 +214,7 @@ class ShortVideoRegistryTests(unittest.TestCase):
                 ),
             ):
                 snapshot = registry.snapshot_for_create(
-                    "bac-ho-ngam-tho",
+                    "poetry-demo",
                     voice_id=selected["id"],
                 )
             self.assertEqual(snapshot["voice_profile"]["voice_id"], selected["id"])
@@ -222,7 +241,7 @@ class ShortVideoRegistryTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "OmniVoice"):
                     registry.snapshot_for_create(
-                        "bac-ho-ngam-tho",
+                        "poetry-demo",
                         voice_id=selected["id"],
                     )
         finally:
@@ -245,7 +264,7 @@ class ShortVideoRegistryTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "một người đọc"):
                     registry.snapshot_for_create(
-                        "bac-ho-ngam-tho",
+                        "poetry-demo",
                         voice_id=selected["id"],
                     )
         finally:
@@ -308,7 +327,7 @@ class ShortVideoRegistryTests(unittest.TestCase):
                 "nexus_engine.services.short_video_registry.voice_config.get_voice",
                 side_effect=RuntimeError("dependency offline"),
             ):
-                project = registry.get("bac-ho-ngam-tho")
+                project = registry.get("poetry-demo")
             self.assertIsNotNone(project)
             self.assertFalse(project["available"])
             self.assertIn("dependency", project["dependencies"][1]["detail"].casefold())
@@ -336,24 +355,24 @@ class ShortVideoCharacterProfileTests(unittest.TestCase):
             root = Path(temp_dir)
             config_dir = root / "config"
             config_dir.mkdir()
-            (config_dir / "bac-ho.v1.json").write_text(
+            (config_dir / "historical-character.v1.json").write_text(
                 json.dumps(empty_draft_character_profile_data(), ensure_ascii=False),
                 encoding="utf-8",
             )
             registry = ShortVideoCharacterProfileRegistry(config_dir, root / "assets")
-            profile = registry.get("bac-ho", 1)
+            profile = registry.get("historical-character", 1)
             self.assertIsNotNone(profile)
             self.assertFalse(profile["available"])
             self.assertEqual(profile["status"], "draft")
             self.assertEqual(
                 [era["key"] for era in profile["eras"]],
                 [
-                    "nguyen_ai_quoc_1919_1923",
-                    "international_1924_1940",
-                    "pac_bo_1941_1942",
-                    "prison_1942_1943",
-                    "viet_bac_1944_1954",
-                    "president_1954_1969",
+                    "early_career_1900_1919",
+                    "middle_career_1920_1939",
+                    "return_period_1940_1944",
+                    "detention_period_1942_1943",
+                    "leadership_period_1945_1954",
+                    "late_career_1955_1970",
                 ],
             )
             self.assertIn("12 đến 18 ảnh", " ".join(profile["errors"]))
@@ -365,12 +384,12 @@ class ShortVideoCharacterProfileTests(unittest.TestCase):
             assets_dir = root / "assets"
             data = active_character_profile(config_dir, assets_dir)
             registry = ShortVideoCharacterProfileRegistry(config_dir, assets_dir)
-            profile = registry.get("bac-ho", 1)
+            profile = registry.get("historical-character", 1)
             self.assertTrue(profile["available"])
             self.assertTrue(all(era["available"] for era in profile["eras"]))
 
             item_dir = root / "item"
-            snapshot = registry.snapshot_for_item("bac-ho", 1, item_dir)
+            snapshot = registry.snapshot_for_item("historical-character", 1, item_dir)
             references = [
                 reference
                 for era in snapshot["eras"]
@@ -397,16 +416,16 @@ class ShortVideoCharacterProfileTests(unittest.TestCase):
             config_dir = root / "config"
             assets_dir = root / "assets"
             config_dir.mkdir()
-            (config_dir / "bac-ho.v1.json").write_text(
+            (config_dir / "historical-character.v1.json").write_text(
                 json.dumps(empty_draft_character_profile_data(), ensure_ascii=False),
                 encoding="utf-8",
             )
             image_bytes = io.BytesIO()
             Image.new("RGB", (512, 768), (80, 80, 80)).save(image_bytes, format="PNG")
             registry = ShortVideoCharacterProfileRegistry(config_dir, assets_dir)
-            era_key = "nguyen_ai_quoc_1919_1923"
+            era_key = "early_career_1900_1919"
             profile = registry.add_reference_asset(
-                "bac-ho",
+                "historical-character",
                 1,
                 era_key=era_key,
                 original_filename="portrait.png",
@@ -421,12 +440,12 @@ class ShortVideoCharacterProfileTests(unittest.TestCase):
             self.assertEqual(era["reference_count"], 1)
             self.assertTrue(era["assets"][0]["available"])
             asset_id = era["assets"][0]["id"]
-            source = registry.asset_path("bac-ho", 1, asset_id)
+            source = registry.asset_path("historical-character", 1, asset_id)
             self.assertIsNotNone(source)
             self.assertTrue(source.is_file())
 
             profile = registry.add_reference_asset(
-                "bac-ho",
+                "historical-character",
                 1,
                 era_key=era_key,
                 original_filename="half-body.png",
@@ -441,11 +460,11 @@ class ShortVideoCharacterProfileTests(unittest.TestCase):
             self.assertTrue(era["available"])
             self.assertFalse(profile["available"])
 
-            profile = registry.remove_reference_asset("bac-ho", 1, asset_id)
+            profile = registry.remove_reference_asset("historical-character", 1, asset_id)
             era = next(item for item in profile["eras"] if item["key"] == era_key)
             self.assertEqual(era["reference_count"], 1)
             self.assertFalse(source.exists())
-            trash = assets_dir / "bac-ho" / "v1" / ".trash"
+            trash = assets_dir / "historical-character" / "v1" / ".trash"
             self.assertEqual(len(list(trash.glob(f"{asset_id}-*.png"))), 1)
 
     def test_secret_and_traversal_are_rejected_without_crashing(self):
@@ -455,7 +474,7 @@ class ShortVideoCharacterProfileTests(unittest.TestCase):
             assets_dir = root / "assets"
             data = active_character_profile(config_dir, assets_dir)
             data["provider_token"] = "do-not-store"
-            (config_dir / "bac-ho.v1.json").write_text(
+            (config_dir / "historical-character.v1.json").write_text(
                 json.dumps(data, ensure_ascii=False), encoding="utf-8"
             )
             registry = ShortVideoCharacterProfileRegistry(config_dir, assets_dir)
@@ -465,7 +484,7 @@ class ShortVideoCharacterProfileTests(unittest.TestCase):
 
             data.pop("provider_token")
             data["eras"][0]["references"][0]["file"] = "../escape.png"
-            (config_dir / "bac-ho.v1.json").write_text(
+            (config_dir / "historical-character.v1.json").write_text(
                 json.dumps(data, ensure_ascii=False), encoding="utf-8"
             )
             profile = registry.list_profiles()[0]
@@ -485,7 +504,7 @@ class ShortVideoCharacterProfileTests(unittest.TestCase):
             project_config.mkdir()
             project = manifest_data()
             project["character_profile"] = {
-                "key": "bac-ho",
+                "key": "historical-character",
                 "profile_version": 1,
                 "required": True,
             }
@@ -497,7 +516,7 @@ class ShortVideoCharacterProfileTests(unittest.TestCase):
                 "nexus_engine.services.short_video_registry.voice_config.get_voice",
                 return_value=voice_record(),
             ):
-                entry = registry.get("bac-ho-ngam-tho")
+                entry = registry.get("poetry-demo")
             self.assertTrue(entry["available"])
             self.assertTrue(entry["character_profile_summary"]["available"])
 
@@ -507,7 +526,7 @@ class ShortVideoCharacterProfileTests(unittest.TestCase):
             character_config = root / "character-config"
             character_assets = root / "character-assets"
             character_config.mkdir()
-            (character_config / "bac-ho.v1.json").write_text(
+            (character_config / "historical-character.v1.json").write_text(
                 CHARACTER_MANIFEST_PATH.read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
@@ -535,7 +554,7 @@ class ShortVideoCharacterProfileTests(unittest.TestCase):
                     },
                 ),
             ):
-                snapshot = registry.snapshot_for_create("bac-ho-ngam-tho")
+                snapshot = registry.snapshot_for_create("poetry-demo")
                 snapshot = registry.snapshot_character_profile(snapshot, root / "item")
             self.assertNotIn("character_profile", snapshot)
             self.assertNotIn("resolved_character_profile", snapshot)
@@ -558,23 +577,23 @@ class ShortVideoStoreAndApiTests(unittest.TestCase):
 
     def test_character_era_schema_accepts_manifest_keys_and_rejects_unsafe_values(self):
         self.assertEqual(
-            CharacterEraRequest(era_key="nguyen_ai_quoc_1919_1923").era_key,
-            "nguyen_ai_quoc_1919_1923",
+            CharacterEraRequest(era_key="early_career_1900_1919").era_key,
+            "early_career_1900_1919",
         )
         self.assertEqual(
-            CharacterEraRequest(era_key="international_1924_1940").era_key,
-            "international_1924_1940",
+            CharacterEraRequest(era_key="middle_career_1920_1939").era_key,
+            "middle_career_1920_1939",
         )
         with self.assertRaises(ValueError):
-            CharacterEraRequest(era_key="../president_1954_1969")
+            CharacterEraRequest(era_key="../late_career_1955_1970")
         with self.assertRaises(ValueError):
             CharacterEraRequest(era_key="president-1954-1969")
 
     def test_double_click_is_idempotent_and_kicks_once(self):
         snapshot = profile_snapshot()
         request = CreateShortVideoRequest(
-            title="Nguyên tiêu",
-            poem="Rằm xuân lồng lộng trăng soi",
+            title="Bài thơ thử nghiệm",
+            poem="Dòng thơ thứ nhất",
             client_request_id="request-123456",
             voice_id=snapshot["resolved_voice_snapshot"]["voice_id"],
         )
@@ -586,14 +605,14 @@ class ShortVideoStoreAndApiTests(unittest.TestCase):
             ) as snapshot_for_create,
             patch.object(short_video_api.short_video_worker, "kick") as kick,
         ):
-            first = short_video_api.create_short_video_item("bac-ho-ngam-tho", request)
-            second = short_video_api.create_short_video_item("bac-ho-ngam-tho", request)
+            first = short_video_api.create_short_video_item("poetry-demo", request)
+            second = short_video_api.create_short_video_item("poetry-demo", request)
         self.assertTrue(first["created"])
         self.assertFalse(second["created"])
         self.assertEqual(first["item"]["id"], second["item"]["id"])
         self.assertEqual(kick.call_count, 1)
         snapshot_for_create.assert_called_once_with(
-            "bac-ho-ngam-tho",
+            "poetry-demo",
             visual_provider="",
             voice_id=snapshot["resolved_voice_snapshot"]["voice_id"],
             audio_profile_id="",
@@ -612,11 +631,11 @@ class ShortVideoStoreAndApiTests(unittest.TestCase):
     def test_public_item_does_not_expose_filesystem_path_or_receipts(self):
         snapshot = profile_snapshot()
         snapshot["resolved_character_profile"] = {
-            "key": "bac-ho",
+            "key": "historical-character",
             "profile_version": 1,
             "eras": [
                 {
-                    "key": "viet_bac_1944_1954",
+                    "key": "leadership_period_1945_1954",
                     "references": [
                         {
                             "id": "private-reference",
@@ -629,10 +648,10 @@ class ShortVideoStoreAndApiTests(unittest.TestCase):
         }
         item, _job, _created = db.create_short_video_item_with_job(
             item_id="11111111-1111-4111-8111-111111111111",
-            project_key="bac-ho-ngam-tho",
+            project_key="poetry-demo",
             profile_version="1.0.0",
-            title="Cảnh khuya",
-            source_text="Tiếng suối trong như tiếng hát xa",
+            title="Bài thơ đêm",
+            source_text="Dòng thơ thứ hai",
             manifest=snapshot,
             job_id="short-video-public",
             payload={"short_video_id": "11111111-1111-4111-8111-111111111111"},
@@ -649,20 +668,20 @@ class ShortVideoStoreAndApiTests(unittest.TestCase):
     def test_character_era_override_updates_options_and_queues_visuals_only(self):
         snapshot = profile_snapshot()
         snapshot["resolved_character_profile"] = {
-            "key": "bac-ho",
+            "key": "historical-character",
             "profile_version": 1,
             "eras": [
-                {"key": "viet_bac_1944_1954", "label": "Việt Bắc", "references": []},
-                {"key": "president_1954_1969", "label": "Chủ tịch nước", "references": []},
+                {"key": "leadership_period_1945_1954", "label": "Việt Bắc", "references": []},
+                {"key": "late_career_1955_1970", "label": "Chủ tịch nước", "references": []},
             ],
         }
         item_id = "44444444-4444-4444-8444-444444444444"
         item, job, _created = db.create_short_video_item_with_job(
             item_id=item_id,
-            project_key="bac-ho-ngam-tho",
+            project_key="poetry-demo",
             profile_version="1.0.0",
-            title="Cảnh khuya",
-            source_text="Tiếng suối trong như tiếng hát xa",
+            title="Bài thơ đêm",
+            source_text="Dòng thơ thứ hai",
             manifest=snapshot,
             job_id="short-video-era-original",
             payload={"short_video_id": item_id, "action": "generate"},
@@ -674,11 +693,11 @@ class ShortVideoStoreAndApiTests(unittest.TestCase):
         with patch.object(short_video_api.short_video_worker, "kick"):
             response = short_video_api.update_short_video_character_era(
                 item_id,
-                CharacterEraRequest(era_key="president_1954_1969"),
+                CharacterEraRequest(era_key="late_career_1955_1970"),
             )
         stored = db.get_short_video_item(item_id)
         queued = db.get_system_job(response["job"]["id"])
-        self.assertEqual(stored["options"]["character_era"], "president_1954_1969")
+        self.assertEqual(stored["options"]["character_era"], "late_career_1955_1970")
         self.assertNotIn("resolved_character_era", stored["options"])
         self.assertEqual(queued["payload"]["action"], "regenerate_visuals")
 
@@ -687,10 +706,10 @@ class ShortVideoStoreAndApiTests(unittest.TestCase):
         item_id = "33333333-3333-4333-8333-333333333333"
         _item, job, _created = db.create_short_video_item_with_job(
             item_id=item_id,
-            project_key="bac-ho-ngam-tho",
+            project_key="poetry-demo",
             profile_version="1.0.0",
-            title="Rằm tháng giêng",
-            source_text="Rằm xuân lồng lộng trăng soi",
+            title="Bài thơ mùa xuân",
+            source_text="Dòng thơ thứ nhất",
             manifest=snapshot,
             job_id="short-video-restart-paused",
             payload={"short_video_id": item_id, "action": "generate"},
@@ -734,7 +753,7 @@ class ShortVideoPipelineUnitTests(unittest.TestCase):
         ]
         profile = {
             "resolved_character_profile": {
-                "key": "bac-ho",
+                "key": "historical-character",
                 "profile_version": 1,
                 "identity_prompt": "stable historical identity",
                 "style_prompt": "neutral archival black and white documentary photography",
@@ -746,7 +765,7 @@ class ShortVideoPipelineUnitTests(unittest.TestCase):
                 },
                 "eras": [
                     {
-                        "key": "viet_bac_1944_1954",
+                        "key": "leadership_period_1945_1954",
                         "label": "Việt Bắc",
                         "keywords": ["việt bắc", "cảnh khuya"],
                         "appearance_prompt": "historically accurate resistance-era appearance",
@@ -758,7 +777,7 @@ class ShortVideoPipelineUnitTests(unittest.TestCase):
         plan = short_video_pipeline._apply_character_profile_to_plan(
             {"scenes": scenes},
             profile,
-            {"character_resolution": {"era_key": "viet_bac_1944_1954", "source": "auto", "confidence": 0.9}},
+            {"character_resolution": {"era_key": "leadership_period_1945_1954", "source": "auto", "confidence": 0.9}},
         )
         visible = [scene for scene in plan["scenes"] if scene["character_presence"]]
         environment = [scene for scene in plan["scenes"] if not scene["character_presence"]]
@@ -771,7 +790,7 @@ class ShortVideoPipelineUnitTests(unittest.TestCase):
     def test_reference_selection_is_provider_specific_and_era_locked(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             item_dir = Path(temp_dir)
-            era_dir = item_dir / "references" / "viet_bac_1944_1954"
+            era_dir = item_dir / "references" / "leadership_period_1945_1954"
             era_dir.mkdir(parents=True)
             primary = era_dir / "primary.png"
             half_body = era_dir / "half.png"
@@ -781,7 +800,7 @@ class ShortVideoPipelineUnitTests(unittest.TestCase):
                 "resolved_character_profile": {
                     "eras": [
                         {
-                            "key": "viet_bac_1944_1954",
+                            "key": "leadership_period_1945_1954",
                             "references": [
                                 {
                                     "id": "primary",
@@ -802,7 +821,7 @@ class ShortVideoPipelineUnitTests(unittest.TestCase):
                     ]
                 }
             }
-            checkpoint = {"character_resolution": {"era_key": "viet_bac_1944_1954"}}
+            checkpoint = {"character_resolution": {"era_key": "leadership_period_1945_1954"}}
             scene = {"character_presence": True, "reference_role": "half_body"}
             muse = short_video_pipeline._scene_character_references(
                 scene=scene,
@@ -836,7 +855,7 @@ class ShortVideoPipelineUnitTests(unittest.TestCase):
             "audio_revision": 1,
             "audio": {"normalized_path": "audio.wav"},
             "timing": {"path": "timing.json"},
-            "character_resolution": {"era_key": "viet_bac_1944_1954"},
+            "character_resolution": {"era_key": "leadership_period_1945_1954"},
             "storyboard": {"path": "storyboard.json"},
             "scenes": [{"index": 0, "image": {"path": "0.png"}}],
             "artifacts": {"draft": {"path": "draft.mp4"}, "final": {"path": "final.mp4"}},
@@ -853,7 +872,7 @@ class ShortVideoPipelineUnitTests(unittest.TestCase):
     def test_low_confidence_era_stops_before_media_pipeline(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             item_dir = Path(temp_dir)
-            ref_dir = item_dir / "references" / "viet_bac_1944_1954"
+            ref_dir = item_dir / "references" / "leadership_period_1945_1954"
             ref_dir.mkdir(parents=True)
             references = []
             for asset_id, primary in (("primary", True), ("half", False)):
@@ -869,12 +888,12 @@ class ShortVideoPipelineUnitTests(unittest.TestCase):
                 )
             profile = {
                 "resolved_character_profile": {
-                    "key": "bac-ho",
+                    "key": "historical-character",
                     "profile_version": 1,
                     "snapshot_hash": "snapshot",
                     "eras": [
                         {
-                            "key": "viet_bac_1944_1954",
+                            "key": "leadership_period_1945_1954",
                             "label": "Việt Bắc",
                             "references": references,
                         }
@@ -894,7 +913,7 @@ class ShortVideoPipelineUnitTests(unittest.TestCase):
                     short_video_pipeline,
                     "resolve_short_video_character_era",
                     return_value={
-                        "era_key": "viet_bac_1944_1954",
+                        "era_key": "leadership_period_1945_1954",
                         "confidence": 0.55,
                         "reason": "Văn bản không có dấu hiệu thời kỳ đủ rõ ràng.",
                         "planner_source": "mock",
@@ -1098,7 +1117,7 @@ class ShortVideoMockE2ETests(ShortVideoStoreAndApiTests):
         snapshot["visual_profile"]["provider"] = "google_flow"
         snapshot["visual_profile"]["max_video_scenes"] = 0
         item_id = "55555555-5555-4555-8555-555555555555"
-        item_dir = self.root / "artifacts" / "bac-ho-ngam-tho" / item_id
+        item_dir = self.root / "artifacts" / "poetry-demo" / item_id
         character_config = self.root / "flow-character-config"
         character_assets = self.root / "flow-character-assets"
         active_character_profile(character_config, character_assets)
@@ -1106,21 +1125,21 @@ class ShortVideoMockE2ETests(ShortVideoStoreAndApiTests):
             character_config, character_assets
         )
         snapshot["resolved_character_profile"] = character_registry.snapshot_for_item(
-            "bac-ho", 1, item_dir
+            "historical-character", 1, item_dir
         )
         _item, job, _created = db.create_short_video_item_with_job(
             item_id=item_id,
-            project_key="bac-ho-ngam-tho",
+            project_key="poetry-demo",
             profile_version="1.0.0",
-            title="Cảnh khuya",
-            source_text="tiếng suối trong như tiếng hát xa\ntrăng lồng cổ thụ bóng lồng hoa",
+            title="Bài thơ đêm",
+            source_text="dòng thơ thứ nhất\ndòng thơ thứ hai",
             manifest=snapshot,
             job_id="short-video-e2e-flow-character",
             payload={"short_video_id": item_id, "action": "generate"},
             voice_snapshot=snapshot["resolved_voice_snapshot"],
             options={
                 "visual_provider": "google_flow",
-                "character_era": "viet_bac_1944_1954",
+                "character_era": "leadership_period_1945_1954",
             },
         )
 
@@ -1225,8 +1244,8 @@ class ShortVideoMockE2ETests(ShortVideoStoreAndApiTests):
                 short_video_pipeline,
                 "_transcribe_audio",
                 return_value=[
-                    {"start": 0.0, "end": 6.0, "text": "tiếng suối trong như tiếng hát xa"},
-                    {"start": 6.0, "end": 12.0, "text": "trăng lồng cổ thụ bóng lồng hoa"},
+                    {"start": 0.0, "end": 6.0, "text": "dòng thơ thứ nhất"},
+                    {"start": 6.0, "end": 12.0, "text": "dòng thơ thứ hai"},
                 ],
             ),
             patch.object(short_video_pipeline.chatgpt_runtime, "try_start_operation", return_value=True),
@@ -1252,15 +1271,15 @@ class ShortVideoMockE2ETests(ShortVideoStoreAndApiTests):
         item_id = "22222222-2222-4222-8222-222222222222"
         item, job, _created = db.create_short_video_item_with_job(
             item_id=item_id,
-            project_key="bac-ho-ngam-tho",
+            project_key="poetry-demo",
             profile_version="1.0.0",
-            title="Cảnh khuya",
-            source_text="tiếng suối trong như tiếng hát xa\ntrăng lồng cổ thụ bóng lồng hoa",
+            title="Bài thơ đêm",
+            source_text="dòng thơ thứ nhất\ndòng thơ thứ hai",
             manifest=snapshot,
             job_id="short-video-e2e-generate",
             payload={
                 "short_video_id": item_id,
-                "project_key": "bac-ho-ngam-tho",
+                "project_key": "poetry-demo",
                 "action": "generate",
                 "checkpoint": {"version": 1, "stage": "queued"},
             },
@@ -1380,8 +1399,8 @@ class ShortVideoMockE2ETests(ShortVideoStoreAndApiTests):
                 short_video_pipeline,
                 "_transcribe_audio",
                 return_value=[
-                    {"start": 0.0, "end": 6.0, "text": "tiếng suối trong như tiếng hát xa"},
-                    {"start": 6.0, "end": 12.0, "text": "trăng lồng cổ thụ bóng lồng hoa"},
+                    {"start": 0.0, "end": 6.0, "text": "dòng thơ thứ nhất"},
+                    {"start": 6.0, "end": 12.0, "text": "dòng thơ thứ hai"},
                 ],
             ),
             patch.object(short_video_pipeline.chatgpt_runtime, "try_start_operation", return_value=True),
@@ -1401,8 +1420,8 @@ class ShortVideoMockE2ETests(ShortVideoStoreAndApiTests):
             short_video_pipeline.execute(job)
             submit_tts.assert_called_once()
             submitted_text = submit_tts.call_args.args[0]
-            self.assertIn("Cảnh khuya", submitted_text)
-            self.assertIn("tiếng suối", submitted_text)
+            self.assertIn("Bài thơ đêm", submitted_text)
+            self.assertIn("dòng thơ thứ nhất", submitted_text)
 
             draft_item = db.get_short_video_item(item_id)
             self.assertEqual(draft_item["status"], "awaiting_review")
@@ -1411,10 +1430,10 @@ class ShortVideoMockE2ETests(ShortVideoStoreAndApiTests):
             final_item, final_job = db.create_short_video_job(
                 item_id=item_id,
                 job_id="short-video-e2e-final",
-                title="final: Cảnh khuya",
+                title="final: Bài thơ đêm",
                 payload={
                     "short_video_id": item_id,
-                    "project_key": "bac-ho-ngam-tho",
+                    "project_key": "poetry-demo",
                     "action": "final_render",
                     "checkpoint": {"version": 1, "stage": "final_render"},
                 },

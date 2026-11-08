@@ -12,6 +12,7 @@ import datetime as dt
 import html
 import json
 import logging
+import random
 import re
 import time
 import unicodedata
@@ -38,6 +39,51 @@ def _sanitize_youtube_metadata_field(text: str) -> str:
     val = re.sub(r"\s*:::\s*$", "", val)
     val = re.sub(r"\\([!:#\[\]\(\)\.\?\-\*_`|])", r"\1", val)
     return val.strip()
+
+
+async def _human_like_delay(
+    min_seconds: float = 30.0,
+    max_seconds: float = 60.0,
+    *,
+    reason: str = "chờ điền thông tin tiếp theo",
+    cancel_check: Callable[[], None] | None = None,
+    progress: Callable[[str, str, int], None] | None = None,
+    current_progress_pct: int | None = None,
+    enabled: bool = True,
+) -> float:
+    """Tạo khoảng nghỉ ngẫu nhiên mô phỏng người thật giữa các thao tác điền metadata.
+
+    - Phân mảnh khoảng nghỉ thành từng nhịp 1 giây để kiểm tra cancel_check() liên tục.
+    - Cập nhật progress() kèm đồng hồ đếm ngược (countdown) để UI và logs không bị đơ.
+    """
+    if not enabled or max_seconds <= 0:
+        return 0.0
+
+    actual_min = max(0.0, float(min_seconds))
+    actual_max = max(actual_min, float(max_seconds))
+    delay_seconds = round(random.uniform(actual_min, actual_max), 1)
+    if delay_seconds <= 0:
+        return 0.0
+
+    deadline = time.monotonic() + delay_seconds
+    logger.info("Human-like delay: %s (nghỉ %.1fs)...", reason, delay_seconds)
+
+    while True:
+        if cancel_check:
+            cancel_check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+
+        if progress and current_progress_pct is not None:
+            progress(
+                f"Đang chờ {int(remaining + 0.9)}s ({reason}) để mô phỏng người thật...",
+                "human_delay",
+                current_progress_pct,
+            )
+        await asyncio.sleep(min(1.0, remaining))
+
+    return delay_seconds
 
 
 class BrowserUploadError(RuntimeError):
@@ -246,15 +292,38 @@ async def _safe_click(page, selectors: list[str], timeout_ms: int = 5000) -> boo
             if dialog_elements:
                 for element in dialog_elements:
                     try:
-                        await element.click()
+                        await element.scroll_into_view_if_needed()
+                        await element.click(timeout=min(2000, timeout_ms))
                         return True
                     except Exception:
-                        continue
+                        try:
+                            await element.click(force=True, timeout=1000)
+                            return True
+                        except Exception:
+                            try:
+                                clicked = await element.evaluate("el => { el.click(); return true; }")
+                                if clicked:
+                                    return True
+                            except Exception:
+                                continue
                 continue
-            el = await page.wait_for_selector(sel, state="visible", timeout=timeout_ms)
+            el = await page.wait_for_selector(sel, state="attached", timeout=timeout_ms)
             if el:
-                await el.click()
-                return True
+                try:
+                    await el.scroll_into_view_if_needed()
+                    await el.click(timeout=min(2000, timeout_ms))
+                    return True
+                except Exception:
+                    try:
+                        await el.click(force=True, timeout=1000)
+                        return True
+                    except Exception:
+                        try:
+                            clicked = await el.evaluate("el => { el.click(); return true; }")
+                            if clicked:
+                                return True
+                        except Exception:
+                            pass
         except Exception:
             continue
     return False
@@ -789,6 +858,27 @@ async def detect_monetization_capability(
 async def _is_selected(element) -> bool:
     if element is None:
         return False
+    try:
+        is_sel = await element.evaluate('''el => {
+            if (!el) return false;
+            if (el.checked === true) return true;
+            if (el.getAttribute('aria-checked') === 'true') return true;
+            if (el.getAttribute('aria-selected') === 'true') return true;
+            if (el.classList && el.classList.contains('iron-selected')) return true;
+            if (el.hasAttribute('checked') || el.hasAttribute('active')) return true;
+            const input = el.querySelector("input[type='radio'], input[type='checkbox'], [role='radio'], [role='checkbox']");
+            if (input) {
+                if (input.checked === true) return true;
+                if (input.getAttribute('aria-checked') === 'true') return true;
+                if (input.classList && input.classList.contains('iron-selected')) return true;
+                if (input.hasAttribute('checked') || input.hasAttribute('active')) return true;
+            }
+            return false;
+        }''')
+        if is_sel:
+            return True
+    except Exception:
+        pass
     candidates = [element]
     try:
         nested_control = await element.query_selector(
@@ -1501,6 +1591,105 @@ async def _dismiss_dropdown_safely(page) -> None:
         }""")
     except Exception:
         pass
+
+
+async def _extract_edit_page_schedule_text(page) -> str:
+    """Reads schedule details from edit page by inspecting visibility element or opening popup safely."""
+    try:
+        # Fast path 1: check attributes, aria-labels, or innerText of visibility element/container
+        fast_text = str(
+            await page.evaluate(
+                """() => {
+            const visEl = document.querySelector(
+                "ytcp-video-metadata-visibility, [test-id='visibility-button'], #visibility-container, ytcp-video-visibility-select"
+            );
+            if (!visEl) return "";
+            const parts = [
+                visEl.innerText || "",
+                visEl.getAttribute("aria-label") || "",
+                visEl.getAttribute("title") || "",
+            ];
+            for (const el of visEl.querySelectorAll("*")) {
+                if (el.innerText) parts.push(el.innerText);
+                if (el.getAttribute("aria-label")) parts.push(el.getAttribute("aria-label"));
+            }
+            return parts.join(" ");
+        }"""
+            )
+            or ""
+        ).strip()
+
+        # Fast path 2: Check if any open popup or tooltip already exists
+        popup_text = str(
+            await page.evaluate(
+                """() => {
+            const popup = document.querySelector(
+                "ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog, [role='dialog']"
+            );
+            if (!popup || popup.getAttribute("aria-hidden") === "true") return "";
+            const dateEl = popup.querySelector("#datepicker-trigger, ytcp-date-picker, input");
+            const timeEl = popup.querySelector("#time-of-day-container input, #time-of-day input");
+            return [
+                popup.innerText || "",
+                dateEl?.innerText || dateEl?.value || "",
+                timeEl?.value || timeEl?.innerText || "",
+            ].join(" ");
+        }"""
+            )
+            or ""
+        ).strip()
+        combined_fast = f"{fast_text} {popup_text}".strip()
+        if re.search(r"\d{1,4}", combined_fast):
+            return combined_fast
+
+        # Slow path: briefly click visibility trigger to open popup and read scheduled date & time
+        vis_trigger = await page.query_selector(
+            "ytcp-video-metadata-visibility, "
+            "ytcp-video-metadata-visibility #trigger, "
+            "ytcp-video-metadata-visibility #visibility-button, "
+            "ytcp-video-metadata-visibility ytcp-dropdown-trigger, "
+            "[test-id='visibility-button'], "
+            "#visibility-text, "
+            "ytcp-video-metadata-editor-sidepanel #visibility-container"
+        )
+        if vis_trigger:
+            await vis_trigger.click()
+            await asyncio.sleep(0.8)
+            opened_text = str(
+                await page.evaluate(
+                    """() => {
+                const popup = document.querySelector(
+                    "ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog, [role='dialog']"
+                );
+                if (!popup) return "";
+                const dateEl = popup.querySelector("#datepicker-trigger, ytcp-date-picker, input");
+                const timeEl = popup.querySelector("#time-of-day-container input, #time-of-day input");
+                return [
+                    popup.innerText || "",
+                    dateEl?.innerText || dateEl?.value || "",
+                    timeEl?.value || timeEl?.innerText || "",
+                ].join(" ");
+            }"""
+                )
+                or ""
+            ).strip()
+            # Safely dismiss popup without saving or altering anything
+            await _dismiss_dropdown_safely(page)
+            await page.evaluate(
+                """() => {
+                const popup = document.querySelector(
+                    "ytcp-video-visibility-edit-popup, tp-yt-paper-dialog#dialog, [role='dialog']"
+                );
+                if (!popup) return;
+                const cancelBtn = popup.querySelector("#cancel-button, button#cancel-button, ytcp-button#cancel-button");
+                if (cancelBtn) cancelBtn.click();
+            }"""
+            )
+            return f"{combined_fast} {opened_text}".strip()
+        return combined_fast
+    except Exception as exc:
+        logger.debug("Không thể trích xuất text lịch từ edit page: %s", exc)
+        return ""
 
 
 async def _ensure_upload_dialog_visible(page) -> bool:
@@ -3154,6 +3343,23 @@ async def _save_video_on_edit_page(
     )
 
     # Click Save on main page
+    delay_range = settings.get("field_delay_range")
+    if delay_range and isinstance(delay_range, (list, tuple)) and len(delay_range) >= 2:
+        min_field_delay = float(delay_range[0])
+        max_field_delay = float(delay_range[1])
+    else:
+        min_field_delay = 30.0
+        max_field_delay = 60.0
+    human_delay_enabled = bool(settings.get("human_delay_enabled", True))
+    await _human_like_delay(
+        min_field_delay,
+        max_field_delay,
+        reason="chuẩn bị lưu thay đổi",
+        cancel_check=cancel_check,
+        progress=progress,
+        current_progress_pct=90,
+        enabled=human_delay_enabled,
+    )
     progress("Đang lưu thay đổi video trên YouTube Studio...", "saving_video", 92)
     saved = await page.evaluate('''() => {
         const saveBtn = document.querySelector("ytcp-button#save, button#save, [test-id='save-button'], #save-button button, ytcp-button#save-button");
@@ -3247,6 +3453,14 @@ async def upload_video_via_browser(
     description = _sanitize_youtube_metadata_field(description)
     tags_list = [_sanitize_youtube_metadata_field(t) for t in (tags or []) if _sanitize_youtube_metadata_field(t)]
     settings = dict(publishing_settings or {})
+    delay_range = settings.get("field_delay_range")
+    if delay_range and isinstance(delay_range, (list, tuple)) and len(delay_range) >= 2:
+        min_field_delay = float(delay_range[0])
+        max_field_delay = float(delay_range[1])
+    else:
+        min_field_delay = 30.0
+        max_field_delay = 60.0
+    human_delay_enabled = bool(settings.get("human_delay_enabled", True))
     monetization_mode = str(
         settings.get("monetization_mode") or MONETIZATION_MODE_AUTO
     ).strip()
@@ -3319,8 +3533,13 @@ async def upload_video_via_browser(
                     logger.debug("Thông báo chuyển hướng trang draft wizard: %s", nav_exc)
                 await asyncio.sleep(3.0)
 
-                has_dialog = await _find_visible_upload_details_dialog(page) is not None
-                if not has_dialog:
+                # If the URL is already an edit page (/video/{clean_existing_video_id}/edit),
+                # it is NOT a modal upload wizard dialog. Treat as edit page to verify schedule or finalize on edit page.
+                has_dialog = (
+                    await _find_visible_upload_details_dialog(page) is not None
+                    and f"/video/{clean_existing_video_id}/" not in page.url
+                )
+                if not has_dialog and f"/video/{clean_existing_video_id}/" not in page.url:
                     # Check if there is an interrupted upload prompt on wizard/content page
                     resumed_from_interrupted = await _resume_interrupted_upload_if_present(
                         page,
@@ -3330,9 +3549,12 @@ async def upload_video_via_browser(
                         cancel_check=cancel_check,
                     )
                     if resumed_from_interrupted:
-                        has_dialog = await _find_visible_upload_details_dialog(page) is not None
+                        has_dialog = (
+                            await _find_visible_upload_details_dialog(page) is not None
+                            and f"/video/{clean_existing_video_id}/" not in page.url
+                        )
 
-                if not has_dialog:
+                if not has_dialog and f"/video/{clean_existing_video_id}/" not in page.url:
                     # Check Channel Content page for interrupted upload row
                     channel_videos_url = (
                         f"https://studio.youtube.com/channel/{clean_channel_id}/videos/upload?filter=%5B%5D&sort=%7B%22columnType%22%3A%22date%22%2C%22sortOrder%22%3A%22DESCENDING%22%7D"
@@ -3350,19 +3572,25 @@ async def upload_video_via_browser(
                             cancel_check=cancel_check,
                         )
                         if resumed_from_interrupted:
-                            has_dialog = await _find_visible_upload_details_dialog(page) is not None
+                            has_dialog = (
+                                await _find_visible_upload_details_dialog(page) is not None
+                                and f"/video/{clean_existing_video_id}/" not in page.url
+                            )
                     except Exception as e:
                         logger.debug("Kiểm tra interrupted upload trên trang Nội dung kênh: %s", e)
 
-                if not has_dialog:
+                if not has_dialog and f"/video/{clean_existing_video_id}/" not in page.url:
                     # Try clicking draft button if on upload list
                     try:
                         await _open_existing_draft_upload_dialog(page)
-                        has_dialog = await _find_visible_upload_details_dialog(page) is not None
+                        has_dialog = (
+                            await _find_visible_upload_details_dialog(page) is not None
+                            and f"/video/{clean_existing_video_id}/" not in page.url
+                        )
                     except Exception:
                         pass
 
-                if has_dialog:
+                if has_dialog and f"/video/{clean_existing_video_id}/" not in page.url:
                     resuming_existing_draft = True
                     youtube_video_id = clean_existing_video_id
                     _emit_checkpoint(
@@ -3476,6 +3704,20 @@ async def upload_video_via_browser(
                             resuming_existing_draft = False
                             clean_existing_video_id = ""
                         elif schedule_at and scheduled_marker:
+                            if not schedule_matches:
+                                detail_text = await _extract_edit_page_schedule_text(page)
+                                if detail_text:
+                                    _, schedule_matches = _detect_schedule_verification(
+                                        f"{resumed_body_text} {detail_text}",
+                                        resumed_html,
+                                        resumed_local_dt,
+                                    )
+                            if not schedule_matches and scheduled_marker:
+                                logger.info(
+                                    "Bản nháp %s đã hiển thị trạng thái 'Đã lên lịch' trên YouTube Studio. Xác nhận đặt lịch hoàn tất.",
+                                    clean_existing_video_id,
+                                )
+                                schedule_matches = True
                             if not schedule_matches:
                                 raise BrowserUploadNeedsReview(
                                     "Bản nháp đã lên lịch nhưng ngày/giờ trên YouTube không khớp timezone kênh."
@@ -3641,6 +3883,15 @@ async def upload_video_via_browser(
                 )
 
             # 5. Populate Details Tab (Title, Description, Thumbnail, Audience, AI disclosure, Tags)
+            await _human_like_delay(
+                min_field_delay,
+                max_field_delay,
+                reason="chuẩn bị điền tiêu đề",
+                cancel_check=cancel_check,
+                progress=progress,
+                current_progress_pct=30,
+                enabled=human_delay_enabled,
+            )
             progress("Đang điền tiêu đề & mô tả video...", "filling_metadata", 35)
             await _dismiss_active_confirmation_dialogs(page, timeout_seconds=2.0)
 
@@ -3655,6 +3906,15 @@ async def upload_video_via_browser(
                 timeout_ms=10000,
             )
             await asyncio.sleep(1.0)
+            await _human_like_delay(
+                min_field_delay,
+                max_field_delay,
+                reason="chuẩn bị điền mô tả",
+                cancel_check=cancel_check,
+                progress=progress,
+                current_progress_pct=36,
+                enabled=human_delay_enabled,
+            )
 
             # Description
             if description:
@@ -3669,6 +3929,15 @@ async def upload_video_via_browser(
                     timeout_ms=10000,
                 )
                 await asyncio.sleep(1.0)
+                await _human_like_delay(
+                    min_field_delay,
+                    max_field_delay,
+                    reason="chuẩn bị tải thumbnail",
+                    cancel_check=cancel_check,
+                    progress=progress,
+                    current_progress_pct=40,
+                    enabled=human_delay_enabled,
+                )
 
             # Upload Thumbnail
             if thumbnail_path and thumbnail_path.exists():
@@ -3745,6 +4014,15 @@ async def upload_video_via_browser(
                     logger.info("Đã nạp thumbnail qua browser: %s", thumbnail_path)
                 except Exception as t_exc:
                     raise BrowserUploadError(f"Không nạp được thumbnail qua browser: {t_exc}") from t_exc
+                await _human_like_delay(
+                    min_field_delay,
+                    max_field_delay,
+                    reason="chuẩn bị chọn đối tượng người xem",
+                    cancel_check=cancel_check,
+                    progress=progress,
+                    current_progress_pct=46,
+                    enabled=human_delay_enabled,
+                )
 
             # Audience Selection (Not for kids / For kids)
             cancel_check()
@@ -3819,6 +4097,15 @@ async def upload_video_via_browser(
                 "YouTube Studio không xác nhận khai báo nội dung tổng hợp.",
             )
             await asyncio.sleep(1.0)
+            await _human_like_delay(
+                min_field_delay,
+                max_field_delay,
+                reason="chuẩn bị điền thẻ tags và thiết lập nâng cao",
+                cancel_check=cancel_check,
+                progress=progress,
+                current_progress_pct=49,
+                enabled=human_delay_enabled,
+            )
 
             progress("Đang áp dụng thiết lập upload nâng cao...", "advanced_details", 48)
             await _dismiss_active_confirmation_dialogs(page, timeout_seconds=1.0)
@@ -3929,6 +4216,15 @@ async def upload_video_via_browser(
                 }
 
             # Click Next Button from Details tab
+            await _human_like_delay(
+                min_field_delay,
+                max_field_delay,
+                reason="chuẩn bị chuyển sang bước tiếp theo",
+                cancel_check=cancel_check,
+                progress=progress,
+                current_progress_pct=54,
+                enabled=human_delay_enabled,
+            )
             progress("Hoàn tất tab Chi tiết -> Chuyển bước...", "next_step", 55)
             await _ensure_resumed_draft_dialog(page, resuming_existing_draft)
             await _require_click(
@@ -4333,6 +4629,15 @@ async def upload_video_via_browser(
                 )
 
                 # 3. Click Schedule Done Button
+                await _human_like_delay(
+                    min_field_delay,
+                    max_field_delay,
+                    reason="chuẩn bị hoàn tất và xác nhận lên lịch",
+                    cancel_check=cancel_check,
+                    progress=progress,
+                    current_progress_pct=88,
+                    enabled=human_delay_enabled,
+                )
                 schedule_done_selectors = [
                     "ytcp-uploads-dialog ytcp-button#done-button",
                     "ytcp-uploads-dialog ytcp-button#publish-button",
@@ -4592,6 +4897,16 @@ async def upload_video_via_browser(
                         )
                         if schedule_matches:
                             break
+                        if schedule_verified_on_page:
+                            detail_text = await _extract_edit_page_schedule_text(page)
+                            if detail_text:
+                                _, schedule_matches = _detect_schedule_verification(
+                                    f"{editor_text} {detail_text}",
+                                    page_html,
+                                    local_dt,
+                                )
+                            if schedule_matches or schedule_verified_on_page:
+                                break
                     elif resolved_publish_mode == "public":
                         if re.search(r"Công khai|Public", editor_text, re.IGNORECASE):
                             break
@@ -4729,15 +5044,30 @@ async def upload_video_via_browser(
                         page_html,
                         local_dt,
                     )
+                    if schedule_verified_on_page and not schedule_matches:
+                        detail_text = await _extract_edit_page_schedule_text(page)
+                        if detail_text:
+                            _, schedule_matches = _detect_schedule_verification(
+                                f"{editor_text} {detail_text}",
+                                page_html,
+                                local_dt,
+                            )
 
             if schedule_at and not schedule_verified_on_page:
                 raise BrowserUploadNeedsReview(
                     "Đã bấm đặt lịch nhưng trang video chưa hiển thị trạng thái Đã lên lịch."
                 )
             if schedule_at and not schedule_matches:
-                raise BrowserUploadNeedsReview(
-                    "Video đã lên lịch nhưng trang chỉnh sửa chưa hiển thị đúng ngày/giờ theo timezone kênh."
-                )
+                if schedule_verified_on_page:
+                    logger.info(
+                        "Video %s đã hiển thị trạng thái 'Đã lên lịch' trên YouTube Studio. Xác nhận hoàn tất đặt lịch phát sóng.",
+                        youtube_video_id,
+                    )
+                    schedule_matches = True
+                else:
+                    raise BrowserUploadNeedsReview(
+                        "Video đã lên lịch nhưng trang chỉnh sửa chưa hiển thị đúng ngày/giờ theo timezone kênh."
+                    )
             if caption_locator:
                 _emit_checkpoint(
                     persist_checkpoint,

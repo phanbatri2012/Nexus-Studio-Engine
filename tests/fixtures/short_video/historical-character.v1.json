@@ -1,0 +1,78 @@
+{
+  "key": "historical-character",
+  "display_name": "Historical Character",
+  "description": "Synthetic multi-era character profile used only by automated tests.",
+  "status": "draft",
+  "profile_version": 1,
+  "identity_prompt": "A consistent fictional historical narrator with stable facial features across documented eras.",
+  "style_prompt": "Neutral archival documentary photography with realistic anatomy, restrained lighting, and period-appropriate detail.",
+  "appearance_policy": {
+    "min_scene_ratio": 0.6,
+    "target_scene_ratio": 0.7,
+    "max_scene_ratio": 0.8,
+    "allowed_shots": ["medium", "half_body", "full_body", "three_quarter"],
+    "forbid": ["text", "logo", "watermark", "lip_sync"]
+  },
+  "eras": [
+    {
+      "key": "early_career_1900_1919",
+      "label": "Early career 1900–1919",
+      "year_from": 1900,
+      "year_to": 1919,
+      "keywords": ["early career"],
+      "appearance_prompt": "A young fictional historical narrator in period-appropriate early twentieth-century clothing.",
+      "context_prompt": "A historically plausible early twentieth-century workplace with coherent clothing and objects.",
+      "references": []
+    },
+    {
+      "key": "middle_career_1920_1939",
+      "label": "Middle career 1920–1939",
+      "year_from": 1920,
+      "year_to": 1939,
+      "keywords": ["middle career"],
+      "appearance_prompt": "The same fictional narrator as a mature adult with period-appropriate clothing and grooming.",
+      "context_prompt": "A historically plausible interwar setting with coherent architecture, clothing, and objects.",
+      "references": []
+    },
+    {
+      "key": "return_period_1940_1944",
+      "label": "Return period 1940–1944",
+      "year_from": 1940,
+      "year_to": 1944,
+      "keywords": ["return period"],
+      "appearance_prompt": "The same fictional narrator in practical early-1940s clothing with restrained documentary realism.",
+      "context_prompt": "A historically plausible rural early-1940s setting with natural materials and practical objects.",
+      "references": []
+    },
+    {
+      "key": "detention_period_1942_1943",
+      "label": "Detention period 1942–1943",
+      "year_from": 1942,
+      "year_to": 1943,
+      "keywords": ["detention period"],
+      "appearance_prompt": "The same fictional narrator during a difficult period, shown respectfully with realistic anatomy.",
+      "context_prompt": "A restrained period interior with sparse objects and historically coherent environmental detail.",
+      "references": []
+    },
+    {
+      "key": "leadership_period_1945_1954",
+      "label": "Leadership period 1945–1954",
+      "year_from": 1945,
+      "year_to": 1954,
+      "keywords": ["leadership period"],
+      "appearance_prompt": "The same fictional narrator in mature adulthood with modest period-appropriate clothing.",
+      "context_prompt": "A historically plausible mid-century meeting or outdoor setting with coherent period details.",
+      "references": []
+    },
+    {
+      "key": "late_career_1955_1970",
+      "label": "Late career 1955–1970",
+      "year_from": 1955,
+      "year_to": 1970,
+      "keywords": ["late career"],
+      "appearance_prompt": "The same fictional narrator later in life with consistent identity and age-appropriate features.",
+      "context_prompt": "A historically plausible late-career office or public setting with restrained documentary composition.",
+      "references": []
+    }
+  ]
+}

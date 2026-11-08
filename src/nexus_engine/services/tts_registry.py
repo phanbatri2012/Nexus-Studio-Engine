@@ -16,7 +16,6 @@ from nexus_engine.services import tts_service as genmax_service
 from nexus_engine.services import voice_config
 from nexus_engine.services import vieneu_tts
 from nexus_engine.services import vieneu_tts_worker
-from nexus_engine.services import vieneu_voice_profiles
 
 
 OMNIVOICE_TASK_PREFIX = "omnivoice:"
@@ -220,55 +219,22 @@ class VieNeuProvider(TTSProvider):
         }
 
     def health(self, *, test_connection: bool = False) -> dict:
-        runtime = vieneu_tts.runtime_status(verify_hashes=True)
+        runtime = vieneu_tts.api_health()
         worker = vieneu_tts_worker.status()
-        probe_ok = None
-        probe_error = ""
-        if test_connection and runtime.get("available"):
-            try:
-                voice = next(
-                    item
-                    for item in voice_config.load_voice_config().get("voices") or []
-                    if item.get("provider_id") == self.id
-                    and (item.get("active_revision") or item.get("draft_revision"))
-                )
-                revision = int(
-                    voice.get("active_revision") or voice.get("draft_revision") or 0
-                )
-                reference = vieneu_voice_profiles.reference_path(voice["id"], revision)
-                with tempfile.TemporaryDirectory(prefix="vieneu-health-") as temporary:
-                    work_dir = Path(temporary)
-                    with vieneu_tts.VieNeuGenerationSession(
-                        job_id=f"vieneu-health-{uuid.uuid4()}",
-                        reference_path=reference,
-                        work_dir=work_dir,
-                        timeout_seconds=180,
-                    ) as session:
-                        session.generate(
-                            text="Xin chào.",
-                            seed=20261106,
-                            output_path=work_dir / "probe.wav",
-                        )
-                probe_ok = True
-            except Exception as exc:
-                probe_ok = False
-                probe_error = str(security_logging.redact_sensitive(exc))
-        healthy = bool(runtime.get("available")) and probe_ok is not False
+        healthy = bool(runtime.get("available"))
         return {
             "ok": healthy,
             "state": "ready" if healthy else "unavailable",
-            "configured": bool(vieneu_tts.resolve_runtime_home()),
+            "configured": runtime.get("code") != "api_unconfigured",
             "busy": bool(worker.get("current_job_id")),
-            "runtime_revision": runtime.get("runtime_revision") or "",
-            "model_revision": runtime.get("model_revision") or {},
-            "backend": "onnx",
-            "precision": "fp32",
+            "runtime_revision": "",
+            "model_revision": {},
+            "backend": runtime.get("backend") or "",
+            "precision": "",
             "max_parallel_jobs": 1,
             "connection_tested": bool(test_connection),
-            "probe_ok": probe_ok,
-            "error": probe_error or (
-                "" if runtime.get("available") else runtime.get("detail") or ""
-            ),
+            "probe_ok": healthy if test_connection else None,
+            "error": "" if healthy else runtime.get("detail") or "",
         }
 
     def validate_voice(self, voice: dict) -> None:
@@ -276,16 +242,10 @@ class VieNeuProvider(TTSProvider):
             voice,
             allow_draft=str(voice.get("status") or "") == "draft",
         )
-        profile = snapshot.get("profile") or {}
-        status = vieneu_voice_profiles.revision_status(
-            str(profile.get("voice_id") or snapshot.get("voice_id") or ""),
-            int(profile.get("revision") or snapshot.get("voice_revision") or 0),
-            verify_runtime=True,
-        )
-        if not status.get("available"):
-            raise ValueError(str(status.get("detail") or "Voice VieNeu chưa sẵn sàng."))
-        if status.get("reference_sha256") != profile.get("reference_sha256"):
-            raise ValueError("Reference VieNeu không khớp voice snapshot.")
+        remote = vieneu_tts.api_voice(str(snapshot.get("provider_voice_id") or ""))
+        expected_revision = int(snapshot.get("provider_voice_revision") or 0)
+        if expected_revision and int(remote.get("revision") or 1) != expected_revision:
+            raise ValueError("Revision giọng trên VieNeu đã đổi so với snapshot.")
 
     def submit(self, text: str, voice: dict, request_hash: str) -> dict:
         snapshot = self._snapshot(
@@ -316,22 +276,7 @@ class VieNeuProvider(TTSProvider):
         return self._normalize_job(vieneu_tts_worker.recover(task_id))
 
     def list_remote_voices(self) -> dict:
-        voices = [
-            {
-                "id": voice["provider_voice_id"],
-                "voice_id": voice["id"],
-                "name": voice["name"],
-                "status": voice["status"],
-                "active_revision": voice.get("active_revision"),
-                "draft_revision": voice.get("draft_revision"),
-                "revisions": [
-                    vieneu_voice_profiles.public_revision(item)
-                    for item in vieneu_voice_profiles.list_revisions(voice["id"])
-                ],
-            }
-            for voice in voice_config.load_voice_config()["voices"]
-            if voice["provider_id"] == self.id
-        ]
+        voices = vieneu_tts.api_voices()
         return {"profiles": voices, "samples": []}
 
     def download_audio(self, task_id: str, destination: Path) -> Path:
@@ -417,17 +362,8 @@ def get_request_hash(
         "settings": voice.get("config") or {},
     }
     if voice["provider_id"] == voice_config.VIENEU_PROVIDER_ID and voice_snapshot:
-        profile = voice_snapshot.get("profile") or {}
-        request_data.update(
-            {
-                "profile_revision": int(
-                    profile.get("revision")
-                    or voice_snapshot.get("voice_revision")
-                    or 1
-                ),
-                "reference_sha256": str(profile.get("reference_sha256") or ""),
-                "model_revision": voice_snapshot.get("model_revision") or {},
-            }
+        request_data["provider_voice_revision"] = int(
+            voice_snapshot.get("provider_voice_revision") or 1
         )
     canonical = json.dumps(
         request_data,
@@ -457,7 +393,7 @@ def split_text_for_tts(
         return [normalized]
     if voice["provider_id"] == voice_config.VIENEU_PROVIDER_ID:
         normalized = str(text or "").strip()
-        vieneu_tts_worker.split_text(normalized)
+        vieneu_tts_worker.validate_text(normalized)
         return [normalized]
     return genmax_service.split_text_for_tts(
         text,

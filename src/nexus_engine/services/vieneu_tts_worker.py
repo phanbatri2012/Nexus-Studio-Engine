@@ -5,24 +5,20 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import threading
 import uuid
-import wave
 from copy import deepcopy
 from pathlib import Path
 
 from nexus_engine.paths import VIENEU_TTS_JOBS_DIR
 from nexus_engine.services import database as db
-from nexus_engine.services import process_registry, security_logging, vieneu_tts
-from nexus_engine.services import vieneu_voice_profiles
+from nexus_engine.services import security_logging, vieneu_tts
 from nexus_engine.services.production_coordinator import ProductionCoordinator
 
 
 JOB_TYPE = "vieneu_tts_generation"
 TASK_PREFIX = "vieneu:"
 MAX_TEXT_CHARACTERS = 10_000
-MAX_CHUNK_CHARACTERS = 220
 _JOB_NAMESPACE = uuid.UUID("6e8b76ca-39ca-47c2-8b49-0d7e0b5d4a8a")
 _LOCK = threading.Lock()
 _COORDINATOR: ProductionCoordinator | None = None
@@ -46,47 +42,13 @@ def task_id(job_id: str) -> str:
     return f"{TASK_PREFIX}{raw_job_id(job_id)}"
 
 
-def _split_long_sentence(sentence: str) -> list[str]:
-    chunks: list[str] = []
-    remaining = sentence.strip()
-    while len(remaining) > MAX_CHUNK_CHARACTERS:
-        split_at = max(
-            remaining.rfind(mark, 0, MAX_CHUNK_CHARACTERS + 1)
-            for mark in (", ", "; ", ": ", " ")
-        )
-        if split_at < MAX_CHUNK_CHARACTERS // 2:
-            split_at = MAX_CHUNK_CHARACTERS
-        chunks.append(remaining[:split_at].strip())
-        remaining = remaining[split_at:].strip()
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
-def split_text(text: str) -> list[str]:
-    normalized = re.sub(r"[\t ]+", " ", str(text or "").replace("\r", "")).strip()
+def validate_text(text: str) -> str:
+    normalized = str(text or "").strip()
     if not normalized:
         raise ValueError("Nội dung tạo audio không được để trống.")
     if len(normalized) > MAX_TEXT_CHARACTERS:
         raise ValueError("Nội dung tạo audio vượt giới hạn 10.000 ký tự.")
-    sentences = re.split(r"(?<=[.!?…])\s+|\n+", normalized)
-    chunks: list[str] = []
-    pending = ""
-    for raw_sentence in sentences:
-        sentence = raw_sentence.strip()
-        if not sentence:
-            continue
-        for part in _split_long_sentence(sentence):
-            candidate = f"{pending} {part}".strip() if pending else part
-            if len(candidate) <= MAX_CHUNK_CHARACTERS:
-                pending = candidate
-            else:
-                if pending:
-                    chunks.append(pending)
-                pending = part
-    if pending:
-        chunks.append(pending)
-    return chunks
+    return normalized
 
 
 def _seed(request_hash: str, index: int) -> int:
@@ -105,49 +67,6 @@ def _assert_not_canceled(job_id: str) -> dict:
     return job
 
 
-def _read_chunk(path: Path) -> tuple[bytes, int, int, int]:
-    try:
-        with wave.open(str(path), "rb") as source:
-            channels = source.getnchannels()
-            sample_width = source.getsampwidth()
-            sample_rate = source.getframerate()
-            frames = source.readframes(source.getnframes())
-    except (OSError, wave.Error) as exc:
-        raise RuntimeError("Chunk VieNeu không phải WAV hợp lệ.") from exc
-    if (channels, sample_width, sample_rate) != (1, 2, 48000):
-        raise RuntimeError("Chunk VieNeu phải là mono PCM16 48 kHz.")
-    return frames, channels, sample_width, sample_rate
-
-
-def _pause_milliseconds(text: str) -> int:
-    stripped = str(text or "").rstrip()
-    if stripped.endswith((".", "!", "?", "…")):
-        return 350
-    if stripped.endswith((",", ";", ":")):
-        return 180
-    return 120
-
-
-def _assemble(chunks: list[Path], texts: list[str], destination: Path) -> float:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(".tmp.wav")
-    total_frames = 0
-    with wave.open(str(temporary), "wb") as output:
-        output.setnchannels(1)
-        output.setsampwidth(2)
-        output.setframerate(48000)
-        for index, chunk_path in enumerate(chunks):
-            frames, _channels, _width, _rate = _read_chunk(chunk_path)
-            output.writeframes(frames)
-            total_frames += len(frames) // 2
-            if index < len(chunks) - 1:
-                pause_frames = int(48000 * _pause_milliseconds(texts[index]) / 1000)
-                output.writeframes(b"\x00\x00" * pause_frames)
-                total_frames += pause_frames
-    os.replace(temporary, destination)
-    return total_frames / 48000.0
-
-
 def _execute(job: dict) -> None:
     job_id = raw_job_id(str(job["id"]))
     payload = job.get("payload") or {}
@@ -156,87 +75,45 @@ def _execute(job: dict) -> None:
     snapshot = deepcopy(job.get("voice_snapshot") or payload.get("voice_snapshot") or {})
     if not request_hash or not snapshot:
         raise RuntimeError("Job VieNeu thiếu request hash hoặc voice snapshot.")
-    chunks = split_text(text)
-    profile = snapshot.get("profile") or {}
-    voice_id = str(profile.get("voice_id") or snapshot.get("voice_id") or "")
-    revision = int(profile.get("revision") or snapshot.get("voice_revision") or 0)
-    reference = vieneu_voice_profiles.reference_path(voice_id, revision)
-    if vieneu_tts.file_sha256(reference) != str(profile.get("reference_sha256") or ""):
-        raise RuntimeError("Reference VieNeu không khớp snapshot của job.")
-    runtime = vieneu_tts.runtime_status()
-    if not runtime.get("available"):
-        raise RuntimeError(str(runtime.get("detail") or "Runtime VieNeu chưa sẵn sàng."))
-    expected_lock = str(snapshot.get("runtime_lock_sha256") or "")
-    if expected_lock and expected_lock != str(runtime.get("lock_sha256") or ""):
-        raise RuntimeError("Runtime VieNeu đã thay đổi so với snapshot của job.")
+    text = validate_text(text)
+    voice_id = str(snapshot.get("voice_id") or "")
+    provider_voice_id = str(snapshot.get("provider_voice_id") or "").strip()
+    if not provider_voice_id:
+        raise RuntimeError("Job VieNeu thiếu provider_voice_id.")
+    remote_voice = vieneu_tts.api_voice(provider_voice_id)
+    expected_revision = int(snapshot.get("provider_voice_revision") or 0)
+    remote_revision = int(remote_voice.get("revision") or 1)
+    if expected_revision and expected_revision != remote_revision:
+        raise RuntimeError("Revision giọng trên VieNeu đã đổi so với snapshot của job.")
 
     work_dir = _job_directory(job_id)
     work_dir.mkdir(parents=True, exist_ok=True)
     result = deepcopy(job.get("result") or {})
-    checkpoints = result.get("chunks") if isinstance(result.get("chunks"), list) else []
-    completed_by_index = {
-        int(item.get("index")): item
-        for item in checkpoints
-        if isinstance(item, dict) and str(item.get("index", "")).isdigit()
-    }
-    output_paths: list[Path] = []
-    with vieneu_tts.VieNeuGenerationSession(
-        job_id=job_id,
-        reference_path=reference,
-        work_dir=work_dir,
-        timeout_seconds=900,
-    ) as session:
-        for index, chunk_text in enumerate(chunks):
-            _assert_not_canceled(job_id)
-            output_path = work_dir / f"chunk_{index:04d}.wav"
-            checkpoint = completed_by_index.get(index)
-            if (
-                checkpoint
-                and output_path.is_file()
-                and vieneu_tts.file_sha256(output_path) == checkpoint.get("sha256")
-                and checkpoint.get("text_sha256")
-                == hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
-            ):
-                output_paths.append(output_path)
-                continue
-            receipt = session.generate(
-                text=chunk_text,
-                seed=_seed(request_hash, index),
-                output_path=output_path,
-            )
-            checkpoint = {
-                "index": index,
-                "filename": output_path.name,
-                "sha256": vieneu_tts.file_sha256(output_path),
-                "text_sha256": hashlib.sha256(chunk_text.encode("utf-8")).hexdigest(),
-                "request_hash": receipt.get("request_hash") or "",
-            }
-            completed_by_index[index] = checkpoint
-            db.update_system_job(
-                job_id,
-                progress=f"Đã tạo {index + 1}/{len(chunks)} đoạn audio",
-                result_json={
-                    **result,
-                    "chunks": [completed_by_index[key] for key in sorted(completed_by_index)],
-                },
-                resume_from_step=f"chunk_{index + 1}",
-            )
-            output_paths.append(output_path)
-
     _assert_not_canceled(job_id)
     output = work_dir / "audio.wav"
-    duration = _assemble(output_paths, chunks, output)
+    db.update_system_job(
+        job_id,
+        progress="Đang chờ VieNeu tạo audio",
+        resume_from_step="provider_request",
+    )
+    provider_receipt = vieneu_tts.generate_api_audio(
+        text=text,
+        provider_voice_id=provider_voice_id,
+        seed=_seed(request_hash, 0),
+        output_path=output,
+        timeout_seconds=1800,
+        cancel_check=lambda: _assert_not_canceled(job_id),
+    )
+    _assert_not_canceled(job_id)
     receipt = {
         "provider": vieneu_tts.SUPPORTED_PROVIDER,
         "request_hash": request_hash,
         "voice_id": voice_id,
-        "voice_revision": revision,
-        "reference_sha256": profile.get("reference_sha256") or "",
-        "runtime_revision": snapshot.get("runtime_revision") or "",
-        "model_revision": snapshot.get("model_revision") or {},
-        "chunk_count": len(chunks),
+        "provider_voice_id": provider_voice_id,
+        "provider_voice_revision": remote_revision,
+        "provider_request_id": provider_receipt.get("provider_request_id") or "",
         "audio_sha256": vieneu_tts.file_sha256(output),
-        "duration_seconds": round(duration, 3),
+        "duration_seconds": float(provider_receipt.get("duration_seconds") or 0),
     }
     receipt_path = work_dir / "receipt.json"
     temporary_receipt = receipt_path.with_suffix(".tmp")
@@ -251,7 +128,6 @@ def _execute(job: dict) -> None:
         progress="Đã tạo audio VieNeu",
         result_json={
             **result,
-            "chunks": [completed_by_index[key] for key in sorted(completed_by_index)],
             "audio_filename": "audio.wav",
             "audio_sha256": receipt["audio_sha256"],
             "duration_seconds": receipt["duration_seconds"],
@@ -323,7 +199,7 @@ def enqueue(
     title: str = "",
     client_request_id: str = "",
 ) -> dict:
-    split_text(text)
+    text = validate_text(text)
     canonical_key = (
         f"client:{client_request_id}"
         if client_request_id
@@ -368,15 +244,6 @@ def cancel(task: str) -> dict:
     job = db.request_cancel_system_job(job_id)
     if job is None:
         raise ValueError("Task VieNeu không tồn tại.")
-    if job.get("status") == "running" or job.get("cancel_requested"):
-        def force_after_grace() -> None:
-            current = db.get_system_job(job_id)
-            if current and current.get("status") == "running" and current.get("cancel_requested"):
-                process_registry.kill_job_processes(job_id)
-
-        timer = threading.Timer(5.0, force_after_grace)
-        timer.daemon = True
-        timer.start()
     return job
 
 

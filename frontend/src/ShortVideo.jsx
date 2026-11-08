@@ -23,15 +23,6 @@ const STATUS_LABELS = {
   canceled: 'Đã hủy'
 }
 
-const ERA_FALLBACK_LABELS = {
-  nguyen_ai_quoc_1919_1923: 'Nguyễn Ái Quốc tại Pháp 1919–1923',
-  international_1924_1940: 'Hoạt động quốc tế 1924–1940',
-  pac_bo_1941_1942: 'Pác Bó 1941–1942',
-  prison_1942_1943: 'Nhật ký trong tù 1942–1943',
-  viet_bac_1944_1954: 'Việt Bắc 1944–1954',
-  president_1954_1969: 'Chủ tịch nước 1954–1969'
-}
-
 async function api(path, options) {
   const response = await fetch(`${API_BASE}${path}`, options)
   const data = await response.json().catch(() => ({}))
@@ -41,6 +32,10 @@ async function api(path, options) {
 
 function artifactUrl(path) {
   return path ? `${API_BASE}${path}` : ''
+}
+
+function characterEraLabel(character, eraKey) {
+  return (character?.eras || []).find(era => era.key === eraKey)?.label || eraKey
 }
 
 function StatusBadge({ status }) {
@@ -282,7 +277,7 @@ function CreateView({ project, onCreated }) {
               <option value="auto">Tự động</option>
               {characterEras.map(era => (
                 <option key={era.key} value={era.key} disabled={!era.available}>
-                  {era.label || ERA_FALLBACK_LABELS[era.key] || era.key}{era.available ? '' : ' · thiếu ảnh'}
+                  {era.label || era.key}{era.available ? '' : ' · thiếu ảnh'}
                 </option>
               ))}
             </select>
@@ -358,7 +353,7 @@ function ReviewDetail({ itemId, onBack, onChanged }) {
           <div>
             <strong>Profile {item.character.profile_key} v{item.character.profile_version}</strong>
             <small>
-              {item.character.resolved_era ? (ERA_FALLBACK_LABELS[item.character.resolved_era] || item.character.resolved_era) : 'Chưa xác định thời kỳ'}
+              {item.character.resolved_era ? characterEraLabel(item.character, item.character.resolved_era) : 'Chưa xác định thời kỳ'}
               {item.character.source === 'auto' && item.character.confidence != null
                 ? ` · độ tin cậy ${(Number(item.character.confidence) * 100).toFixed(0)}%`
                 : ''}
@@ -369,7 +364,7 @@ function ReviewDetail({ itemId, onBack, onChanged }) {
             <select value={eraChoice} onChange={event => setEraChoice(event.target.value)}>
               <option value="auto">Tự động chọn lại</option>
               {(item.character.eras || []).map(era => (
-                <option key={era.key} value={era.key}>{era.label || ERA_FALLBACK_LABELS[era.key] || era.key}</option>
+                <option key={era.key} value={era.key}>{era.label || era.key}</option>
               ))}
             </select>
             <button
@@ -381,7 +376,7 @@ function ReviewDetail({ itemId, onBack, onChanged }) {
           <ul>
             <li>Đúng khuôn mặt, độ tuổi và thời kỳ</li>
             <li>Trang phục, đạo cụ và cơ thể tự nhiên</li>
-            <li>Đen trắng, không chữ, logo hoặc màu hóa</li>
+            <li>Tuân thủ style và các nội dung bị cấm của project</li>
           </ul>
         </section>
       )}
@@ -400,7 +395,9 @@ function ReviewDetail({ itemId, onBack, onChanged }) {
               <strong>Cảnh {scene.index + 1}</strong>
               <small>{Number(scene.duration || 0).toFixed(1)} giây · {scene.fallback_to_image ? 'Pan/zoom fallback' : scene.media_type}</small>
               {scene.character_presence && (
-                <small>Có Bác Hồ · {scene.shot_type} · ref: {(scene.reference_asset_ids || []).join(', ') || scene.reference_role}</small>
+                <small>
+                  Có {item.profile?.resolved_character_profile?.display_name || item.character?.profile_key || 'nhân vật'} · {scene.shot_type} · ref: {(scene.reference_asset_ids || []).join(', ') || scene.reference_role}
+                </small>
               )}
               <p>{scene.transcript}</p>
               <button
@@ -585,7 +582,7 @@ function SettingsView({ project }) {
   const [error, setError] = useState('')
   const [removing, setRemoving] = useState('')
   const [audioSample, setAudioSample] = useState(
-    'Sáng ra bờ suối, tối vào hang,\nCháo bẹ, rau măng vẫn sẵn sàng.\nBàn đá chông chênh dịch sử Đảng,\nCuộc đời cách mạng thật là sang.'
+    'Dòng thơ thử nghiệm thứ nhất.\nDòng thơ thử nghiệm thứ hai.'
   )
   const voiceOptions = Array.isArray(project.voice_options) ? project.voice_options : []
   const [settingsVoiceId, setSettingsVoiceId] = useState(voiceOptions[0]?.id || '')

@@ -201,13 +201,13 @@ def _default_providers() -> list[dict]:
         },
         {
             "id": VIENEU_PROVIDER_ID,
-            "type": "local_on_demand",
+            "type": "local_api",
             "display_name": "VieNeu v3 Turbo",
             "enabled": True,
             "health": "unknown",
             "capabilities": {
-                "remote_voices": False,
-                "voice_clone": True,
+                "remote_voices": True,
+                "voice_clone": False,
                 "preview": True,
                 "standalone_generation": True,
                 "billable": False,
@@ -557,12 +557,12 @@ def build_voice_snapshot(
         ),
     }
     if provider_id == VIENEU_PROVIDER_ID:
-        from nexus_engine.services import vieneu_voice_profiles
+        from nexus_engine.services import vieneu_tts
 
-        snapshot.update(
-            vieneu_voice_profiles.build_voice_snapshot_fields(
-                voice_id=voice_id,
-                revision=selected_revision,
-            )
+        remote = vieneu_tts.api_voice(snapshot["provider_voice_id"])
+        snapshot["provider_voice_revision"] = max(
+            1,
+            int(remote.get("revision") or 1),
         )
+        snapshot["provider_voice_source"] = str(remote.get("source") or "")
     return snapshot

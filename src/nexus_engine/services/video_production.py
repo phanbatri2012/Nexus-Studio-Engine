@@ -1410,6 +1410,7 @@ async def _generate_scene_image_async(
     existing_hashes: set[str] | None = None,
     existing_perceptual_hashes: list[ImagePerceptualFingerprint] | None = None,
     force_new_project: bool = False,
+    force_new_flow_project: bool = False,
     submit_only: bool = False,
     artifact_snapshot: dict[str, dict] | None = None,
     reference_hash_cache: dict[tuple[str, int, int], str] | None = None,
@@ -1542,6 +1543,7 @@ async def _generate_scene_image_async(
     terminal_reason = str(existing_metadata.get("reason_code") or "")
     if (
         not force_new_project
+        and not force_new_flow_project
         and existing
         and existing.get("content_hash") == content_hash
         and existing.get("status") == "failed"
@@ -1555,7 +1557,7 @@ async def _generate_scene_image_async(
             cached_err or f"Cảnh {scene.get('index', 0) + 1} đã thất bại và đạt giới hạn thử lại."
         )
 
-    generation_attempt = int(existing_metadata.get("generation_attempt") or 0)
+    generation_attempt = 0 if force_new_flow_project else int(existing_metadata.get("generation_attempt") or 0)
     if not is_reconciliation_checkpoint and not is_intent_reconciliation:
         generation_attempt += 1
         if generation_attempt > MAX_FLOW_IMAGE_SUBMISSION_ATTEMPTS:
@@ -2881,7 +2883,8 @@ def generate_scene_media(
                         worker=worker,
                         existing_hashes=image_hashes,
                         existing_perceptual_hashes=image_perceptual_hashes,
-                        force_new_project=False,
+                        force_new_project=force_new_project,
+                        force_new_flow_project=force_new_flow_project,
                         submit_only=True,
                         artifact_snapshot=artifact_snapshot,
                         reference_hash_cache=reference_hash_cache,

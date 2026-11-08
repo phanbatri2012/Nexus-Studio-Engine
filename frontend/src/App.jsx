@@ -275,34 +275,35 @@ function App() {
   const isRenderCanceled = !isRenderActive && !isRenderPaused && Boolean(renderInfo?.is_canceled || renderInfo?.job?.status === 'canceled')
   const hasMp4Ready = Boolean(!isRenderActive && !isRenderError && !isRenderCanceled && renderInfo?.has_mp4)
   const mediaReadiness = renderInfo?.media_readiness
-  let allBaseImagesReady = false
-  let completedIntroVideos = 0
-  let requestedIntroVideos = 0
-
-  if (mediaReadiness) {
-    allBaseImagesReady = Boolean(mediaReadiness.all_base_images_ready)
-    completedIntroVideos = Number(mediaReadiness.completed_videos ?? mediaReadiness.completed_intro_videos ?? 0)
-    requestedIntroVideos = Number(mediaReadiness.total_videos ?? mediaReadiness.requested_intro_videos ?? 0)
-  } else {
-    const fmp = renderInfo?.job?.flow_media_progress || {}
-    const progText = String(renderInfo?.job?.progress || renderInfo?.production_progress || '')
-    const hasIncompleteImageText = progText.includes('Đã xong') && progText.includes('ảnh')
-    if (fmp.phase === 'videos' || (fmp.images_total > 0 && fmp.images_completed >= fmp.images_total)) {
-      allBaseImagesReady = true
-      completedIntroVideos = Number(fmp.videos_completed || 0)
-      requestedIntroVideos = Number(fmp.videos_total || 0)
-    } else if (fmp.phase === 'images' || hasIncompleteImageText) {
-      allBaseImagesReady = false
-    } else if (renderInfo?.current_stage === 'intro_fallback_review' || renderInfo?.current_stage === 'flow_reconcile_stalled') {
-      allBaseImagesReady = true
-    }
-  }
-
   const fmp = renderInfo?.job?.flow_media_progress || {}
   const mmp = renderInfo?.job?.muse_media_progress || {}
   const museArtifacts = renderInfo?.job?.muse_artifacts || {}
 
+  const hasJobImageProgress = (fmp?.images_total != null && fmp.images_total > 0) || (mmp?.images_total != null && mmp.images_total > 0) || (mmp?.phase === 'images' && mmp?.total > 0);
+  const hasJobVideoProgress = (fmp?.videos_total != null && fmp.videos_total > 0) || (mmp?.videos_total != null && mmp.videos_total > 0) || (mmp?.phase === 'videos' && mmp?.total > 0);
+
+  let allBaseImagesReady = false
+  let completedIntroVideos = 0
+  let requestedIntroVideos = 0
+
+  if (hasJobImageProgress || hasJobVideoProgress) {
+    if (fmp.phase === 'videos' || (fmp.images_total > 0 && fmp.images_completed >= fmp.images_total)) {
+      allBaseImagesReady = true
+      completedIntroVideos = Number(fmp.videos_completed || 0)
+      requestedIntroVideos = Number(fmp.videos_total || 0)
+    } else if (fmp.phase === 'images') {
+      allBaseImagesReady = false
+    } else if (renderInfo?.current_stage === 'intro_fallback_review' || renderInfo?.current_stage === 'flow_reconcile_stalled') {
+      allBaseImagesReady = Boolean(fmp.images_total > 0 && fmp.images_completed >= fmp.images_total)
+    }
+  } else if (mediaReadiness) {
+    allBaseImagesReady = Boolean(mediaReadiness.all_base_images_ready)
+    completedIntroVideos = Number(mediaReadiness.completed_videos ?? mediaReadiness.completed_intro_videos ?? 0)
+    requestedIntroVideos = Number(mediaReadiness.total_videos ?? mediaReadiness.requested_intro_videos ?? 0)
+  }
+
   const totalImages = Number(
+    (hasJobImageProgress ? (fmp.images_total ?? mmp.images_total ?? (mmp.phase === 'images' ? mmp.total : 0)) : null) ??
     mediaReadiness?.total_images ??
     mediaReadiness?.total_scenes ??
     fmp.images_total ??
@@ -311,6 +312,7 @@ function App() {
     0
   )
   const completedImages = Number(
+    (hasJobImageProgress ? (fmp.images_completed ?? mmp.images_completed ?? museArtifacts.scene_images_ready) : null) ??
     mediaReadiness?.completed_images ??
     mediaReadiness?.completed_base_images ??
     fmp.images_completed ??
@@ -319,6 +321,7 @@ function App() {
     0
   )
   const totalVideos = Number(
+    (hasJobVideoProgress ? (fmp.videos_total ?? mmp.videos_total ?? (mmp.phase === 'videos' ? mmp.total : 0)) : null) ??
     mediaReadiness?.total_videos ??
     mediaReadiness?.requested_intro_videos ??
     fmp.videos_total ??
@@ -327,6 +330,7 @@ function App() {
     0
   )
   const completedVideos = Number(
+    (hasJobVideoProgress ? (fmp.videos_completed ?? mmp.videos_completed ?? museArtifacts.scene_videos_ready) : null) ??
     mediaReadiness?.completed_videos ??
     mediaReadiness?.completed_intro_videos ??
     fmp.videos_completed ??

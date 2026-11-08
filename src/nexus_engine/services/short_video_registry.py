@@ -20,7 +20,7 @@ from pydantic import (
 )
 
 from nexus_engine.paths import SHORT_VIDEO_PROJECTS_CONFIG_DIR
-from nexus_engine.services import vieneu_tts, vieneu_voice_profiles, voice_config
+from nexus_engine.services import vieneu_tts, voice_config
 from nexus_engine.services.short_video_character_profiles import (
     ShortVideoCharacterProfileRegistry,
     character_profile_registry,
@@ -82,7 +82,6 @@ class VoiceProfile(BaseModel):
     voice_id: str = Field(min_length=1, max_length=200)
     voice_name: str = Field(min_length=1, max_length=200)
     selectable: bool = False
-    title_pause_ms: int = Field(ge=0, le=5000)
     single_task: Literal[True]
 
 
@@ -185,7 +184,6 @@ class ShortVideoProjectManifest(BaseModel):
     render_profile: RenderProfile
     review_policy: ReviewPolicy
     character_profile: CharacterProfileDependency | None = None
-    audio_generation_policy: Literal["bac_ho_poetry_v1"] | None = None
 
     @field_validator("key")
     @classmethod
@@ -198,14 +196,6 @@ class ShortVideoProjectManifest(BaseModel):
     def validate_audio_provider(self) -> "ShortVideoProjectManifest":
         if (self.voice_profile is None) == (self.audio_profile is None):
             raise ValueError("Manifest phải khai báo đúng một voice_profile hoặc audio_profile")
-        if (
-            self.audio_generation_policy == "bac_ho_poetry_v1"
-            and (
-                self.voice_profile is None
-                or self.voice_profile.provider != vieneu_tts.SUPPORTED_PROVIDER
-            )
-        ):
-            raise ValueError("bac_ho_poetry_v1 yêu cầu voice_profile VieNeu.")
         return self
 
 
@@ -252,35 +242,23 @@ def _dependency_status(
     )
     audio_summary = None
     if manifest.audio_profile is not None:
-        technical = vieneu_tts.managed_profile_status(
-            manifest.key,
-            manifest.audio_profile.profile_version,
+        detail = (
+            "Audio Profile cục bộ là định dạng legacy; "
+            "hãy cấu hình voice_profile do VieNeu API quản lý."
         )
-        audio_ready = bool(technical.get("available"))
-        create_ready = audio_ready and manifest.audio_profile.status == "active"
         audio_summary = {
             **manifest.audio_profile.model_dump(mode="json"),
-            "runtime_ready": bool((technical.get("runtime") or {}).get("available")),
-            "reference_ready": bool(technical.get("reference_ready")),
-            "create_ready": create_ready,
-            "model_revision": deepcopy(
-                (technical.get("runtime") or {}).get("model_revision") or {}
-            ),
-            "detail": (
-                technical.get("detail")
-                if audio_ready
-                else technical.get("detail") or "Audio Profile chưa sẵn sàng."
-            ),
+            "runtime_ready": False,
+            "reference_ready": False,
+            "create_ready": False,
+            "model_revision": {},
+            "detail": detail,
         }
         dependencies.append(
             {
                 "id": "audio_profile",
-                "available": create_ready,
-                "detail": (
-                    "Audio Profile đang ở trạng thái draft; chỉ cho phép nghe thử."
-                    if audio_ready and not create_ready
-                    else audio_summary["detail"]
-                ),
+                "available": False,
+                "detail": detail,
             }
         )
     else:
@@ -298,6 +276,11 @@ def _dependency_status(
             voice_ok = provider_id == voice_profile.provider and (
                 voice_profile.selectable or actual_name == voice_profile.voice_name
             )
+            if voice_ok and provider_id == vieneu_tts.SUPPORTED_PROVIDER:
+                remote = vieneu_tts.api_voice(
+                    str(voice.get("provider_voice_id") or voice.get("id") or "")
+                )
+                voice_ok = bool(remote)
             if not voice_ok:
                 voice_detail = "Giọng không đúng provider hoặc tên đã khai báo."
         except ValueError as exc:
@@ -397,10 +380,6 @@ class ShortVideoProjectRegistry:
             (f"character:{name}", mtime, size)
             for name, mtime, size in self.character_profiles.revision_signature()
         )
-        audio_signature = tuple(
-            (f"audio:{name}", mtime, size)
-            for name, mtime, size in vieneu_tts.revision_signature()
-        )
         voice_catalog_signature = ()
         if voice_config.VOICE_CONFIG_PATH.is_file():
             voice_stat = voice_config.VOICE_CONFIG_PATH.stat()
@@ -414,7 +393,6 @@ class ShortVideoProjectRegistry:
         return (
             *project_signature,
             *character_signature,
-            *audio_signature,
             *voice_catalog_signature,
         )
 
@@ -546,32 +524,10 @@ class ShortVideoProjectRegistry:
         snapshot["visual_profile"] = visual
         configured_audio = snapshot.get("audio_profile")
         if isinstance(configured_audio, dict):
-            if voice_id:
-                raise ValueError("voice_id chỉ dùng để đọc item OmniVoice cũ.")
-            selected_profile_id = str(
-                audio_profile_id or configured_audio.get("profile_id") or ""
-            ).strip()
-            if selected_profile_id != str(configured_audio.get("profile_id") or ""):
-                raise ValueError("Audio Profile không thuộc project này.")
-            if configured_audio.get("status") != "active":
-                raise ValueError("Audio Profile đang ở trạng thái draft; chưa thể tạo video.")
-            technical = vieneu_tts.managed_profile_status(
-                str(snapshot.get("key") or ""),
-                int(configured_audio.get("profile_version") or 1),
+            raise ValueError(
+                "Audio Profile cục bộ là định dạng legacy; "
+                "hãy cấu hình voice_profile do VieNeu API quản lý."
             )
-            if not technical.get("available"):
-                raise ValueError(str(technical.get("detail") or "Audio Profile chưa sẵn sàng."))
-            voice_snapshot = {
-                "voice_id": selected_profile_id,
-                "voice_name": str(configured_audio.get("display_name") or selected_profile_id),
-                "provider_id": str(configured_audio.get("provider") or ""),
-                "voice_revision": int(configured_audio.get("profile_version") or 1),
-                "config": {
-                    "backend": configured_audio.get("backend"),
-                    "precision": configured_audio.get("precision"),
-                    "sample_rate": configured_audio.get("sample_rate"),
-                },
-            }
         else:
             configured_voice = snapshot.get("voice_profile") or {}
             selected_voice_id = str(
@@ -599,10 +555,6 @@ class ShortVideoProjectRegistry:
                 "voice_name": str(voice.get("name") or ""),
             }
             voice_snapshot = voice_config.build_voice_snapshot(voice)
-            voice_snapshot["config"] = {
-                **(voice_snapshot.get("config") or {}),
-                "pause_ms": int(configured_voice.get("title_pause_ms") or 0),
-            }
         snapshot["resolved_voice_snapshot"] = voice_snapshot
         return snapshot
 
@@ -627,41 +579,45 @@ class ShortVideoProjectRegistry:
             raise KeyError("Dự án không khả dụng.")
         profile = entry.get("audio_profile")
         if not isinstance(profile, dict):
-            raise ValueError("Project không dùng Audio Profile VieNeu.")
+            configured_voice = entry.get("voice_profile") or {}
+            selected = str(profile_id or configured_voice.get("voice_id") or "").strip()
+            voice = voice_config.get_voice(selected, include_inactive=True)
+            if voice.get("provider_id") != vieneu_tts.SUPPORTED_PROVIDER:
+                raise ValueError("Giọng nghe thử không thuộc VieNeu.")
+            snapshot = voice_config.build_voice_snapshot(voice, allow_draft=True)
+            return {
+                "profile_kind": "global_voice",
+                "profile_id": str(voice.get("id") or ""),
+                "display_name": str(voice.get("name") or ""),
+                "provider": vieneu_tts.SUPPORTED_PROVIDER,
+                "profile_version": int(snapshot.get("provider_voice_revision") or 1),
+                "provider_voice_id": str(snapshot.get("provider_voice_id") or ""),
+                "provider_voice_revision": int(
+                    snapshot.get("provider_voice_revision") or 1
+                ),
+            }
         selected = str(profile_id or profile.get("profile_id") or "").strip()
         if selected != str(profile.get("profile_id") or ""):
             raise ValueError("Audio Profile không thuộc project này.")
-        status = vieneu_tts.managed_profile_status(
-            str(entry.get("key") or ""),
-            int(profile.get("profile_version") or 1),
+        raise ValueError(
+            "Audio Profile cục bộ là định dạng legacy; hãy chọn giọng được quản lý trong VieNeu."
         )
-        if not status.get("available"):
-            raise ValueError(str(status.get("detail") or "Audio Profile chưa sẵn sàng."))
-        return {
-            **deepcopy(profile),
-            "runtime_revision": (status.get("runtime") or {}).get("runtime_revision") or "",
-            "model_revision": deepcopy(
-                (status.get("runtime") or {}).get("model_revision") or {}
-            ),
-            "runtime_lock_sha256": (status.get("runtime") or {}).get("lock_sha256") or "",
-            "reference_sha256": status.get("reference_sha256") or "",
-        }
 
     def snapshot_audio_profile(self, snapshot: dict, item_dir: Path) -> dict:
         profile = snapshot.get("audio_profile")
         if isinstance(profile, dict):
-            snapshot["resolved_audio_profile"] = vieneu_tts.snapshot_profile(
-                project_key=str(snapshot.get("key") or ""),
-                profile=profile,
-                item_dir=item_dir,
+            raise ValueError(
+                "Không thể tạo item mới từ Audio Profile VieNeu cục bộ; hãy dùng global voice ID."
             )
-            return snapshot
         voice_snapshot = snapshot.get("resolved_voice_snapshot") or {}
         if voice_snapshot.get("provider_id") == vieneu_tts.SUPPORTED_PROVIDER:
-            snapshot["resolved_voice_profile"] = vieneu_voice_profiles.snapshot_revision(
-                voice_snapshot=voice_snapshot,
-                item_dir=item_dir,
-            )
+            snapshot["resolved_voice_profile"] = {
+                "provider": vieneu_tts.SUPPORTED_PROVIDER,
+                "provider_voice_id": str(voice_snapshot.get("provider_voice_id") or ""),
+                "provider_voice_revision": int(
+                    voice_snapshot.get("provider_voice_revision") or 1
+                ),
+            }
         return snapshot
 
     def snapshot_character_profile(self, snapshot: dict, item_dir: Path) -> dict:

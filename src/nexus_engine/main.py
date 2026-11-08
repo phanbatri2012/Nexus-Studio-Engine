@@ -12423,10 +12423,29 @@ def _run_system_job_center_action(
             updated_job = _resume_muse_media_job(job)
         elif str(job.get("job_type") or "") == "flow_media_generation":
             res = dict(job.get("result") or {})
-            if "reconcile_stagnant_count" in res:
-                res["reconcile_stagnant_count"] = 0
-                res.pop("attention_required", None)
-                db.update_system_job(job_id, result_json=res)
+            res["reconcile_stagnant_count"] = 0
+            res.pop("attention_required", None)
+            vid_id = int(job.get("video_id") or (job.get("payload") or {}).get("video_id") or 0)
+            if vid_id and job.get("status") == "paused":
+                scene_artifacts = db.list_latest_video_artifacts(vid_id, ("scene:",))
+                for k, art in scene_artifacts.items():
+                    art_meta = art.get("metadata") or {}
+                    if art.get("status") == "failed" and (art_meta.get("terminal") or art_meta.get("reason_code") == "flow_max_attempts_exceeded"):
+                        meta = dict(art_meta)
+                        meta["terminal"] = False
+                        meta["generation_attempt"] = 0
+                        meta.pop("reason_code", None)
+                        meta.pop("error", None)
+                        db.upsert_video_artifact(
+                            video_id=vid_id,
+                            artifact_type=k,
+                            path=str(art.get("path") or ""),
+                            content_hash=str(art.get("content_hash") or ""),
+                            status="queued",
+                            mime_type=art.get("mime_type") or "image/png",
+                            metadata=meta,
+                        )
+            db.update_system_job(job_id, result_json=res, error="")
             updated_job = db.resume_system_job(job_id)
             if updated_job and job.get("video_id"):
                 db.update_video_production_state(
@@ -12487,6 +12506,12 @@ def _run_system_job_center_action(
                             mime_type="video/mp4",
                             metadata={**(art.get("metadata") or {}), "failure_stage": "reset_new_project", "reason_code": "reset_requested"},
                         )
+                scene_artifacts = db.list_latest_video_artifacts(vid_id, ("scene:",))
+                for k, art in scene_artifacts.items():
+                    if art.get("status") != "completed":
+                        art_id = art.get("id")
+                        if art_id:
+                            db.delete_video_artifact(art_id)
                 db.request_new_flow_project(vid_id)
 
             db.update_system_job(
@@ -14864,63 +14889,104 @@ def _check_video_media_readiness(video_id: int) -> dict:
                     pass
 
         total_scenes = len(scenes)
-        artifacts = db.list_video_artifacts(video_id)
-        latest_by_type: dict[str, dict] = {}
-        for a in artifacts:
-            atype = str(a.get("artifact_type") or "")
-            prev = latest_by_type.get(atype)
-            if prev is None or int(a.get("id") or 0) > int(prev.get("id") or 0):
-                latest_by_type[atype] = a
 
-        if total_scenes > 0:
-            total_images = total_scenes + (1 if isinstance(terminal_frame, dict) else 0)
-            for idx, sc in enumerate(scenes):
-                # Kiểm tra ảnh (Flow: scene:{idx}, Muse: muse_scene_image:{idx})
-                img_art = latest_by_type.get(f"scene:{idx}") or latest_by_type.get(f"muse_scene_image:{idx}")
-                if (
-                    img_art
-                    and img_art.get("status") in {"completed", "ready"}
-                    and Path(img_art.get("path") or "").is_file()
-                ):
-                    completed_images += 1
+        # 3. Ưu tiên kiểm tra tiến độ từ media job gần nhất (Flow / Muse) nếu có
+        media_jobs = [
+            j
+            for j in db.list_system_jobs(video_id=video_id, limit=None)
+            if j.get("job_type") in {"flow_media_generation", "muse_media_generation"}
+            and j.get("status") in {"queued", "running", "retry_wait", "paused", "completed"}
+        ]
+        job_progress_applied = False
+        if media_jobs:
+            active_media_job = next(
+                (
+                    j
+                    for j in media_jobs
+                    if j.get("status") in {"queued", "running", "retry_wait", "paused"}
+                ),
+                None,
+            )
+            target_job = active_media_job or media_jobs[0]
+            job_res = target_job.get("result") or {}
+            fmp = job_res.get("flow_media_progress")
+            mmp = job_res.get("muse_media_progress")
+            if isinstance(fmp, dict) and int(fmp.get("images_total") or 0) > 0:
+                fmp_total = int(fmp.get("images_total") or 0)
+                if total_scenes == 0 or fmp_total == total_scenes:
+                    total_images = fmp_total
+                    completed_images = int(fmp.get("images_completed") or 0)
+                    total_videos = int(fmp.get("videos_total") or 0)
+                    completed_videos = int(fmp.get("videos_completed") or 0)
+                    job_progress_applied = True
+            elif isinstance(mmp, dict) and int(mmp.get("images_total") or mmp.get("total") or 0) > 0:
+                mmp_total = int(mmp.get("images_total") or mmp.get("total") or 0)
+                if total_scenes == 0 or mmp_total == total_scenes:
+                    total_images = mmp_total
+                    completed_images = int(mmp.get("images_completed") or 0)
+                    total_videos = int(mmp.get("videos_total") or 0)
+                    completed_videos = int(mmp.get("videos_completed") or 0)
+                    job_progress_applied = True
 
-                # Kiểm tra video (Flow: scene_video:{idx}, Muse: muse_scene_video:{idx})
-                if sc.get("is_video") or sc.get("media_type") == "video":
-                    total_videos += 1
-                    vid_art = latest_by_type.get(f"scene_video:{idx}") or latest_by_type.get(f"muse_scene_video:{idx}")
+        if not job_progress_applied:
+            artifacts = db.list_video_artifacts(video_id)
+            latest_by_type: dict[str, dict] = {}
+            for a in artifacts:
+                atype = str(a.get("artifact_type") or "")
+                prev = latest_by_type.get(atype)
+                if prev is None or int(a.get("id") or 0) > int(prev.get("id") or 0):
+                    latest_by_type[atype] = a
+
+            if total_scenes > 0:
+                total_images = total_scenes + (1 if isinstance(terminal_frame, dict) else 0)
+                for idx, sc in enumerate(scenes):
+                    # Kiểm tra ảnh (Flow: scene:{idx}, Muse: muse_scene_image:{idx})
+                    img_art = latest_by_type.get(f"scene:{idx}") or latest_by_type.get(f"muse_scene_image:{idx}")
                     if (
-                        vid_art
-                        and vid_art.get("status") in {"completed", "ready"}
-                        and Path(vid_art.get("path") or "").is_file()
-                        and Path(vid_art.get("path") or "").stat().st_size > 0
+                        img_art
+                        and img_art.get("status") in {"completed", "ready"}
+                        and Path(img_art.get("path") or "").is_file()
                     ):
-                        completed_videos += 1
+                        completed_images += 1
 
-            if isinstance(terminal_frame, dict):
-                term_art = latest_by_type.get("muse_terminal_frame")
-                if (
-                    term_art
-                    and term_art.get("status") in {"completed", "ready"}
-                    and Path(term_art.get("path") or "").is_file()
-                ):
-                    completed_images += 1
-        else:
-            # Fallback nếu plan chưa kịp lưu: đếm trực tiếp các artifact hợp lệ
-            completed_images = sum(
-                1
-                for atype, a in latest_by_type.items()
-                if (atype.startswith("scene:") or atype.startswith("muse_scene_image:") or atype == "muse_terminal_frame")
-                and a.get("status") in {"completed", "ready"}
-                and Path(a.get("path") or "").is_file()
-            )
-            completed_videos = sum(
-                1
-                for atype, a in latest_by_type.items()
-                if (atype.startswith("scene_video:") or atype.startswith("muse_scene_video:"))
-                and a.get("status") in {"completed", "ready"}
-                and Path(a.get("path") or "").is_file()
-                and Path(a.get("path") or "").stat().st_size > 0
-            )
+                    # Kiểm tra video (Flow: scene_video:{idx}, Muse: muse_scene_video:{idx})
+                    if sc.get("is_video") or sc.get("media_type") == "video":
+                        total_videos += 1
+                        vid_art = latest_by_type.get(f"scene_video:{idx}") or latest_by_type.get(f"muse_scene_video:{idx}")
+                        if (
+                            vid_art
+                            and vid_art.get("status") in {"completed", "ready"}
+                            and Path(vid_art.get("path") or "").is_file()
+                            and Path(vid_art.get("path") or "").stat().st_size > 0
+                        ):
+                            completed_videos += 1
+
+                if isinstance(terminal_frame, dict):
+                    term_art = latest_by_type.get("muse_terminal_frame")
+                    if (
+                        term_art
+                        and term_art.get("status") in {"completed", "ready"}
+                        and Path(term_art.get("path") or "").is_file()
+                    ):
+                        completed_images += 1
+            else:
+                # Fallback nếu plan chưa kịp lưu: đếm trực tiếp các artifact hợp lệ
+                completed_images = sum(
+                    1
+                    for atype, a in latest_by_type.items()
+                    if (atype.startswith("scene:") or atype.startswith("muse_scene_image:") or atype == "muse_terminal_frame")
+                    and a.get("status") in {"completed", "ready"}
+                    and Path(a.get("path") or "").is_file()
+                )
+                completed_videos = sum(
+                    1
+                    for atype, a in latest_by_type.items()
+                    if (atype.startswith("scene_video:") or atype.startswith("muse_scene_video:"))
+                    and a.get("status") in {"completed", "ready"}
+                    and Path(a.get("path") or "").is_file()
+                    and Path(a.get("path") or "").stat().st_size > 0
+                )
+
     except Exception:
         pass
 

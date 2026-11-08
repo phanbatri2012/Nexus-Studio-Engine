@@ -1,20 +1,13 @@
-import hashlib
-import io
 import json
-import os
 import tempfile
 import unittest
 import wave
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
-
-import numpy as np
+from unittest.mock import patch
 
 from nexus_engine.services import database as db
 from nexus_engine.services import short_video_api
-from nexus_engine.services import short_video_audio
 from nexus_engine.services import short_video_pipeline
 from nexus_engine.services import short_video_renderer
 from nexus_engine.services import short_video_worker
@@ -24,94 +17,109 @@ from nexus_engine.services.short_video_registry import ShortVideoProjectRegistry
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST_PATH = ROOT / "config" / "short_video_projects" / "bac-ho-ngam-tho.v1.json"
-
-
-def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+MANIFEST_PATH = ROOT / "tests" / "fixtures" / "short_video" / "poetry-demo.v1.json"
 
 
 class VieNeuPoemAudioTests(unittest.TestCase):
-    def test_title_is_not_part_of_vieneu_audio_input(self):
-        item = {
-            "title": "TÊN BÀI THƠ KHÔNG ĐƯỢC ĐỌC",
-            "source_text": "Sáng ra bờ suối, tối vào hang\nCháo bẹ, rau măng vẫn sẵn sàng",
+    def test_profile_validation_uses_remote_voice_snapshot_without_reference(self):
+        voice_snapshot = {
+            "voice_id": "catalog-bh-1",
+            "voice_name": "BH_1",
+            "provider_id": "vieneu_v3_turbo",
+            "provider_voice_id": "BH_1",
+            "provider_voice_revision": 3,
         }
-        lines = short_video_pipeline._vieneu_audio_input_lines(item)
-        payload = "\n".join(line["synthesis_text"] for line in lines)
-        self.assertNotIn(item["title"], payload)
-        self.assertIn("Sáng ra bờ suối", payload)
+        manifest = {
+            "pipeline_profile": {"id": "poem_to_short_v1"},
+            "voice_profile": {
+                "provider": "vieneu_v3_turbo",
+                "voice_id": "catalog-bh-1",
+                "voice_name": "BH_1",
+            },
+            "resolved_voice_snapshot": voice_snapshot,
+            "resolved_voice_profile": {
+                "provider": "vieneu_v3_turbo",
+                "provider_voice_id": "BH_1",
+                "provider_voice_revision": 3,
+            },
+            "visual_profile": {"provider": "muse", "available_providers": ["muse"]},
+            "render_profile": {
+                "subtitles": False,
+                "title_card": False,
+                "credits": False,
+                "music": False,
+                "ambience": False,
+            },
+        }
 
-    def test_line_punctuation_and_pause_policy(self):
-        lines = short_video_audio.prepare_poem_lines(
-            "Dòng thường\nDòng cuối khổ\n\nDòng hỏi?\nDòng cuối"
-        )
-        self.assertEqual(
-            [line["gap_ms"] for line in lines],
-            [900, 2200, 1200, 1200],
-        )
-        self.assertEqual(lines[0]["synthesis_text"], "Dòng thường,")
-        self.assertEqual(lines[1]["synthesis_text"], "Dòng cuối khổ.")
-        self.assertEqual(lines[2]["source_text"], "Dòng hỏi?")
-        self.assertEqual(lines[3]["synthesis_text"], "Dòng cuối.")
+        _, _, validated_voice = short_video_pipeline._validate_profile({"manifest": manifest})
+        self.assertEqual(validated_voice["provider_voice_id"], "BH_1")
+        self.assertNotIn("reference", manifest["resolved_voice_profile"])
 
-    def test_seed_is_deterministic_per_variant(self):
-        first = short_video_audio.deterministic_seed(
-            item_id="item", audio_revision=2, line_index=3, variant=1
-        )
-        repeated = short_video_audio.deterministic_seed(
-            item_id="item", audio_revision=2, line_index=3, variant=1
-        )
-        second_variant = short_video_audio.deterministic_seed(
-            item_id="item", audio_revision=2, line_index=3, variant=2
-        )
-        self.assertEqual(first, repeated)
-        self.assertNotEqual(first, second_variant)
+        legacy = dict(manifest)
+        legacy["audio_profile"] = {"provider": "vieneu_v3_turbo"}
+        with self.assertRaisesRegex(short_video_pipeline.ShortVideoPipelineError, "legacy"):
+            short_video_pipeline._validate_profile({"manifest": legacy})
 
-    def test_transcript_qc_rejects_repeated_words(self):
-        result = short_video_audio.transcript_score(
-            "Sáng ra bờ suối tối vào hang",
-            "Sáng sáng sáng sáng ra bờ suối tối vào hang",
-        )
-        self.assertFalse(result["accepted"])
-        self.assertTrue(result["repeated_words"])
+    def test_nexus_sends_whole_poem_once_without_title_or_local_delivery(self):
+        item = {
+            "id": "item-1",
+            "title": "TÊN BÀI THƠ KHÔNG ĐƯỢC ĐỌC",
+            "source_text": "Dòng thơ thứ nhất\nDòng thơ thứ hai",
+        }
+        profile = {
+            "resolved_voice_snapshot": {
+                "provider_voice_id": "BH_1",
+                "provider_voice_revision": 3,
+            },
+            "resolved_voice_profile": {
+                "provider_voice_id": "BH_1",
+                "provider_voice_revision": 3,
+            },
+        }
+        captured = {"calls": 0}
 
-    def test_transcript_qc_tolerates_near_phonetic_asr_spelling(self):
-        result = short_video_audio.transcript_score(
-            "Sáng ra bờ suối tối vào hang",
-            "Sáng ra bờ xuối tối vào hàng",
-        )
-        self.assertTrue(result["accepted"])
-        self.assertGreaterEqual(result["score"], 0.8)
+        class FakeSession:
+            def __init__(self, **_kwargs):
+                pass
 
-    def test_transcript_qc_rejects_missing_word(self):
-        result = short_video_audio.transcript_score(
-            "Sáng ra bờ suối tối vào hang",
-            "Sáng ra bờ suối vào hang",
-        )
-        self.assertFalse(result["accepted"])
-        self.assertFalse(result["same_word_count"])
+            def __enter__(self):
+                return self
 
-    def test_transcript_qc_rejects_unrelated_equal_length_words(self):
-        result = short_video_audio.transcript_score(
-            "Bàn đá chông chênh dịch sử Đảng",
-            "mây trắng bay ngang trời xanh xa",
-        )
-        self.assertFalse(result["accepted"])
-        self.assertLess(result["score"], short_video_audio.TRANSCRIPT_ACCEPTANCE_THRESHOLD)
+            def __exit__(self, *_args):
+                return None
 
-    def test_wav_qc_rejects_clipping(self):
+            def generate(self, *, text, seed, output_path):
+                captured.update({"calls": captured["calls"] + 1, "text": text, "seed": seed})
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with wave.open(str(output_path), "wb") as target:
+                    target.setnchannels(1)
+                    target.setsampwidth(2)
+                    target.setframerate(48000)
+                    target.writeframes(b"\x00\x00" * 48000)
+                output_path.with_suffix(".receipt.json").write_text("{}", encoding="utf-8")
+                return {"duration_seconds": 1.0, "sha256": "a" * 64}
+
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-            path = Path(temp_dir) / "clipped.wav"
-            samples = np.full(48000, 32767, dtype="<i2")
-            with wave.open(str(path), "wb") as target:
-                target.setnchannels(1)
-                target.setsampwidth(2)
-                target.setframerate(48000)
-                target.writeframes(samples.tobytes())
-            metrics = short_video_audio.analyze_wav(path)
-            self.assertFalse(metrics["technical_ok"])
-            self.assertGreater(metrics["clipping_ratio"], 0.9)
+            with (
+                patch.object(vieneu_tts, "api_health", return_value={"available": True}),
+                patch.object(vieneu_tts, "api_voice", return_value={"id": "BH_1", "revision": 3}),
+                patch.object(vieneu_tts, "VieNeuGenerationSession", FakeSession),
+                patch.object(short_video_pipeline, "_save_checkpoint"),
+            ):
+                duration = short_video_pipeline._ensure_vieneu_audio(
+                    checkpoint={"audio_revision": 0, "audio": {}},
+                    item_dir=Path(temp_dir),
+                    job={"id": "job-1"},
+                    item=item,
+                    profile=profile,
+                    max_duration=180,
+                )
+
+        self.assertEqual(captured["calls"], 1)
+        self.assertEqual(captured["text"], item["source_text"])
+        self.assertNotIn(item["title"], captured["text"])
+        self.assertEqual(duration, 1.0)
 
     def test_renderer_probe_falls_back_to_ffmpeg_metadata(self):
         ffmpeg_output = """
@@ -142,88 +150,44 @@ Stream #0:1 -> #0:1 (aac (native) -> pcm_s16le (native))
 
 
 class VieNeuRuntimeTests(unittest.TestCase):
-    def setUp(self):
-        vieneu_tts._STATUS_CACHE.clear()
+    def test_session_calls_vieneu_api_by_voice_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "candidate.wav"
+            receipt = {"sha256": "a" * 64, "provider_request_id": "spk-test"}
 
-    def tearDown(self):
-        vieneu_tts._STATUS_CACHE.clear()
+            def fake_generate(**kwargs):
+                kwargs["output_path"].write_bytes(b"wav")
+                return dict(receipt)
 
-    def test_unicode_home_and_model_hash_fail_closed(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-            home = Path(temp_dir) / "VieNeu‑TTS v3_Turbo"
-            python = home / ".venv" / "Scripts" / "python.exe"
-            model = home / "models" / "tiny.bin"
-            python.parent.mkdir(parents=True)
-            model.parent.mkdir(parents=True)
-            python.write_bytes(b"python")
-            model.write_bytes(b"model")
-            lock = {
-                "engine": "vieneu_v3_turbo",
-                "backend": "onnx",
-                "precision": "fp32",
-                "python": ".venv/Scripts/python.exe",
-                "runtime_revision": "runtime-revision",
-                "package_version": "3.8.3",
-                "model_revision": {"backbone": "model-revision"},
-                "watermark_available": True,
-                "artifacts": [
-                    {
-                        "path": "models/tiny.bin",
-                        "size": model.stat().st_size,
-                        "sha256": sha256(model),
-                    }
-                ],
-            }
-            (home / "runtime.lock.json").write_text(json.dumps(lock), encoding="utf-8")
-            with patch.dict(os.environ, {vieneu_tts.ENV_HOME: str(home)}):
-                ready = vieneu_tts.runtime_status()
-                self.assertTrue(ready["available"])
-                model.write_bytes(b"tampered")
-                invalid = vieneu_tts.runtime_status()
-                self.assertFalse(invalid["available"])
-                self.assertEqual(invalid["code"], "runtime_invalid")
+            with (
+                patch.object(vieneu_tts, "api_health", return_value={"available": True}),
+                patch.object(
+                    vieneu_tts,
+                    "api_voice",
+                    return_value={"id": "BH_1", "revision": 3},
+                ),
+                patch.object(vieneu_tts, "generate_api_audio", side_effect=fake_generate) as generate,
+            ):
+                with vieneu_tts.VieNeuGenerationSession(
+                    job_id="test-session",
+                    provider_voice_id="BH_1",
+                    work_dir=Path(temp_dir),
+                ) as session:
+                    result = session.generate(text="Dòng thơ", seed=7, output_path=output)
 
-    def test_session_ignores_engine_logs_before_json_protocol(self):
-        stream = io.StringIO('Loading ONNX model...\n{"status":"ready"}\n')
-        process = SimpleNamespace(stdout=stream)
-        session = vieneu_tts.VieNeuGenerationSession(
-            job_id="test-session",
-            reference_path=Path("reference.wav"),
-            work_dir=Path("work"),
-        )
-        session.process = process
-        session._executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            self.assertEqual(session._read_response(timeout=1), {"status": "ready"})
-        finally:
-            session._executor.shutdown(wait=True)
+            self.assertEqual(result["provider_request_id"], "spk-test")
+            self.assertTrue(output.is_file())
+            self.assertEqual(generate.call_args.kwargs["provider_voice_id"], "BH_1")
+            self.assertNotIn("reference_path", generate.call_args.kwargs)
 
-    def test_session_rejects_excessive_non_protocol_output(self):
-        stream = io.StringIO("engine log\n" * 501)
-        process = SimpleNamespace(stdout=stream, kill=Mock())
-        session = vieneu_tts.VieNeuGenerationSession(
-            job_id="test-session-log-limit",
-            reference_path=Path("reference.wav"),
-            work_dir=Path("work"),
-        )
-        session.process = process
-        session._executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            with self.assertRaisesRegex(vieneu_tts.VieNeuRuntimeError, "quá nhiều log"):
-                session._read_response(timeout=2)
-            process.kill.assert_called_once_with()
-        finally:
-            session._executor.shutdown(wait=True)
-
-    def test_runner_has_bounded_commands_and_idle_timeout(self):
-        source = (ROOT / "scripts" / "vieneu_tts_runner.py").read_text(
+    def test_nexus_does_not_own_a_vieneu_inference_runner(self):
+        self.assertFalse((ROOT / "scripts" / "vieneu_tts_runner.py").exists())
+        source = (ROOT / "src" / "nexus_engine" / "services" / "vieneu_tts.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("MAX_SESSION_COMMANDS = 256", source)
-        self.assertIn("SESSION_IDLE_TIMEOUT_SECONDS = 900.0", source)
-        self.assertIn("range(MAX_SESSION_COMMANDS)", source)
-        self.assertIn("commands.get(timeout=SESSION_IDLE_TIMEOUT_SECONDS)", source)
-        self.assertNotIn("while True", source)
+        self.assertIn('"provider_voice_id"', source)
+        self.assertIn('/v1/audio/speech', source)
+        self.assertNotIn('tts.infer(', source)
 
 
 class VieNeuRegistryAndPreviewTests(unittest.TestCase):
@@ -247,10 +211,10 @@ class VieNeuRegistryAndPreviewTests(unittest.TestCase):
             json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
         )
         draft_voice = {
-            "id": "bac-ho-ngam-tho",
-            "name": "Bác Hồ ngâm thơ",
+            "id": manifest["voice_profile"]["voice_id"],
+            "name": manifest["voice_profile"]["voice_name"],
             "provider_id": "vieneu_v3_turbo",
-            "provider_voice_id": "bac-ho-ngam-tho",
+            "provider_voice_id": manifest["voice_profile"]["voice_name"],
             "status": "draft",
             "revision": 3,
             "active_revision": None,
@@ -269,7 +233,7 @@ class VieNeuRegistryAndPreviewTests(unittest.TestCase):
             ),
         ):
             registry = ShortVideoProjectRegistry(config)
-            project = registry.get("bac-ho-ngam-tho")
+            project = registry.get("poetry-demo")
         self.assertFalse(project["available"])
         voice_dependency = next(
             item for item in project["dependencies"] if item["id"] == "voice"
@@ -277,13 +241,13 @@ class VieNeuRegistryAndPreviewTests(unittest.TestCase):
         self.assertFalse(voice_dependency["available"])
         self.assertIsNone(project["audio_profile_summary"])
         with self.assertRaisesRegex(ValueError, "Dependency"):
-            registry.snapshot_for_create("bac-ho-ngam-tho")
+            registry.snapshot_for_create("poetry-demo")
 
     def test_preview_double_click_is_idempotent_and_uses_only_poem(self):
         profile = {
             "provider": "vieneu_v3_turbo",
-            "profile_id": "bac-ho-ngam-tho-v1",
-            "display_name": "Bác Hồ ngâm thơ · VieNeu v1",
+            "profile_id": "poetry-demo-v1",
+            "display_name": "Poetry Demo · VieNeu v1",
             "profile_version": 1,
             "status": "draft",
             "backend": "onnx",
@@ -306,10 +270,10 @@ class VieNeuRegistryAndPreviewTests(unittest.TestCase):
             patch.object(short_video_api.short_video_worker, "kick") as kick,
         ):
             first = short_video_api.create_short_video_audio_preview(
-                "bac-ho-ngam-tho", request
+                "poetry-demo", request
             )
             second = short_video_api.create_short_video_audio_preview(
-                "bac-ho-ngam-tho", request
+                "poetry-demo", request
             )
         self.assertTrue(first["created"])
         self.assertFalse(second["created"])
@@ -338,7 +302,7 @@ class VieNeuRegistryAndPreviewTests(unittest.TestCase):
             patch.object(short_video_api.short_video_worker, "kick") as resume_kick,
         ):
             resumed = short_video_api.create_short_video_audio_preview(
-                "bac-ho-ngam-tho", request
+                "poetry-demo", request
             )
         self.assertFalse(resumed["created"])
         self.assertEqual(resumed["preview"]["id"], first["preview"]["id"])
@@ -351,16 +315,16 @@ class VieNeuRegistryAndPreviewTests(unittest.TestCase):
         job_id = f"short-video-audio-preview-{preview_id}"
         _preview, _job, created = db.create_short_video_audio_preview_with_job(
             preview_id=preview_id,
-            project_key="bac-ho-ngam-tho",
-            profile_id="bac-ho-ngam-tho-v1",
+            project_key="poetry-demo",
+            profile_id="poetry-demo-v1",
             request_hash="c" * 64,
             poem_excerpt="Dòng thơ",
             job_id=job_id,
             payload={"preview_id": preview_id, "audio_profile": {}},
             expires_at="2999-01-01T00:00:00+00:00",
             voice_snapshot={
-                "voice_id": "bac-ho-ngam-tho-v1",
-                "voice_name": "Bác Hồ ngâm thơ · VieNeu v1",
+                "voice_id": "poetry-demo-v1",
+                "voice_name": "Poetry Demo · VieNeu v1",
                 "provider_id": "vieneu_v3_turbo",
                 "voice_revision": 1,
             },
@@ -377,7 +341,7 @@ class VieNeuRegistryAndPreviewTests(unittest.TestCase):
     def test_public_item_hides_audio_snapshot_path(self):
         manifest = {
             "resolved_audio_profile": {
-                "profile_id": "bac-ho-ngam-tho-v1",
+                "profile_id": "poetry-demo-v1",
                 "runtime_lock_sha256": "b" * 64,
                 "reference": {
                     "path": "references/audio_profile/reference.wav",
@@ -387,7 +351,7 @@ class VieNeuRegistryAndPreviewTests(unittest.TestCase):
         }
         item = {
             "id": "11111111-1111-4111-8111-111111111111",
-            "project_key": "bac-ho-ngam-tho",
+            "project_key": "poetry-demo",
             "profile_version": "1.1.0",
             "title": "Cảnh khuya",
             "status": "queued",

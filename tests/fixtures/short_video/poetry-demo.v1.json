@@ -1,10 +1,10 @@
 {
-  "key": "bac-ho-ngam-tho",
-  "display_name": "Bác Hồ ngâm thơ",
-  "description": "Tạo video dọc từ một bài thơ do Bác Hồ sáng tác, dùng giọng ngâm VieNeu-TTS từ reference gốc.",
+  "key": "poetry-demo",
+  "display_name": "Poetry Demo",
+  "description": "Synthetic Short Video project used only by automated tests.",
   "status": "active",
   "order": 10,
-  "profile_version": "1.3.0",
+  "profile_version": "1.0.0",
   "pipeline_profile": {
     "id": "poem_to_short_v1",
     "max_duration_seconds": 180,
@@ -20,13 +20,11 @@
   },
   "voice_profile": {
     "provider": "vieneu_v3_turbo",
-    "voice_id": "bac-ho-ngam-tho",
-    "voice_name": "Bác Hồ ngâm thơ",
+    "voice_id": "fixture-vieneu-voice",
+    "voice_name": "fixture_voice",
     "selectable": true,
-    "title_pause_ms": 0,
     "single_task": true
   },
-  "audio_generation_policy": "bac_ho_poetry_v1",
   "visual_profile": {
     "provider": "muse",
     "available_providers": ["muse", "google_flow"],
@@ -36,8 +34,8 @@
     "max_video_scenes": 3,
     "google_flow_image_model": "nano_banana_2_1",
     "google_flow_video_model": "omni_1_1_flash",
-    "style": "Vietnamese cinematic ink-wash painting, restrained historical atmosphere, poetic natural landscapes, soft paper texture, elegant brushwork, respectful and contemplative, vertical composition",
-    "forbid": ["text", "logo", "watermark", "lip_sync", "close_up_portrait"]
+    "style": "Neutral illustrated poetry scenes with consistent lighting and vertical composition.",
+    "forbid": ["text", "logo", "watermark", "lip_sync"]
   },
   "render_profile": {
     "draft": {
@@ -63,7 +61,7 @@
     "review_points": 1
   },
   "character_profile": {
-    "key": "bac-ho",
+    "key": "historical-character",
     "profile_version": 1,
     "required": false
   }

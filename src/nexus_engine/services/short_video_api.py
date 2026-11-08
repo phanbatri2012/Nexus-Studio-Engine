@@ -391,8 +391,8 @@ def create_short_video_audio_preview(key: str, request: AudioPreviewRequest):
                 "profile_id": profile.get("profile_id"),
                 "profile_version": profile.get("profile_version"),
                 "poem_excerpt": excerpt,
-                "reference_sha256": profile.get("reference_sha256"),
-                "runtime_lock_sha256": profile.get("runtime_lock_sha256"),
+                "provider_voice_id": profile.get("provider_voice_id"),
+                "provider_voice_revision": profile.get("provider_voice_revision"),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -407,11 +407,9 @@ def create_short_video_audio_preview(key: str, request: AudioPreviewRequest):
         "voice_name": profile["display_name"],
         "provider_id": profile["provider"],
         "voice_revision": int(profile.get("profile_version") or 1),
-        "config": {
-            "backend": profile.get("backend"),
-            "precision": profile.get("precision"),
-            "sample_rate": profile.get("sample_rate"),
-        },
+        "provider_voice_id": str(profile.get("provider_voice_id") or ""),
+        "provider_voice_revision": int(profile.get("provider_voice_revision") or 1),
+        "config": {},
     }
     expires_at = (
         datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
@@ -427,6 +425,7 @@ def create_short_video_audio_preview(key: str, request: AudioPreviewRequest):
             "preview_id": preview_id,
             "project_key": normalized_key,
             "audio_profile": profile,
+            "voice_snapshot": voice_snapshot,
         },
         expires_at=expires_at,
         voice_snapshot=voice_snapshot,

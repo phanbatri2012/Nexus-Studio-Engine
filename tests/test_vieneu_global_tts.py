@@ -3,29 +3,75 @@ from __future__ import annotations
 import copy
 import tempfile
 import unittest
-import wave
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import HTTPException
 
 from nexus_engine.services import database as db
-from nexus_engine.services import short_video_api
 from nexus_engine.services import tts_registry
-from nexus_engine.services import vieneu_tts_worker, vieneu_voice_profiles, voice_config
-
-
-def _write_wav(path: Path, seconds: float = 4.0) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    frames = int(48000 * seconds)
-    with wave.open(str(path), "wb") as output:
-        output.setnchannels(1)
-        output.setsampwidth(2)
-        output.setframerate(48000)
-        output.writeframes(b"\x00\x00" * frames)
+from nexus_engine.services import vieneu_tts, vieneu_tts_worker, voice_config
 
 
 class VieNeuVoiceRegistryTests(unittest.TestCase):
+    def test_api_health_distinguishes_missing_configuration(self):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(vieneu_tts, "VIENEU_TTS_SETTINGS_PATH", Path("missing-settings.json")),
+        ):
+            health = vieneu_tts.api_health()
+
+        self.assertFalse(health["available"])
+        self.assertEqual(health["code"], "api_unconfigured")
+
+    def test_api_generation_sends_only_synthesis_contract(self):
+        captured = {}
+
+        class FakeResponse:
+            headers = {"X-Request-Id": "provider-request-1"}
+
+            def __init__(self):
+                self._chunks = iter((b"\x00\x00" * 480, b""))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self, _size):
+                return next(self._chunks)
+
+        def fake_urlopen(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            output = Path(temp_dir) / "audio.wav"
+            with (
+                patch.object(vieneu_tts, "api_base_url", return_value="http://127.0.0.1:8000"),
+                patch.object(vieneu_tts.urllib.request, "urlopen", side_effect=fake_urlopen),
+            ):
+                receipt = vieneu_tts.generate_api_audio(
+                    text="  Xin chào.  ",
+                    provider_voice_id="BH_1",
+                    seed=7,
+                    output_path=output,
+                )
+
+            payload = __import__("json").loads(captured["request"].data.decode("utf-8"))
+            self.assertEqual(
+                set(payload),
+                {"model", "input", "voice", "response_format", "stream_format", "sample_rate", "seed"},
+            )
+            self.assertEqual(payload["input"], "Xin chào.")
+            self.assertEqual(payload["voice"], "BH_1")
+            self.assertNotIn("reference", payload)
+            self.assertNotIn("temperature", payload)
+            self.assertTrue(output.is_file())
+            self.assertEqual(receipt["provider_request_id"], "provider-request-1")
+
     def test_schema_v2_migration_adds_vieneu_without_changing_default(self):
         current = voice_config.load_voice_config()
         legacy = copy.deepcopy(current)
@@ -50,74 +96,19 @@ class VieNeuVoiceRegistryTests(unittest.TestCase):
             item for item in migrated["providers"]
             if item["id"] == voice_config.VIENEU_PROVIDER_ID
         )
-        self.assertTrue(provider["capabilities"]["voice_clone"])
+        self.assertEqual(provider["type"], "local_api")
+        self.assertTrue(provider["capabilities"]["remote_voices"])
+        self.assertFalse(provider["capabilities"]["voice_clone"])
         self.assertFalse(provider["capabilities"]["parallel_jobs"])
 
-    def test_global_revision_snapshot_is_relative_and_immutable(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-            root = Path(temp_dir)
-            source = root / "source.wav"
-            _write_wav(source)
-            profiles = root / "profiles"
-            runtime = {
-                "available": True,
-                "detail": "ready",
-                "runtime_revision": "runtime-test",
-                "model_revision": {"backbone": "model-test"},
-                "lock_sha256": "b" * 64,
-            }
-            with (
-                patch.object(vieneu_voice_profiles, "VIENEU_TTS_VOICE_PROFILES_DIR", profiles),
-                patch.object(vieneu_voice_profiles.vieneu_tts, "runtime_status", return_value=runtime),
-            ):
-                vieneu_voice_profiles.create_revision(
-                    voice_id="test-voice",
-                    revision=1,
-                    source_path=source,
-                    start_seconds=0,
-                    end_seconds=4,
-                    transcript="Xin chào",
-                    name="Test voice",
-                )
-                fields = vieneu_voice_profiles.build_voice_snapshot_fields(
-                    voice_id="test-voice",
-                    revision=1,
-                )
-                voice_snapshot = {
-                    "voice_id": "test-voice",
-                    "voice_name": "Test voice",
-                    "provider_id": voice_config.VIENEU_PROVIDER_ID,
-                    "voice_revision": 1,
-                    **fields,
-                }
-                item_dir = root / "item"
-                snapshot = vieneu_voice_profiles.snapshot_revision(
-                    voice_snapshot=voice_snapshot,
-                    item_dir=item_dir,
-                )
-                copied = item_dir / snapshot["reference"]["path"]
-                self.assertTrue(copied.is_file())
-                copied_mtime = copied.stat().st_mtime_ns
-                repeated = vieneu_voice_profiles.snapshot_revision(
-                    voice_snapshot=voice_snapshot,
-                    item_dir=item_dir,
-                )
-                self.assertEqual(repeated["reference"]["sha256"], snapshot["reference"]["sha256"])
-                self.assertEqual(copied.stat().st_mtime_ns, copied_mtime)
-                self.assertNotIn(str(root), snapshot["reference"]["path"])
-                public = short_video_api._public_profile_snapshot(
-                    {"resolved_voice_profile": snapshot}
-                )
-                self.assertNotIn("path", public["resolved_voice_profile"]["reference"])
-                self.assertNotIn("runtime_lock_sha256", public["resolved_voice_profile"])
-
-    def test_request_hash_includes_reference_and_model_revision(self):
+    def test_request_hash_uses_remote_voice_revision_not_local_profile(self):
         base = {
             "voice_id": "test-voice",
             "voice_name": "Test voice",
             "provider_id": voice_config.VIENEU_PROVIDER_ID,
             "provider_voice_id": "test-voice",
             "voice_revision": 1,
+            "provider_voice_revision": 3,
             "config": {"sample_rate": 48000},
             "profile": {
                 "voice_id": "test-voice",
@@ -131,13 +122,19 @@ class VieNeuVoiceRegistryTests(unittest.TestCase):
         changed_reference["profile"]["reference_sha256"] = "b" * 64
         changed_model = copy.deepcopy(base)
         changed_model["model_revision"] = {"backbone": "model-b"}
-        self.assertNotEqual(
+        self.assertEqual(
             first,
             tts_registry.get_request_hash("Xin chào", "test-voice", changed_reference),
         )
-        self.assertNotEqual(
+        self.assertEqual(
             first,
             tts_registry.get_request_hash("Xin chào", "test-voice", changed_model),
+        )
+        changed_revision = copy.deepcopy(base)
+        changed_revision["provider_voice_revision"] = 4
+        self.assertNotEqual(
+            first,
+            tts_registry.get_request_hash("Xin chào", "test-voice", changed_revision),
         )
 
 
@@ -160,11 +157,10 @@ class VieNeuGenerationWorkerTests(unittest.TestCase):
         self.db_patch.stop()
         self.temp.cleanup()
 
-    def test_general_tts_chunks_are_bounded(self):
+    def test_general_tts_preserves_text_for_provider_owned_chunking(self):
         text = ("Một câu đủ dài để kiểm tra việc chia đoạn tự nhiên. " * 20).strip()
-        chunks = vieneu_tts_worker.split_text(text)
-        self.assertGreater(len(chunks), 1)
-        self.assertTrue(all(0 < len(chunk) <= 220 for chunk in chunks))
+        self.assertEqual(vieneu_tts_worker.validate_text(text), text)
+        self.assertIn("\n", vieneu_tts_worker.validate_text("Dòng một\nDòng hai"))
 
     def test_enqueue_is_idempotent_and_rejects_changed_payload(self):
         snapshot = {
