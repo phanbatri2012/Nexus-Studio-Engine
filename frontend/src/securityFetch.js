@@ -66,6 +66,7 @@ function buildProtectedRequest(input, init) {
     method,
     headers,
     credentials: 'include',
+    signal: init?.signal || (input instanceof Request ? input.signal : undefined),
   }
 
   if (body !== undefined && body !== null && method !== 'GET' && method !== 'HEAD') {

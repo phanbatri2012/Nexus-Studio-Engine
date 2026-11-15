@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from nexus_engine import main
-from nexus_engine.services import database, youtube_publisher
+from nexus_engine.services import chatgpt_worker, database, youtube_publisher
 from nexus_engine.services.metadata_validation import MetadataQualityGate
 from nexus_engine.services.script_quality import ScriptQualityGate
 
@@ -82,6 +82,65 @@ def test_script_gate_auto_fixes_narration_and_embedded_script_references():
     assert "narration_self_reference_rewritten" in {
         item["code"] for item in result["fixes"]
     }
+
+
+def test_script_gate_rewrites_inline_script_attributions_from_video_narration():
+    body = (
+        "Những khoản đóng góp ban đầu được nhắc đến trong kịch bản gồm tiền mặt và vàng. "
+        "Nếu quy đổi theo cách tính được sử dụng trong kịch bản gốc, giá trị này rất lớn. "
+        "Theo con số ước tính được nhắc đến trong kịch bản gốc, thiệt hại lên tới hàng triệu đồng. "
+        "Theo những ghi chép được nhắc đến trong kịch bản, người dân đã bảo vệ các hòm phiếu. "
+        "Theo nhận định của Võ Nguyên Giáp được dẫn lại trong kịch bản, cuộc bầu cử có ý nghĩa quyết định. "
+        "Theo những tài liệu được dẫn lại trong kịch bản, các tổ chức đối lập đã phản đối hiệp định. "
+        "Theo những nhận định được dẫn lại trong kịch bản, cục diện chính trị đã thay đổi căn bản."
+    )
+
+    result = ScriptQualityGate().run(_script(body))
+
+    assert result["decision"] == "pass"
+    assert result["can_approve"]
+    assert "trong kịch bản" not in result["cleaned_script"]
+    assert "cách tính tham khảo" in result["cleaned_script"]
+    assert "Theo nhận định của Võ Nguyên Giáp, cuộc bầu cử" in result["cleaned_script"]
+    assert "narration_self_reference_rewritten" in {
+        item["code"] for item in result["fixes"]
+    }
+
+
+def test_script_gate_keeps_legitimate_film_script_reference():
+    body = (
+        "Trong kịch bản phim lịch sử này, nhân vật người lính được xây dựng từ nhiều "
+        "nhân chứng có thật và đại diện cho một thế hệ đã hy sinh vì đất nước."
+    )
+
+    result = ScriptQualityGate().run(_script(body))
+
+    assert result["decision"] == "pass"
+    assert body in result["cleaned_script"]
+
+
+def test_script_gate_requires_review_for_excessive_source_expansion():
+    source = "Dữ kiện lịch sử quan trọng. " * 120
+    expanded_body = "Nội dung lịch sử được trình bày rõ ràng và đầy đủ. " * 130
+
+    result = ScriptQualityGate().run(
+        _script(expanded_body),
+        source_text=source,
+    )
+
+    assert result["decision"] == "review"
+    assert result["metrics"]["source_word_count"] >= 100
+    assert result["metrics"]["source_expansion_ratio"] > 2
+    assert "excessive_source_expansion" in {
+        item["code"] for item in result["review_required"]
+    }
+
+
+def test_narrative_prompt_forbids_editorial_self_references():
+    instruction = chatgpt_worker.NARRATIVE_ONLY_INSTRUCTION
+
+    assert "Không được nhắc tới kịch bản" in instruction
+    assert "ngôn ngữ meta" in instruction
 
 
 @pytest.mark.parametrize(
@@ -185,6 +244,41 @@ def test_unapproved_audio_review_is_not_reported_as_tts_failure(status):
     assert task is None
     assert error == ""
     ensure_audio_task.assert_not_called()
+
+
+def test_audio_review_job_center_deduplicates_messages_and_keeps_issue_details():
+    message = "Lời đọc đang tham chiếu đến kịch bản, prompt hoặc vị trí biên tập."
+    review = {
+        "video_id": 446,
+        "status": "pending",
+        "updated_at": "2026-11-14T16:57:46+00:00",
+        "report": {
+            "decision": "review",
+            "review_required": [
+                {
+                    "code": "narration_self_reference",
+                    "message": message,
+                    "section": "BODY",
+                    "paragraph_index": 3,
+                    "preview": "Đoạn thứ nhất",
+                },
+                {
+                    "code": "narration_self_reference",
+                    "message": message,
+                    "section": "BODY",
+                    "paragraph_index": 6,
+                    "preview": "Đoạn thứ hai",
+                },
+            ],
+        },
+    }
+
+    item = main._audio_review_job_center_item(review)
+
+    assert item["progress"].count(message) == 1
+    assert "2 vấn đề" in item["progress"]
+    assert item["error"] == ""
+    assert len(item["review_required"]) == 2
 
 
 

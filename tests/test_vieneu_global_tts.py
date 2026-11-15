@@ -159,6 +159,83 @@ class VieNeuVoiceRegistryTests(unittest.TestCase):
             tts_registry.get_request_hash("Xin chào", "test-voice", changed_revision),
         )
 
+    def test_remote_voice_listing_acquires_on_demand_runtime(self):
+        entered = []
+
+        class FakeLease:
+            def __enter__(self):
+                entered.append(True)
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        with (
+            patch.object(vieneu_tts, "api_voices", return_value=[{"id": "BH-3"}]),
+            patch.object(tts_registry.vieneu_runtime, "acquire", return_value=FakeLease()),
+        ):
+            remote = tts_registry.VieNeuProvider().list_remote_voices()
+
+        self.assertEqual(entered, [True])
+        self.assertEqual(remote["profiles"], [{"id": "BH-3"}])
+
+    def test_sync_vieneu_profiles_upserts_revision_without_overwriting_user_fields(self):
+        from nexus_engine import main
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            config_path = Path(temp_dir) / "voices.json"
+            with patch.object(voice_config, "VOICE_CONFIG_PATH", config_path):
+                config = voice_config.load_voice_config()
+                existing_voice = {
+                    "id": "local-bh-2",
+                    "name": "Tên tùy chỉnh",
+                    "provider_id": voice_config.VIENEU_PROVIDER_ID,
+                    "provider_voice_id": "BH-2",
+                    "status": "archived",
+                    "revision": 1,
+                    "active_revision": 1,
+                    "draft_revision": None,
+                    "config": {"gain_db": -1.0},
+                    "casting_profile": voice_config.normalize_casting_profile(
+                        {"gender": "male", "age_group": "senior"}
+                    ),
+                }
+                config["voices"].append(existing_voice)
+                voice_config.save_voice_config(config)
+
+                class FakeProvider:
+                    def list_remote_voices(self):
+                        return {
+                            "profiles": [
+                                {"id": "BH-2", "name": "Remote BH-2", "revision": 4},
+                                {"id": "BH-3", "name": "Remote BH-3", "revision": 1},
+                            ],
+                            "samples": [],
+                        }
+
+                with patch.object(main.tts, "get_provider", return_value=FakeProvider()):
+                    result = main.sync_vieneu_profiles()
+
+                saved = voice_config.load_voice_config()
+
+        by_remote_id = {
+            voice["provider_voice_id"]: voice
+            for voice in saved["voices"]
+            if voice["provider_id"] == voice_config.VIENEU_PROVIDER_ID
+        }
+        self.assertEqual(result["added"], 1)
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(by_remote_id["BH-2"]["name"], "Tên tùy chỉnh")
+        self.assertEqual(by_remote_id["BH-2"]["status"], "archived")
+        self.assertEqual(by_remote_id["BH-2"]["active_revision"], 4)
+        self.assertEqual(by_remote_id["BH-2"]["config"], {"gain_db": -1.0})
+        self.assertEqual(
+            by_remote_id["BH-2"]["casting_profile"]["age_group"], "senior"
+        )
+        self.assertEqual(by_remote_id["BH-3"]["name"], "Remote BH-3")
+        self.assertEqual(by_remote_id["BH-3"]["status"], "active")
+        self.assertEqual(by_remote_id["BH-3"]["active_revision"], 1)
+
 
 class VieNeuGenerationWorkerTests(unittest.TestCase):
     def setUp(self):

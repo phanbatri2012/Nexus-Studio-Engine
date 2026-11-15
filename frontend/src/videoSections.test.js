@@ -35,7 +35,7 @@ Giải thích: Nội dung giải thích.
 `)
 
   assert.deepEqual(result.map(section => section.title), [
-    'NỘI DUNG KỊCH BẢN',
+    'LỜI ĐỌC HOÀN CHỈNH (INTRO · BODY · OUTRO)',
     'TIÊU ĐỀ VIDEO',
     'URL SLUG',
     'MÔ TẢ, TAG & CHAPTERS',

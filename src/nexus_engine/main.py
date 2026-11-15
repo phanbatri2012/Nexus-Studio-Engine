@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, ConfigDict, Field
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 import asyncio
 import html
 import json
@@ -70,7 +70,11 @@ from nexus_engine.services.chatgpt_runtime import (
     ChatGPTPreSendTransientError,
 )
 from nexus_engine.services import chatgpt_runtime as shared_chatgpt_runtime
-from nexus_engine.services.chatgpt_worker import sanitize_generated_script
+from nexus_engine.services.chatgpt_worker import (
+    regenerate_body_from_transcript,
+    regenerate_narration_from_transcript,
+    sanitize_generated_script,
+)
 from nexus_engine.services import process_registry
 from nexus_engine.services.system_cleaner import cleaner as system_cleaner
 import nexus_engine.services.database as db
@@ -106,6 +110,7 @@ from nexus_engine.services import (
     muse_studio_service,
     short_video_api,
     short_video_worker,
+    script_body_regeneration,
     source_voice_analyzer,
     video_qc,
     video_production,
@@ -167,6 +172,9 @@ _tts_preview_cleanup_stop_event = threading.Event()
 _tts_preview_cleanup_thread: threading.Thread | None = None
 _system_cleanup_stop_event = threading.Event()
 _system_cleanup_thread: threading.Thread | None = None
+_system_cleanup_runs_lock = threading.Lock()
+_system_cleanup_runs: dict[str, dict[str, Any]] = {}
+SYSTEM_CLEANUP_RUN_HISTORY_LIMIT = 50
 _competitor_radar_stop_event = threading.Event()
 _competitor_radar_thread: threading.Thread | None = None
 _tts_preview_sync_locks: dict[str, threading.Lock] = {}
@@ -195,6 +203,10 @@ TTS_PREVIEW_RETENTION = datetime.timedelta(hours=24)
 TTS_PREVIEW_CLEANUP_INTERVAL_SECONDS = 60 * 60
 TTS_PREVIEW_NAMESPACE = uuid.UUID("daf4300a-039c-4a7f-a2d8-a574d2aa4f80")
 SYSTEM_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
+SYSTEM_CLEANUP_RETRY_INTERVAL_SECONDS = 60 * 60
+SYSTEM_CLEANUP_MAX_RETRIES = (
+    SYSTEM_CLEANUP_INTERVAL_SECONDS // SYSTEM_CLEANUP_RETRY_INTERVAL_SECONDS
+) - 1
 VIDEO_RECOVERY_DELAYS_SECONDS = (30, 120, 300)
 YOUTUBE_RECOVERY_DELAYS_SECONDS = (120, 300, 900)
 TRANSCRIPT_RECOVERY_DELAYS_SECONDS = (60, 300)
@@ -613,12 +625,17 @@ async def handle_request_validation_error(request: Request, exc: RequestValidati
 
 
 @app.exception_handler(Exception)
-async def handle_unexpected_error(_request: Request, exc: Exception):
+async def handle_unexpected_error(request: Request, exc: Exception):
     error_id = security_logging.report_exception("unhandled_api_error", exc)
-    return JSONResponse(
+    response = JSONResponse(
         {"detail": f"Lỗi nội bộ. Mã lỗi: {error_id}."},
         status_code=500,
     )
+    origin = request.headers.get("origin")
+    if origin in ["http://localhost:5173", "http://127.0.0.1:5173"]:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
 
 app.add_middleware(
     TrustedHostMiddleware,
@@ -832,6 +849,10 @@ class ApproveAudioReviewRequest(BaseModel):
     confirm_credit_charge: bool
     voice_id: Optional[str] = None
     cast_voice_overrides: Optional[dict] = None
+
+
+class ApplyScriptBodyRevisionRequest(BaseModel):
+    revision_id: int = Field(ge=1)
 
 
 class UpdateVideoJobRequest(BaseModel):
@@ -3340,6 +3361,7 @@ def _prepare_audio_review(video_id: int) -> dict:
     gate_result = ScriptQualityGate(sanitizer=sanitize_generated_script).run(
         script_text,
         auto_fix=True,
+        source_text=video.get("transcript", ""),
     )
     cleaned_script = gate_result.pop("cleaned_script")
     report = gate_result
@@ -3920,7 +3942,11 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
                 task_voice_id,
                 _voice_snapshot_from_record(stored_task),
             )
-            is_dialogue = is_dialogue_script(raw_script)
+            is_dialogue = (
+                is_dialogue_script(raw_script)
+                or is_dialogue_script(script_for_tts)
+                or str(prod_snapshot.get("content_mode") or "").strip().lower() == "dialogue"
+            )
 
             if is_dialogue:
                 prod_snapshot = {}
@@ -4322,19 +4348,32 @@ def _resolve_radar_auto_cast(
     )
     existing = db.list_video_cast_assignments(video_id)
     if existing:
-        auto_casting.validate_cast_policy(
-            existing,
-            available_voices,
-            mc_voice_id=mc_voice_id,
-            guest_voice_pool=guest_voice_pool,
-            manifest=manifest,
-        )
-        return {
-            str(item.get("role_key") or item.get("speaker_key") or ""): {
-                "voice_id": item["voice_id"]
+        try:
+            auto_casting.validate_cast_policy(
+                existing,
+                available_voices,
+                mc_voice_id=mc_voice_id,
+                guest_voice_pool=guest_voice_pool,
+                manifest=manifest,
+            )
+            return {
+                str(item.get("role_key") or item.get("speaker_key") or ""): {
+                    "voice_id": item["voice_id"]
+                }
+                for item in existing
             }
-            for item in existing
-        }
+        except auto_casting.AutoCastingAttentionRequired as exc:
+            has_approved_manual = any(
+                str(item.get("approval_status") or "") == "approved"
+                or str(item.get("source") or "") == "manual_override"
+                for item in existing
+            )
+            if not has_approved_manual and "đã cũ so với manifest hiện tại" in str(exc):
+                # An automatic cast had an older manifest hash from a preliminary step.
+                # Auto re-cast cleanly with the updated manifest rather than deadlocking.
+                pass
+            else:
+                raise
 
     source_profile: dict = {}
     unresolved_guests = [
@@ -4521,7 +4560,11 @@ def _ensure_audio_task(
         prod_snapshot = json.loads(video.get("production_snapshot_json") or "{}")
     except (TypeError, json.JSONDecodeError):
         pass
-    is_dialogue = is_dialogue_script(raw_script)
+    is_dialogue = (
+        is_dialogue_script(raw_script)
+        or is_dialogue_script(script_for_tts)
+        or str(prod_snapshot.get("content_mode") or "").strip().lower() == "dialogue"
+    )
     automation = prod_snapshot.get("automation") if isinstance(prod_snapshot, dict) else {}
     if isinstance(automation, dict) and automation.get("source") == "competitor_radar":
         required_usage = "multi_host" if is_dialogue else "single_narrator"
@@ -4746,8 +4789,11 @@ AUTOMATION_JOB_LABELS = {
     "competitor_scan": "Quét Radar đối thủ",
     "video_qc": "Kiểm tra chất lượng video",
 }
+SCRIPT_BODY_REGENERATION_JOB_TYPE = "script_body_regeneration"
+CHATGPT_VIDEO_JOB_TYPES = ("video_generation", SCRIPT_BODY_REGENERATION_JOB_TYPE)
 ALL_JOB_LABELS = {
     "video_generation": "Tạo video",
+    SCRIPT_BODY_REGENERATION_JOB_TYPE: "Tạo lại toàn bộ lời đọc",
     "short_video_generation": "Tạo Short Video",
     **COMMENT_JOB_LABELS,
     **FLOW_MEDIA_JOB_LABELS,
@@ -6083,6 +6129,7 @@ def resume_background_jobs() -> None:
     for task in db.get_active_audio_tasks():
         _start_audio_watcher(task["video_id"])
     db.recover_interrupted_system_jobs("video_generation")
+    db.recover_interrupted_system_jobs(SCRIPT_BODY_REGENERATION_JOB_TYPE)
     finalized_transcript_jobs = _finalize_exhausted_transcript_recoveries()
     if finalized_transcript_jobs:
         logger.info(
@@ -8783,16 +8830,7 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         recovery_result["reconcile_last_completed_count"] = current_completed
         recovery_result["reconcile_stagnant_count"] = stagnant_count
 
-        if stagnant_count == 10 and not is_image_phase and video_id:
-            logger.warning(
-                "Google Flow đối soát video kẹt 10 lần liên tiếp; tự động kích hoạt tạo Canvas mới cho video %s.",
-                video_id,
-            )
-            current_payload["force_new_flow_project"] = True
-            db.update_system_job(job["id"], payload_json=current_payload)
-            db.request_new_flow_project(video_id)
-
-        MAX_CONSECUTIVE_STAGNANT_RECONCILES = 15
+        MAX_CONSECUTIVE_STAGNANT_RECONCILES = 25
         if stagnant_count >= MAX_CONSECUTIVE_STAGNANT_RECONCILES:
             stalled_msg = (
                 f"Google Flow đã thử đối soát {stagnant_count} lần liên tiếp mà không có ảnh/video mới hoàn tất. "
@@ -10648,29 +10686,235 @@ def _trigger_video_render_if_enabled(video_id: int) -> dict | None:
     )
     return job
 
+
+def _execute_script_body_regeneration_job(job: dict) -> None:
+    job_id = str(job["id"])
+    payload = job.get("payload") or {}
+    revision_id = int(payload.get("revision_id") or 0)
+    video_id = int(job.get("video_id") or payload.get("video_id") or 0)
+
+    def cancel_check() -> None:
+        current_job = db.get_system_job(job_id)
+        if current_job and current_job.get("cancel_requested"):
+            raise VideoJobCanceled("Job đã được người dùng yêu cầu dừng.")
+
+    def progress_callback(progress: dict) -> None:
+        cancel_check()
+        body = str(progress.get("body") or "").strip()
+        narration = str(progress.get("narration") or "").strip()
+        completed_parts = int(progress.get("completed_parts") or 0)
+        part_count = max(1, int(progress.get("part_count") or 1))
+        stage = str(progress.get("stage") or "generating")
+        progress_report = {
+            "can_apply": False,
+            "errors": [],
+            "warnings": [],
+            "metrics": {
+                "completed_parts": completed_parts,
+                "part_count": part_count,
+            },
+            "progress": {
+                "stage": stage,
+                "completed_parts": completed_parts,
+                "part_count": part_count,
+            },
+        }
+        revision_changes: dict[str, Any] = {
+            "status": "generating",
+            "report_json": progress_report,
+        }
+        if body:
+            revision_changes.update(
+                candidate_body=body,
+                candidate_body_hash=script_body_regeneration.content_hash(body),
+            )
+        if narration:
+            revision_changes.update(
+                candidate_narration=narration,
+                candidate_narration_hash=script_body_regeneration.content_hash(narration),
+            )
+        if progress.get("chat_url"):
+            revision_changes["chat_url"] = str(progress["chat_url"])
+        db.update_script_body_revision(revision_id, **revision_changes)
+        stage_progress = {
+            "outline": "Đang tạo dàn ý BODY đã làm sạch",
+            "intro": "Đang viết INTRO mới",
+            "body": f"Đang viết BODY phần {min(completed_parts + 1, part_count)}/{part_count}",
+            "outro": "Đang viết OUTRO mới",
+            "complete": "Đang kiểm tra toàn bộ lời đọc",
+        }.get(stage, f"Đang viết kịch bản phần {min(completed_parts + 1, part_count)}/{part_count}")
+        db.update_system_job(
+            job_id,
+            progress=stage_progress,
+            result_json={
+                "revision_id": revision_id,
+                "completed_parts": completed_parts,
+                "part_count": part_count,
+            },
+        )
+
+    try:
+        if not revision_id or not video_id:
+            raise RuntimeError("Job tạo lại kịch bản thiếu revision hoặc video.")
+        revision = db.get_script_body_revision(revision_id)
+        video = db.get_video(video_id)
+        if not revision or int(revision.get("video_id") or 0) != video_id:
+            raise RuntimeError("Không tìm thấy revision kịch bản hợp lệ cho job.")
+        if not video:
+            raise RuntimeError("Video của revision không còn tồn tại.")
+        current_script = str(video.get("generated_script") or "")
+        if (
+            script_body_regeneration.content_hash(current_script)
+            != str(revision.get("base_script_hash") or "")
+        ):
+            db.update_script_body_revision(revision_id, status="stale")
+            raise RuntimeError(
+                "Kịch bản đã thay đổi sau khi tạo revision; không tiếp tục để tránh ghi đè."
+            )
+
+        db.update_script_body_revision(
+            revision_id,
+            status="generating",
+            report_json={
+                "can_apply": False,
+                "errors": [],
+                "warnings": [],
+                "metrics": {"completed_parts": 0},
+            },
+        )
+        if str(revision.get("scope") or "body") == "narration":
+            result = regenerate_narration_from_transcript(
+                str(video.get("transcript") or ""),
+                str(video.get("prompt_version") or job.get("prompt_version") or ""),
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+        else:
+            result = regenerate_body_from_transcript(
+                str(video.get("transcript") or ""),
+                str(video.get("prompt_version") or job.get("prompt_version") or ""),
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+        cancel_check()
+        report = dict(result.get("report") or {})
+        candidate_body = str(result.get("body") or "").strip()
+        candidate_narration = str(result.get("narration") or "").strip()
+        revision_status = "draft" if report.get("can_apply") else "needs_review"
+        revision_changes: dict[str, Any] = {
+            "status": revision_status,
+            "report_json": report,
+            "chat_url": str(result.get("chat_url") or ""),
+        }
+        if str(revision.get("scope") or "body") == "narration":
+            revision_changes.update(
+                candidate_narration=candidate_narration,
+                candidate_narration_hash=script_body_regeneration.content_hash(
+                    candidate_narration
+                ),
+            )
+        else:
+            revision_changes.update(
+                candidate_body=candidate_body,
+                candidate_body_hash=script_body_regeneration.content_hash(candidate_body),
+            )
+        updated_revision = db.update_script_body_revision(revision_id, **revision_changes)
+        db.update_system_job(
+            job_id,
+            status="done",
+            progress=(
+                "Đã tạo lời đọc INTRO–BODY–OUTRO; đang chờ xem trước và áp dụng"
+                if revision_status == "draft"
+                else "Lời đọc mới chưa vượt qua quality gate"
+            ),
+            result_json={
+                "revision_id": revision_id,
+                "revision_status": revision_status,
+                "report": report,
+                "part_count": int(result.get("part_count") or 0),
+            },
+            error="",
+            cancel_requested=0,
+            finished_at=db.utc_now(),
+        )
+        if not updated_revision:
+            raise RuntimeError("Không thể lưu revision kịch bản sau khi tạo.")
+    except VideoJobCanceled as exc:
+        if revision_id:
+            db.update_script_body_revision(revision_id, status="canceled")
+        db.update_system_job(
+            job_id,
+            status="canceled",
+            progress="Đã dừng tại điểm an toàn",
+            error=security_logging.redact_sensitive(exc),
+            cancel_requested=0,
+            finished_at=db.utc_now(),
+        )
+    except Exception as exc:
+        safe_error = security_logging.redact_sensitive(exc) or "Tạo lại kịch bản thất bại."
+        if isinstance(exc, ChatGPTAttentionRequiredError):
+            scheduled = _schedule_automatic_chatgpt_login(job_id, exc)
+            if revision_id:
+                db.update_script_body_revision(revision_id, status="queued")
+            db.update_system_job(
+                job_id,
+                status="paused",
+                progress=(
+                    "Cần xác minh phiên ChatGPT — đang chạy Auto Login"
+                    if scheduled
+                    else "Cần xác minh phiên ChatGPT trước khi tiếp tục"
+                ),
+                result_json={
+                    "revision_id": revision_id,
+                    "attention_required": "chatgpt_verification",
+                    "automatic_login": "pending" if scheduled else "",
+                },
+                error=safe_error,
+                cancel_requested=0,
+                finished_at="",
+            )
+        else:
+            if revision_id:
+                db.update_script_body_revision(revision_id, status="error")
+            db.update_system_job(
+                job_id,
+                status="error",
+                progress="Tạo lại kịch bản thất bại",
+                error=safe_error,
+                cancel_requested=0,
+                finished_at=db.utc_now(),
+            )
+    finally:
+        _finish_chatgpt_operation()
+
+
 def _drain_video_queue() -> None:
     global _video_queue_worker_active
     blocked_by_chatgpt = False
     try:
         while True:
-            job = db.claim_next_system_job("video_generation")
+            job = db.claim_next_system_job_types(CHATGPT_VIDEO_JOB_TYPES)
             if not job:
                 return
-            _sync_legacy_job(job)
-            _sync_competitor_dispatch_from_video_job(job)
+            job_type = str(job.get("job_type") or "")
+            if job_type == "video_generation":
+                _sync_legacy_job(job)
+                _sync_competitor_dispatch_from_video_job(job)
             if not _try_start_chatgpt_operation(
                 "video",
                 job.get("prompt_version", ""),
                 job.get("video_id"),
             ):
                 blocked_by_chatgpt = True
-                _update_video_job(
-                    job["id"],
-                    status="queued",
-                    progress="Đang chờ tác vụ ChatGPT hiện tại hoàn tất",
+                update_job = _update_video_job if job_type == "video_generation" else db.update_system_job
+                update_job(
+                    job["id"], status="queued", progress="Đang chờ tác vụ ChatGPT hiện tại hoàn tất"
                 )
                 return
-            _execute_video_job(job)
+            if job_type == SCRIPT_BODY_REGENERATION_JOB_TYPE:
+                _execute_script_body_regeneration_job(job)
+            else:
+                _execute_video_job(job)
             current_job = db.get_system_job(job["id"])
             if current_job and current_job["status"] in {"retry_wait", "paused"}:
                 return
@@ -10681,7 +10925,7 @@ def _drain_video_queue() -> None:
             not blocked_by_chatgpt
             and not shared_chatgpt_runtime.is_busy()
         ):
-            if db.has_claimable_system_jobs("video_generation"):
+            if any(db.has_claimable_system_jobs(item) for item in CHATGPT_VIDEO_JOB_TYPES):
                 _kick_video_queue()
             else:
                 _schedule_video_queue_wakeup()
@@ -10690,7 +10934,12 @@ def _drain_video_queue() -> None:
 def _schedule_video_queue_wakeup(delay_seconds: float | None = None) -> None:
     global _video_queue_wakeup_at, _video_queue_wakeup_timer
     if delay_seconds is None:
-        delay_seconds = db.get_next_system_job_retry_delay("video_generation")
+        delays = [
+            db.get_next_system_job_retry_delay(item)
+            for item in CHATGPT_VIDEO_JOB_TYPES
+        ]
+        available_delays = [item for item in delays if item is not None]
+        delay_seconds = min(available_delays) if available_delays else None
     if delay_seconds is None:
         return
 
@@ -10729,7 +10978,7 @@ def _kick_video_queue() -> None:
     with _video_queue_state_lock:
         if _video_queue_worker_active:
             return
-        if not db.has_claimable_system_jobs("video_generation"):
+        if not any(db.has_claimable_system_jobs(item) for item in CHATGPT_VIDEO_JOB_TYPES):
             should_schedule_wakeup = True
         else:
             if _video_queue_wakeup_timer is not None:
@@ -11533,11 +11782,11 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         "can_force_stop": (
             status == "running"
             or bool(job.get("cancel_requested"))
-            or (job_type in {"video_generation", "flow_media_generation", "muse_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish"} and status in {"running", "retry_wait"})
+            or (job_type in {"video_generation", SCRIPT_BODY_REGENERATION_JOB_TYPE, "flow_media_generation", "muse_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish"} and status in {"running", "retry_wait"})
         ),
         "can_cancel": (
             status in {"queued", "retry_wait", "paused"}
-            or (job_type in {"video_generation", "short_video_generation", "flow_media_generation", "muse_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
+            or (job_type in {"video_generation", SCRIPT_BODY_REGENERATION_JOB_TYPE, "short_video_generation", "flow_media_generation", "muse_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
         ),
         "can_retry": (
             pinned_comment_attention
@@ -11771,14 +12020,20 @@ def _audio_review_job_center_item(review: dict) -> dict:
     }
     status = review.get("status", "blocked")
     report = review.get("report") or {}
-    review_issues = [
-        item.get("message", "")
+    review_required = [
+        item
         for item in report.get("review_required", [])
-        if item.get("message")
+        if isinstance(item, dict) and item.get("message")
     ]
+    review_messages = list(
+        dict.fromkeys(str(item["message"]) for item in review_required)
+    )
     if status == "pending":
-        if review_issues:
-            progress = f"Cần duyệt thủ công: {'; '.join(review_issues)}"
+        if review_required:
+            progress = (
+                f"Cần duyệt thủ công ({len(review_required)} vấn đề): "
+                + "; ".join(review_messages)
+            )
         elif report.get("decision") == "review":
             progress = "Kịch bản có điểm nghi vấn cần duyệt thủ công; chưa gửi Genmax"
         else:
@@ -11797,8 +12052,6 @@ def _audio_review_job_center_item(review: dict) -> dict:
             for item in report.get("errors", [])
             if item.get("message")
         )
-    elif status == "pending" and review_issues:
-        error_message = "; ".join(review_issues)
 
     return {
         "id": f"audio-review:{review['video_id']}",
@@ -11812,6 +12065,7 @@ def _audio_review_job_center_item(review: dict) -> dict:
         "video_url": review.get("video_url", ""),
         "progress": progress,
         "error": error_message,
+        "review_required": review_required,
         "video_id": review["video_id"],
         "created_at": review.get("updated_at", ""),
         "updated_at": review.get("updated_at", ""),
@@ -11971,6 +12225,7 @@ def _job_matches_video_search(item: dict, query: str) -> bool:
 JOB_CENTER_ACTIONS = ("retry", "pause", "resume", "cancel", "force_stop", "fallback_static", "retry_new_flow_project")
 JOB_CENTER_SYSTEM_JOB_TYPES = (
     "video_generation",
+    SCRIPT_BODY_REGENERATION_JOB_TYPE,
     "short_video_generation",
     *COMMENT_JOB_TYPES,
     *FLOW_MEDIA_JOB_TYPES,
@@ -12309,7 +12564,7 @@ class JobCenterActionNotAllowedError(ValueError):
 
 
 def _kick_job_queues(job_types: set[str]) -> None:
-    if "video_generation" in job_types:
+    if any(item in job_types for item in CHATGPT_VIDEO_JOB_TYPES):
         _kick_video_queue()
     if "short_video_generation" in job_types:
         short_video_worker.kick()
@@ -12512,6 +12767,8 @@ def _run_system_job_center_action(
                         art_id = art.get("id")
                         if art_id:
                             db.delete_video_artifact(art_id)
+                from nexus_engine.services import video_production
+                video_production.purge_intro_video_artifacts(vid_id, keep_successful=True)
                 db.request_new_flow_project(vid_id)
 
             db.update_system_job(
@@ -12567,6 +12824,13 @@ def _run_system_job_center_action(
                     current_stage=str(updated_job.get("resume_from_step") or "queued"),
                     error="",
                 )
+    if str(job.get("job_type") or "") == SCRIPT_BODY_REGENERATION_JOB_TYPE:
+        revision_id = int((job.get("payload") or {}).get("revision_id") or 0)
+        if revision_id:
+            revision_status = (
+                "canceled" if action in {"cancel", "force_stop"} else "queued"
+            )
+            db.update_script_body_revision(revision_id, status=revision_status)
     if str(job.get("job_type")) in {"youtube_upload", "youtube_publish"}:
         workflow = db.get_youtube_publish_workflow_by_job(job_id)
         if workflow:
@@ -13677,6 +13941,232 @@ def remove_thumbnail_endpoint(video_id: int, req: RemoveThumbnailRequest):
         raise HTTPException(status_code=404, detail="Không tìm thấy ảnh để xóa trong kịch bản.")
 
 
+def _script_body_revision_response(revision: dict | None, current_script: str = "") -> dict | None:
+    if not revision:
+        return None
+    report = dict(revision.get("report") or {})
+    job = db.get_system_job(str(revision.get("job_id") or ""))
+    base_is_current = bool(current_script) and (
+        script_body_regeneration.content_hash(current_script)
+        == str(revision.get("base_script_hash") or "")
+    )
+    status = str(revision.get("status") or "")
+    return {
+        "id": int(revision["id"]),
+        "video_id": int(revision["video_id"]),
+        "job_id": str(revision.get("job_id") or ""),
+        "scope": str(revision.get("scope") or "body"),
+        "status": status,
+        "original_body": str(revision.get("original_body") or ""),
+        "candidate_body": str(revision.get("candidate_body") or ""),
+        "candidate_body_hash": str(revision.get("candidate_body_hash") or ""),
+        "original_narration": str(revision.get("original_narration") or ""),
+        "candidate_narration": str(revision.get("candidate_narration") or ""),
+        "candidate_narration_hash": str(
+            revision.get("candidate_narration_hash") or ""
+        ),
+        "report": report,
+        "chat_url": str(revision.get("chat_url") or ""),
+        "prompt_version": str(revision.get("prompt_version") or ""),
+        "created_at": str(revision.get("created_at") or ""),
+        "updated_at": str(revision.get("updated_at") or ""),
+        "applied_at": str(revision.get("applied_at") or ""),
+        "base_is_current": base_is_current,
+        "can_apply": bool(
+            status == "draft"
+            and report.get("can_apply")
+            and base_is_current
+        ),
+        "job_status": str((job or {}).get("status") or ""),
+        "job_progress": str((job or {}).get("progress") or ""),
+        "job_error": security_logging.redact_sensitive(str((job or {}).get("error") or "")),
+    }
+
+
+def _assert_body_revision_audio_safe(video_id: int) -> None:
+    task = db.get_audio_task(video_id)
+    if not task:
+        return
+    status = str(task.get("status") or "").strip().lower()
+    if status not in {"failed", "error", "canceled", "cancelled"}:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Video đã có audio hoặc audio đang được tạo. Hãy giữ nguyên kịch bản, "
+                "hoặc xử lý/xóa audio cũ trước khi áp dụng lời đọc mới."
+            ),
+        )
+
+
+@app.get("/api/videos/{video_id}/body-revision")
+def get_script_body_revision_endpoint(video_id: int):
+    video = _require_actionable_video(video_id)
+    revision = db.get_latest_script_body_revision(video_id)
+    return {
+        "success": True,
+        "revision": _script_body_revision_response(
+            revision,
+            str(video.get("generated_script") or ""),
+        ),
+    }
+
+
+@app.post("/api/videos/{video_id}/body-revision/regenerate")
+def regenerate_script_body_endpoint(video_id: int):
+    video = _require_actionable_video(video_id)
+    transcript = str(video.get("transcript") or "").strip()
+    script = str(video.get("generated_script") or "")
+    original_intro = script_body_regeneration.section_text(script, "INTRO")
+    original_body = script_body_regeneration.section_text(script, "BODY")
+    original_outro = script_body_regeneration.section_text(script, "OUTRO")
+    if not transcript:
+        raise HTTPException(status_code=400, detail="Video không có transcript để tạo lại kịch bản.")
+    missing_sections = [
+        tag
+        for tag, value in (
+            ("INTRO", original_intro),
+            ("BODY", original_body),
+            ("OUTRO", original_outro),
+        )
+        if not value
+    ]
+    if missing_sections:
+        raise HTTPException(
+            status_code=400,
+            detail="Kịch bản thiếu section hợp lệ: " + ", ".join(missing_sections),
+        )
+    original_narration = script_body_regeneration.build_narration_sections(
+        intro=original_intro,
+        body=original_body,
+        outro=original_outro,
+    )
+
+    job_id = str(uuid.uuid4())
+    revision = db.create_script_body_revision(
+        video_id=video_id,
+        job_id=job_id,
+        base_script_hash=script_body_regeneration.content_hash(script),
+        original_body=original_body,
+        prompt_version=str(video.get("prompt_version") or ""),
+        scope="narration",
+        original_narration=original_narration,
+    )
+    try:
+        job, created = db.create_system_job_if_absent(
+            job_id=job_id,
+            job_type=SCRIPT_BODY_REGENERATION_JOB_TYPE,
+            title=f"Tạo lại toàn bộ lời đọc cho video #{video_id}",
+            payload={"video_id": video_id, "revision_id": int(revision["id"])},
+            video_id=video_id,
+            prompt_version=str(video.get("prompt_version") or ""),
+            dedupe_job_types=(SCRIPT_BODY_REGENERATION_JOB_TYPE,),
+        )
+    except Exception:
+        db.update_script_body_revision(int(revision["id"]), status="error")
+        raise
+    if not created:
+        db.delete_script_body_revision(int(revision["id"]))
+        existing_revision = db.get_script_body_revision_by_job_id(str(job["id"]))
+        return {
+            "success": True,
+            "created": False,
+            "job": job,
+            "revision": _script_body_revision_response(existing_revision, script),
+        }
+
+    _kick_video_queue()
+    return {
+        "success": True,
+        "created": True,
+        "job": job,
+        "revision": _script_body_revision_response(revision, script),
+    }
+
+
+@app.post("/api/videos/{video_id}/body-revision/apply")
+def apply_script_body_revision_endpoint(
+    video_id: int,
+    request: ApplyScriptBodyRevisionRequest,
+):
+    video = _require_actionable_video(video_id)
+    revision = db.get_script_body_revision(request.revision_id)
+    if not revision or int(revision.get("video_id") or 0) != video_id:
+        raise HTTPException(status_code=404, detail="Không tìm thấy revision kịch bản của video.")
+    report = dict(revision.get("report") or {})
+    if revision.get("status") != "draft" or not report.get("can_apply"):
+        raise HTTPException(
+            status_code=409,
+            detail="Revision kịch bản chưa vượt qua audit nên chưa thể áp dụng.",
+        )
+    scope = str(revision.get("scope") or "body")
+    if scope == "narration":
+        candidate_content = str(revision.get("candidate_narration") or "").strip()
+        expected_candidate_hash = str(
+            revision.get("candidate_narration_hash") or ""
+        )
+    else:
+        candidate_content = str(revision.get("candidate_body") or "").strip()
+        expected_candidate_hash = str(revision.get("candidate_body_hash") or "")
+    if (
+        not candidate_content
+        or script_body_regeneration.content_hash(candidate_content)
+        != expected_candidate_hash
+    ):
+        raise HTTPException(status_code=409, detail="Nội dung revision không còn toàn vẹn.")
+    current_script = str(video.get("generated_script") or "")
+    if (
+        script_body_regeneration.content_hash(current_script)
+        != str(revision.get("base_script_hash") or "")
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Kịch bản đã thay đổi sau khi tạo revision; hãy tạo lại preview mới.",
+        )
+    _assert_body_revision_audio_safe(video_id)
+    try:
+        if scope == "narration":
+            new_script = script_body_regeneration.replace_narration_sections(
+                current_script,
+                candidate_content,
+            )
+        else:
+            new_script = script_body_regeneration.replace_script_section(
+                current_script,
+                "BODY",
+                candidate_content,
+            )
+        applied = db.apply_script_body_revision(
+            request.revision_id,
+            expected_script=current_script,
+            new_script=new_script,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if applied and applied.get("job_id"):
+        applied_job = db.get_system_job(str(applied["job_id"]))
+        applied_result = dict((applied_job or {}).get("result") or {})
+        applied_result["revision_status"] = "applied"
+        db.update_system_job(
+            str(applied["job_id"]),
+            status="done",
+            progress=(
+                "INTRO–BODY–OUTRO mới đã được áp dụng vào video"
+                if scope == "narration"
+                else "BODY mới đã được áp dụng vào video"
+            ),
+            result_json=applied_result,
+            error="",
+            finished_at=(applied_job or {}).get("finished_at") or db.utc_now(),
+        )
+    review = _prepare_audio_review(video_id)
+    return {
+        "success": True,
+        "script": new_script,
+        "revision": _script_body_revision_response(applied, new_script),
+        "audio_review": _audio_review_response(review),
+    }
+
+
 @app.get("/api/videos/{video_id}/audio-review")
 def get_audio_review(video_id: int):
     _require_actionable_video(video_id)
@@ -13977,7 +14467,11 @@ def regenerate_audio_for_video(
             detail="Không tìm thấy kịch bản để tạo lại audio.",
         )
 
-    is_dialogue = is_dialogue_script(raw_script)
+    is_dialogue = (
+        is_dialogue_script(raw_script)
+        or is_dialogue_script(script_for_tts)
+        or str(prod_snapshot.get("content_mode") or "").strip().lower() == "dialogue"
+    )
     if is_dialogue:
         prod_snapshot = {}
         try:
@@ -14326,7 +14820,11 @@ def retry_audio_for_video(video_id: int, request: RetryAudioRequest):
 
         raw_script = video.get("generated_script", "")
         script_for_tts = get_clean_script_for_tts(raw_script)
-        is_dialogue = is_dialogue_script(raw_script)
+        is_dialogue = (
+            is_dialogue_script(raw_script)
+            or is_dialogue_script(script_for_tts)
+            or str(prod_snapshot.get("content_mode") or "").strip().lower() == "dialogue"
+        )
         if is_dialogue:
             prod_snapshot = {}
             try:
@@ -14533,21 +15031,60 @@ def retry_new_flow_canvas_for_video(video_id: int):
     video = db.get_video(video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Không tìm thấy video.")
-    jobs = db.list_system_jobs(video_id=video_id, limit=5)
-    flow_job = next((j for j in jobs if j.get("job_type") == "flow_media_generation"), None)
-    if flow_job:
-        _run_system_job_center_action(flow_job["id"], "retry_new_flow_project", kick_queues=True)
-        return {"success": True, "job_id": flow_job["id"], "message": "Đã yêu cầu Canvas Flow mới và kích hoạt lại hàng đợi."}
+    if video.get("video_status") == db.VIDEO_STATUS_ERROR:
+        raise HTTPException(status_code=400, detail="Video đang ở trạng thái lỗi.")
+
+    # Check for active conflicting jobs
+    jobs = db.list_system_jobs(video_id=video_id, limit=None)
+    active_jobs = [
+        j for j in jobs
+        if j.get("job_type") in {"flow_media_generation", "muse_media_generation", "video_render"}
+        and j.get("status") in {"queued", "running", "retry_wait"}
+    ]
+    if active_jobs:
+        raise HTTPException(
+            status_code=409,
+            detail="Đang có tiến trình tạo media hoặc dựng video đang chạy; vui lòng hủy trước khi đổi Canvas.",
+        )
+
+    # Cancel any paused media generation jobs to avoid duplicate queue conflict
+    for j in jobs:
+        if j.get("job_type") in {"flow_media_generation", "muse_media_generation"} and j.get("status") == "paused":
+            db.update_system_job(j["id"], status="canceled", error="Đã hủy để tạo Canvas mới theo yêu cầu của người dùng.")
+
+    # 1. Purge failed intro video artifacts (keeping successful ones) and manifest
+    from nexus_engine.services import video_production
+    purged_count = video_production.purge_intro_video_artifacts(video_id, keep_successful=True)
+
+    # 2. Persist reset request for Google Flow project
+    db.request_new_flow_project(video_id)
+
+    # 3. Enqueue flow media generation job in resume mode with force_new_flow_project=True
     prompt_version = video.get("prompt_version") or ""
     snapshot = _get_prompt_production_snapshot(prompt_version)
-    db.request_new_flow_project(video_id)
-    job, _ = _enqueue_flow_media_job(
+    job, created = _enqueue_flow_media_job(
         video_id=video_id,
         snapshot=snapshot,
         mode="resume",
         force_new_flow_project=True,
     )
-    return {"success": True, "job_id": job["id"], "message": "Đã tạo Canvas Flow mới và khởi chạy lại."}
+
+    db.update_video_production_state(
+        video_id,
+        render_status="queued",
+        current_stage="flow_media_generation",
+        production_progress="Đang tạo Canvas Google Flow mới để sinh lại video intro...",
+        blocking_reason="",
+    )
+    _kick_job_queues({"flow_media_generation"})
+
+    return {
+        "success": True,
+        "video_id": video_id,
+        "job_id": job["id"],
+        "purged_count": purged_count,
+        "message": "Đã tạo Canvas Google Flow mới và khởi chạy lại tạo media intro.",
+    }
 
 
 @app.post("/api/videos/{video_id}/regenerate-intro-videos")
@@ -15974,26 +16511,74 @@ def _tts_preview_cleanup_scheduler() -> None:
             )
 
 
+def _run_scheduled_system_cleanup_attempt() -> bool:
+    """Run one guarded cleanup attempt and report whether it completed."""
+    try:
+        cleanup_status = maintenance_guard.get_cleanup_status()
+    except Exception as exc:
+        logger.error(
+            "Scheduled cleanup safety probe failed: %s",
+            security_logging.redact_sensitive(exc),
+        )
+        return False
+
+    if not cleanup_status.get("safe_to_cleanup"):
+        logger.info(
+            "Scheduled cleanup deferred: blockers=%s verification_errors=%s",
+            cleanup_status.get("total_blocking_jobs", 0),
+            len(cleanup_status.get("verification_errors") or []),
+        )
+        return False
+
+    try:
+        summary = system_cleaner.run_full_cleanup(dry_run=False, vacuum_db=True)
+    except Exception as exc:
+        logger.error(
+            "System auto cleanup failed: %s",
+            security_logging.redact_sensitive(exc),
+        )
+        return False
+
+    if summary.blocked:
+        logger.info(
+            "Scheduled cleanup became blocked during its final safety check: "
+            "blockers=%s verification_errors=%s",
+            len(summary.blockers),
+            len(summary.verification_errors),
+        )
+        return False
+
+    logger.info(
+        "Scheduled cleanup completed: files_removed=%s bytes_freed=%s",
+        summary.total_files_removed,
+        summary.total_bytes_freed,
+    )
+    return True
+
+
 def _system_cleanup_scheduler() -> None:
     while not _system_cleanup_stop_event.wait(
         SYSTEM_CLEANUP_INTERVAL_SECONDS
     ):
-        try:
-            cleanup_status = maintenance_guard.get_cleanup_status()
-            if cleanup_status.get("safe_to_cleanup"):
-                system_cleaner.run_full_cleanup(dry_run=False, vacuum_db=True)
-            else:
-                logger.info(
-                    "Scheduled cleanup skipped: blockers=%s verification_errors=%s",
-                    cleanup_status.get("total_blocking_jobs", 0),
-                    len(cleanup_status.get("verification_errors") or []),
+        for retry_index in range(SYSTEM_CLEANUP_MAX_RETRIES + 1):
+            if _run_scheduled_system_cleanup_attempt():
+                break
+            if retry_index >= SYSTEM_CLEANUP_MAX_RETRIES:
+                logger.warning(
+                    "Scheduled cleanup remained pending for one retry window; "
+                    "the next 24-hour cycle will try again."
                 )
-        except Exception as exc:
-            print(
-                "System auto cleanup failed: "
-                f"{security_logging.redact_sensitive(exc)}",
-                file=sys.stderr,
+                break
+            logger.info(
+                "Scheduled cleanup will retry in %s seconds (%s/%s).",
+                SYSTEM_CLEANUP_RETRY_INTERVAL_SECONDS,
+                retry_index + 1,
+                SYSTEM_CLEANUP_MAX_RETRIES,
             )
+            if _system_cleanup_stop_event.wait(
+                SYSTEM_CLEANUP_RETRY_INTERVAL_SECONDS
+            ):
+                return
 
 
 def _get_unexpired_tts_preview(preview_id: str) -> dict:
@@ -16263,6 +16848,103 @@ def sync_omnivoice_profiles():
         "profiles": remote.get("profiles", []),
         "samples": remote.get("samples", []),
         "voices": [voice for voice in saved["voices"] if voice["id"] in added],
+    }
+
+
+@app.post("/api/tts/providers/vieneu_v3_turbo/sync")
+def sync_vieneu_profiles():
+    try:
+        remote = tts.get_provider(
+            voice_config.VIENEU_PROVIDER_ID
+        ).list_remote_voices()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail=security_logging.redact_sensitive(exc)
+        ) from exc
+    profiles = remote.get("profiles")
+    if not isinstance(profiles, list):
+        raise HTTPException(
+            status_code=502,
+            detail="VieNeu API trả danh sách giọng không hợp lệ.",
+        )
+
+    with _tts_config_lock:
+        config = voice_config.load_voice_config()
+        existing = {
+            voice["provider_voice_id"].casefold(): voice
+            for voice in config["voices"]
+            if voice["provider_id"] == voice_config.VIENEU_PROVIDER_ID
+        }
+        added: list[str] = []
+        updated: list[str] = []
+        unchanged = 0
+        seen_remote_ids: set[str] = set()
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            remote_id = str(profile.get("id") or "").strip()
+            if not remote_id:
+                continue
+            remote_key = remote_id.casefold()
+            if remote_key in seen_remote_ids:
+                continue
+            seen_remote_ids.add(remote_key)
+            try:
+                remote_revision = int(profile.get("revision") or 1)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Revision của giọng VieNeu '{remote_id}' không hợp lệ.",
+                ) from exc
+            if remote_revision < 1:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Revision của giọng VieNeu '{remote_id}' không hợp lệ.",
+                )
+
+            voice = existing.get(remote_key)
+            if voice is None:
+                voice = {
+                    "id": str(uuid.uuid4()),
+                    "name": str(profile.get("name") or remote_id).strip() or remote_id,
+                    "provider_id": voice_config.VIENEU_PROVIDER_ID,
+                    "provider_voice_id": remote_id,
+                    "status": "active",
+                    "revision": remote_revision,
+                    "active_revision": remote_revision,
+                    "draft_revision": None,
+                    "config": {},
+                    "casting_profile": voice_config.normalize_casting_profile({}),
+                }
+                config["voices"].append(voice)
+                existing[remote_key] = voice
+                added.append(voice["id"])
+                continue
+
+            changed = int(voice.get("revision") or 1) != remote_revision
+            voice["revision"] = remote_revision
+            if voice.get("status") == "draft":
+                changed = changed or int(voice.get("draft_revision") or 1) != remote_revision
+                voice["draft_revision"] = remote_revision
+            else:
+                changed = changed or int(voice.get("active_revision") or 1) != remote_revision
+                voice["active_revision"] = remote_revision
+            if changed:
+                updated.append(voice["id"])
+            else:
+                unchanged += 1
+
+        saved = _save_tts_config(config)
+    synced_ids = set(added + updated)
+    return {
+        "success": True,
+        "added": len(added),
+        "updated": len(updated),
+        "unchanged": unchanged,
+        "profiles": profiles,
+        "voices": [
+            voice for voice in saved["voices"] if voice["id"] in synced_ids
+        ],
     }
 
 
@@ -17962,17 +18644,103 @@ def delete_crossposter_campaign(
 # =========================================================================
 # System Cleanup & Space Management Endpoints
 # =========================================================================
+def _public_cleanup_blockers(items: Any) -> list[dict[str, str]]:
+    blockers: list[dict[str, str]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        blocker = {
+            "type": str(item.get("type") or ""),
+            "id": str(item.get("id") or ""),
+            "status": str(item.get("status") or ""),
+        }
+        job_type = str(item.get("job_type") or "")
+        if job_type:
+            blocker["job_type"] = job_type
+        blockers.append(blocker)
+    return blockers
+
+
+def _public_cleanup_status(status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "safe_to_cleanup": bool(status.get("safe_to_cleanup")),
+        "status_verified": bool(status.get("status_verified")),
+        "total_blocking_jobs": int(status.get("total_blocking_jobs") or 0),
+        "blocking_jobs": _public_cleanup_blockers(status.get("blocking_jobs")),
+        "verification_errors": [
+            str(item) for item in (status.get("verification_errors") or [])
+        ],
+        "reasons": [str(item) for item in (status.get("reasons") or [])],
+    }
+
+
+def _cleanup_storage_snapshot() -> dict[str, int]:
+    usage = shutil.disk_usage(system_cleaner.data_dir)
+    return {
+        "total_bytes": int(usage.total),
+        "used_bytes": int(usage.used),
+        "free_bytes": int(usage.free),
+    }
+
+
+def _public_cleanup_summary(summary: Any) -> dict[str, Any]:
+    payload = summary.to_dict()
+    payload["blockers"] = _public_cleanup_blockers(payload.get("blockers"))
+    payload.pop("manifest_path", None)
+    policy = dict(payload.get("policy") or {})
+    policy.pop("cleanup_scope_root", None)
+    payload["policy"] = policy
+    return payload
+
+
+def _update_system_cleanup_run(manifest_id: str, **changes: Any) -> dict[str, Any]:
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with _system_cleanup_runs_lock:
+        record = dict(_system_cleanup_runs.get(manifest_id) or {})
+        if not record:
+            record = {"manifest_id": manifest_id, "created_at": now}
+        record.update(changes)
+        record["updated_at"] = now
+        _system_cleanup_runs[manifest_id] = record
+        while len(_system_cleanup_runs) > SYSTEM_CLEANUP_RUN_HISTORY_LIMIT:
+            oldest_id = next(iter(_system_cleanup_runs))
+            _system_cleanup_runs.pop(oldest_id, None)
+        return dict(record)
+
+
+def _get_system_cleanup_run(manifest_id: str) -> dict[str, Any] | None:
+    with _system_cleanup_runs_lock:
+        record = _system_cleanup_runs.get(manifest_id)
+        return dict(record) if record else None
+
+
+@app.get("/api/system/cleanup/status")
+async def get_system_cleanup_status_endpoint():
+    """Return a non-destructive cleanup readiness snapshot."""
+    cleanup_status = await asyncio.to_thread(maintenance_guard.get_cleanup_status)
+    return {
+        "status": "ok",
+        "cleanup_status": _public_cleanup_status(cleanup_status),
+        "storage": _cleanup_storage_snapshot(),
+    }
+
+
 @app.get("/api/system/cleanup/stats")
 async def get_system_cleanup_stats_endpoint():
     """Get breakdown of cleanable disk space and files across all categories."""
     try:
-        summary = system_cleaner.run_full_cleanup(dry_run=True, vacuum_db=False)
-        cleanup_status = maintenance_guard.get_cleanup_status()
+        summary = await asyncio.to_thread(
+            system_cleaner.run_full_cleanup,
+            dry_run=True,
+            vacuum_db=False,
+        )
+        cleanup_status = await asyncio.to_thread(maintenance_guard.get_cleanup_status)
         return {
             "status": "ok",
             "policy": summary.policy,
-            "cleanup_status": cleanup_status,
-            "summary": summary.to_dict(),
+            "cleanup_status": _public_cleanup_status(cleanup_status),
+            "storage": _cleanup_storage_snapshot(),
+            "summary": _public_cleanup_summary(summary),
         }
     except Exception as exc:
         logger.exception(
@@ -17982,25 +18750,30 @@ async def get_system_cleanup_stats_endpoint():
         raise HTTPException(status_code=500, detail="Không thể quét dung lượng dọn rác.")
 
 
+@app.get("/api/system/cleanup/runs/{manifest_id}")
+async def get_system_cleanup_run_endpoint(manifest_id: str):
+    """Return the bounded in-memory status for a manual cleanup run."""
+    if not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{8}", manifest_id):
+        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ dọn rác.")
+    record = _get_system_cleanup_run(manifest_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ dọn rác.")
+    return {"status": "ok", "run": record}
+
+
 @app.post("/api/system/cleanup/run")
 async def run_system_cleanup_endpoint(background_tasks: BackgroundTasks, vacuum: bool = True):
     """Trigger background system cleanup to reclaim disk space."""
-    cleanup_status = maintenance_guard.get_cleanup_status()
+    cleanup_status = await asyncio.to_thread(maintenance_guard.get_cleanup_status)
     if not cleanup_status.get("safe_to_cleanup"):
+        public_status = _public_cleanup_status(cleanup_status)
         raise HTTPException(
             status_code=409,
             detail={
                 "message": "Hệ thống đang bận hoặc chưa thể xác minh trạng thái an toàn.",
-                "reasons": cleanup_status.get("reasons") or [],
-                "blockers": [
-                    {
-                        "type": item.get("type", ""),
-                        "id": item.get("id", ""),
-                        "status": item.get("status", ""),
-                    }
-                    for item in (cleanup_status.get("blocking_jobs") or [])[:50]
-                ],
-                "verification_errors": cleanup_status.get("verification_errors") or [],
+                "reasons": public_status["reasons"],
+                "blockers": public_status["blocking_jobs"][:50],
+                "verification_errors": public_status["verification_errors"],
             },
         )
 
@@ -18009,24 +18782,56 @@ async def run_system_cleanup_endpoint(background_tasks: BackgroundTasks, vacuum:
         + "-"
         + uuid.uuid4().hex[:8]
     )
+    queued_run = _update_system_cleanup_run(
+        manifest_id,
+        status="queued",
+        message="Tác vụ dọn rác đang chờ worker nền.",
+        summary=None,
+    )
 
     def _do_clean():
+        _update_system_cleanup_run(
+            manifest_id,
+            status="running",
+            message="Đang quét lại trạng thái và dọn các file an toàn.",
+        )
         try:
-            system_cleaner.run_full_cleanup(
+            summary = system_cleaner.run_full_cleanup(
                 dry_run=False,
                 vacuum_db=vacuum,
                 manifest_id=manifest_id,
             )
+            public_summary = _public_cleanup_summary(summary)
+            if summary.blocked:
+                _update_system_cleanup_run(
+                    manifest_id,
+                    status="blocked",
+                    message="Tác vụ dọn rác đã dừng vì hệ thống không còn ở trạng thái an toàn.",
+                    summary=public_summary,
+                )
+            else:
+                _update_system_cleanup_run(
+                    manifest_id,
+                    status="completed",
+                    message="Đã hoàn tất dọn rác an toàn.",
+                    summary=public_summary,
+                )
         except Exception as exc:
-            print(
-                "Manual system cleanup failed: "
-                f"{security_logging.redact_sensitive(exc)}",
-                file=sys.stderr,
+            error_id = security_logging.report_exception(
+                "manual_system_cleanup_failed",
+                exc,
+            )
+            _update_system_cleanup_run(
+                manifest_id,
+                status="error",
+                message=f"Dọn rác thất bại. Mã lỗi: {error_id}.",
+                summary=None,
             )
 
     background_tasks.add_task(_do_clean)
     return {
-        "status": "ok",
+        "status": "queued",
         "manifest_id": manifest_id,
+        "run": queued_run,
         "message": "Tiến trình dọn dẹp hệ thống đã được khởi chạy trong nền.",
     }

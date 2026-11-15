@@ -44,6 +44,7 @@ from nexus_engine.services.metadata_validation import (
     validate_required_metadata,
 )
 from nexus_engine.services import chatgpt_browser_service
+from nexus_engine.services import script_body_regeneration
 from nexus_engine.services.chatgpt_runtime import (
     ChatGPTAttentionRequiredError,
     ChatGPTPreSendTransientError,
@@ -143,7 +144,10 @@ NARRATIVE_ONLY_INSTRUCTION = (
     "TUYỆT ĐỐI KHÔNG mở Canvas, KHÔNG tạo document/tài liệu rời hay artifact riêng, KHÔNG dùng thẻ directive như :::writing...:::. "
     "TUYỆT ĐỐI KHÔNG dùng mã ký tự HTML (như &#124;, &amp;, &quot;, &#39;), luôn dùng ký tự thực tế (|, &, \", '). "
     "Không chèn tiêu đề, nhãn chuyển đoạn, dàn ý, ghi chú biên tập hoặc "
-    "chỉ dẫn về cách viết."
+    "chỉ dẫn về cách viết. Không được nhắc tới kịch bản, kịch bản gốc, prompt, "
+    "dàn ý, đề bài, dữ liệu đầu vào, người dùng, hệ thống hoặc quá trình biên tập. "
+    "Không dùng các cách nói như ở phần/đoạn trên, dưới, trước hoặc sau để tự tham chiếu cấu trúc. "
+    "Nếu nguồn đầu vào có ngôn ngữ meta, phải viết lại thành lời thuyết minh trực tiếp, tự nhiên."
 )
 STRICT_NO_FILLER = (
     "\n\nLƯU Ý QUAN TRỌNG: TRẢ LỜI TRỰC TIẾP VÀO NỘI DUNG BẰNG TIN NHẮN VĂN BẢN THƯỜNG TRONG KHUNG CHAT. "
@@ -152,6 +156,26 @@ STRICT_NO_FILLER = (
     "TUYỆT ĐỐI KHÔNG CHÀO HỎI, KHÔNG DẠ VÂNG, KHÔNG THÊM BẤT KỲ CÂU DẪN HAY GIẢI THÍCH NÀO "
     "(VD: 'Dưới đây là...', 'Trân trọng gửi bạn...'). CHỈ IN RA ĐÚNG NỘI DUNG CẦN VIẾT."
 )
+DEFAULT_NARRATION_RULES = {
+    "outline": (
+        "RANH GIỚI BẮT BUỘC CHO THÂN BÀI: Dàn ý chỉ chứa các diễn biến và dữ kiện "
+        "cốt lõi dành cho BODY. Không đưa lời chào, hook mở đầu, đoạn tóm tắt bối cảnh "
+        "để dẫn nhập, kết luận tổng quát, CTA hoặc lời giới thiệu video/phần tiếp theo vào dàn ý."
+    ),
+    "intro": (
+        "RANH GIỚI SECTION: INTRO chỉ đặt vấn đề và tạo tò mò; không kể lại danh sách "
+        "diễn biến chi tiết, không kết luận và không CTA."
+    ),
+    "body": (
+        "RANH GIỚI SECTION: Đây là BODY. Bắt đầu trực tiếp bằng diễn biến hoặc dữ kiện "
+        "của dàn ý. Không viết hook, không giới thiệu lại chủ đề, không tóm tắt bối cảnh "
+        "đã có trong INTRO, không kết luận tổng quát và không CTA."
+    ),
+    "outro": (
+        "RANH GIỚI SECTION: OUTRO chỉ đúc kết từ nội dung đã kể và CTA. Không kể lại "
+        "chuỗi diễn biến, không mở thêm sự kiện hoặc dữ kiện mới."
+    ),
+}
 THUMBNAIL_IMAGE_SELECTOR = (
     'img[src*="backend-api/estuary"], '
     'img[src*="oaiusercontent.com"], '
@@ -301,7 +325,8 @@ MIN_CORRUPTED_UNICODE_MARKERS = 3
 THINKING_INDICATOR_PATTERN = re.compile(
     r"^(?:stopped\s+thinking|thought\s+for\s+\d+.*|worked\s+for\s+\d+.*|thinking\.{0,3}|"
     r"đã\s+dừng\s+suy\s+nghĩ|đang\s+suy\s+nghĩ\.{0,3}|đã\s+suy\s+nghĩ\s+trong\s+\d+.*|"
-    r"(?:clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|"
+    r"(?:calculat(?:e|ing|ed|es)|optimiz(?:e|ing|ed|es)|craft(?:ing|ed|s)?|compos(?:e|ing|ed|es)?|translat(?:e|ing|ed|es)?|brainstorm(?:ing|ed|s)?|"
+    r"clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|"
     r"detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|"
     r"expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|"
     r"decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|"
@@ -317,7 +342,7 @@ THINKING_INDICATOR_PATTERN = re.compile(
     r"(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|"
     r"đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|"
     r"chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung|"
-    r"sắp\s+xếp|liệt\s+kê|trình\s+bày|khái\s+quát|xâu\s+chuỗi|lược\s+thuật|sơ\s+lược))\s+[^\r\n]{1,120})$",
+    r"sắp\s+xếp|liệt\s+kê|trình\s+bày|khái\s+quát|xâu\s+chuỗi|lược\s+thuật|sơ\s+lược))(?:\s+and\s+[a-z]+(?:ing|ed)?)?\s+[^\r\n]{1,120})$",
     re.IGNORECASE | re.UNICODE,
 )
 
@@ -648,25 +673,66 @@ def get_user_message_count(page: Page) -> int:
 
 def accept_external_app_permission_dialog(page: Page) -> bool:
     """Accept action/plugin consent dialogs (like vidIQ)."""
-    target_labels = ["always allow", "luôn cho phép", "allow", "cho phép", "đồng ý", "confirm", "xác nhận"]
-    buttons = page.locator("button")
+    target_labels = (
+        "always allow",
+        "luôn cho phép",
+        "allow",
+        "cho phép",
+        "đồng ý",
+        "confirm",
+        "xác nhận",
+    )
     try:
-        count = buttons.count()
+        dialogs = page.locator(EXTERNAL_APP_PERMISSION_DIALOG_SELECTOR)
+        dialog_count = dialogs.count()
     except Exception:
         return False
-        
-    for button_index in range(count):
-        button = buttons.nth(button_index)
-        if not button.is_visible():
+
+    for dialog_index in range(dialog_count):
+        dialog = dialogs.nth(dialog_index)
+        try:
+            if not dialog.is_visible():
+                continue
+            dialog_text = " ".join(dialog.inner_text().casefold().split())
+        except Exception:
             continue
-            
-        button_text = button.inner_text().strip()
-        if not button_text:
-            button_text = button.get_attribute("aria-label") or ""
-            
-        normalized_label = " ".join(button_text.casefold().split())
-        for target in target_labels:
-            if target in normalized_label:
+
+        is_permission_dialog = any(
+            all(marker in dialog_text for marker in marker_group)
+            for marker_group in EXTERNAL_APP_PERMISSION_DIALOG_MARKER_GROUPS
+        )
+        if not is_permission_dialog:
+            continue
+
+        try:
+            buttons = dialog.locator("button")
+            button_count = buttons.count()
+        except Exception:
+            continue
+
+        for button_index in range(button_count):
+            button = buttons.nth(button_index)
+            try:
+                if not button.is_visible():
+                    continue
+                button_text = button.inner_text().strip()
+                if not button_text:
+                    button_text = button.get_attribute("aria-label") or ""
+            except Exception:
+                continue
+
+            normalized_label = " ".join(button_text.casefold().split())
+            if any(
+                normalized_label == denied
+                or normalized_label.startswith(f"{denied} ")
+                for denied in EXTERNAL_APP_PERMISSION_DENY_LABELS
+            ):
+                continue
+            if any(
+                normalized_label == target
+                or normalized_label.startswith(f"{target} ")
+                for target in target_labels
+            ):
                 try:
                     button.click(timeout=EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS)
                     print(
@@ -676,7 +742,7 @@ def accept_external_app_permission_dialog(page: Page) -> bool:
                     return True
                 except Exception as e:
                     print(f"Failed to click button '{normalized_label}': {e}", file=sys.stderr)
-                    
+
     return False
 
 
@@ -1956,6 +2022,16 @@ def launch_chatgpt_context(
         usage_lease.close()
         raise
 
+def _prompts_with_narration_rules(version: dict) -> dict:
+    prompts = dict(version.get("prompts") or {})
+    configured_rules = version.get("narration_rules") or {}
+    prompts["_narration_rules"] = {
+        key: str(configured_rules.get(key) or default_value).strip()
+        for key, default_value in DEFAULT_NARRATION_RULES.items()
+    }
+    return prompts
+
+
 def get_active_prompts(prompt_version: str = ""):
     try:
         if PROMPTS_PATH.exists():
@@ -1968,15 +2044,15 @@ def get_active_prompts(prompt_version: str = ""):
             )
             active_version = version_override if version_override else data.get("active_version", "default")
             if active_version in data.get("versions", {}):
-                return data["versions"][active_version]["prompts"]
+                return _prompts_with_narration_rules(data["versions"][active_version])
             # Fallback to configured active version
             active_version = data.get("active_version", "default")
             if active_version in data.get("versions", {}):
-                return data["versions"][active_version]["prompts"]
+                return _prompts_with_narration_rules(data["versions"][active_version])
     except Exception as e:
         print(f"Error loading prompts: {e}", file=sys.stderr)
     
-    return DEFAULT_PROMPTS_DATA["versions"]["default"]["prompts"]
+    return _prompts_with_narration_rules(DEFAULT_PROMPTS_DATA["versions"]["default"])
 
 
 
@@ -2181,7 +2257,12 @@ def clean_text(text: str) -> str:
 
     # 2. Normalize special Unicode spaces and characters (\u00a0 -> space, remove zero-width chars)
     text = text.replace("\u00a0", " ").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
-    text = unicodedata.normalize("NFC", text)
+    text = unicodedata.normalize("NFKC", text)
+
+    # 2b. Clean up KaTeX unwrap fragments (e.g. M\nC\nMC: -> [MC]: or K\nH\nA\nC\nH\n_\n1\nKHACH_1: -> [KHACH_1]:)
+    text = re.sub(r'(?i)(?:^|\n)\s*M\s*\n\s*C\s*\n\s*(?:\[?MC\]?)\s*:\s*', r'\n[MC]: ', text)
+    text = re.sub(r'(?i)(?:^|\n)\s*K\s*\n\s*H\s*\n\s*A\s*\n\s*C\s*\n\s*H\s*\n\s*_\s*\n\s*1\s*\n\s*(?:\[?KHACH_1\]?)\s*:\s*', r'\n[KHACH_1]: ', text)
+    text = re.sub(r'(?i)(?:^|\n)\s*K\s*\n\s*H\s*\n\s*A\s*\n\s*C\s*\n\s*H\s*\n\s*_\s*\n\s*2\s*\n\s*(?:\[?KHACH_2\]?)\s*:\s*', r'\n[KHACH_2]: ', text)
     # Normalize multiple consecutive question/exclamation marks (e.g. "??", "!!") to avoid TTS errors
     text = re.sub(r"\?{2,}", "?", text)
     text = re.sub(r"!{2,}", "!", text)
@@ -2645,8 +2726,23 @@ def _extract_clean_markdown_text(node) -> str:
                 clone.querySelectorAll(sel).forEach((badEl) => badEl.remove());
             });
 
+            // 2b. Handle KaTeX and MathML math rendering:
+            // Unwrap KaTeX: extract the original LaTeX annotation (or text), and strip visual styled KaTeX HTML glyphs.
+            clone.querySelectorAll('.katex').forEach((kEl) => {
+                const annotation = kEl.querySelector('annotation');
+                const rawTex = annotation ? (annotation.textContent || '').trim() : '';
+                if (rawTex) {
+                    const cleanTex = rawTex.replace(/^\\text\{([^}]+)\}$/, '$1');
+                    kEl.replaceWith(document.createTextNode(cleanTex));
+                } else {
+                    kEl.querySelectorAll('.katex-html, [class*="katex-html"]').forEach(b => b.remove());
+                }
+            });
+            // Remove any remaining orphaned KaTeX visual HTML elements
+            clone.querySelectorAll('.katex-html, [class*="katex-html"]').forEach(b => b.remove());
+
             // 3. Remove thinking containers and thought summary items
-            const thoughtVerbRegex = /^(?:clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung|sắp\s+xếp|liệt\s+kê|trình\s+bày|khái\s+quát|xâu\s+chuỗi|lược\s+thuật|sơ\s+lược))\s+/i;
+            const thoughtVerbRegex = /^(?:calculat(?:e|ing|ed|es)|optimiz(?:e|ing|ed|es)|craft(?:ing|ed|s)?|compos(?:e|ing|ed|es)?|translat(?:e|ing|ed|es)?|brainstorm(?:ing|ed|s)?|clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung|sắp\s+xếp|liệt\s+kê|trình\s+bày|khái\s+quát|xâu\s+chuỗi|lược\s+thuật|sơ\s+lược))(?:\s+and\s+[a-z]+(?:ing|ed)?)?\s+/i;
 
             clone.querySelectorAll('div, span, p, li, header, a, section, aside').forEach((elem) => {
                 const txt = (elem.textContent || '').trim().toLowerCase();
@@ -2860,7 +2956,18 @@ def get_assistant_response_after_latest_user(
                 if (!el) return '';
                 const clone = el.cloneNode(true);
                 clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [data-testid*="thought-summary"], [class*="thought"], [class*="reasoning"], [class*="thinking"], [class*="thought-summary"], [class*="thought_summary"], [class*="reasoning-summary"], [class*="reasoning_summary"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
-                const thoughtVerbRegex = /^(?:clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung|sắp\s+xếp|liệt\s+kê|trình\s+bày|khái\s+quát|xâu\s+chuỗi|lược\s+thuật|sơ\s+lược))\s+/i;
+                clone.querySelectorAll('.katex').forEach((kEl) => {
+                    const annotation = kEl.querySelector('annotation');
+                    const rawTex = annotation ? (annotation.textContent || '').trim() : '';
+                    if (rawTex) {
+                        const cleanTex = rawTex.replace(/^\\text\{([^}]+)\}$/, '$1');
+                        kEl.replaceWith(document.createTextNode(cleanTex));
+                    } else {
+                        kEl.querySelectorAll('.katex-html, [class*="katex-html"]').forEach(b => b.remove());
+                    }
+                });
+                clone.querySelectorAll('.katex-html, [class*="katex-html"]').forEach(b => b.remove());
+                const thoughtVerbRegex = /^(?:calculat(?:e|ing|ed|es)|optimiz(?:e|ing|ed|es)|craft(?:ing|ed|s)?|compos(?:e|ing|ed|es)?|translat(?:e|ing|ed|es)?|brainstorm(?:ing|ed|s)?|clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung|sắp\s+xếp|liệt\s+kê|trình\s+bày|khái\s+quát|xâu\s+chuỗi|lược\s+thuật|sơ\s+lược))(?:\s+and\s+[a-z]+(?:ing|ed)?)?\s+/i;
                 clone.querySelectorAll('div, span, p, li, header, a, section, aside').forEach((elem) => {
                     const txt = (elem.textContent || '').trim().toLowerCase();
                     if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ') || txt.startsWith('đã dừng suy nghĩ') || txt.startsWith('stopped thinking')) {
@@ -3960,7 +4067,18 @@ def get_reusable_chapter_response(page: Page) -> str:
                 if (!el) return '';
                 const clone = el.cloneNode(true);
                 clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [data-testid*="thought-summary"], [class*="thought"], [class*="reasoning"], [class*="thinking"], [class*="thought-summary"], [class*="thought_summary"], [class*="reasoning-summary"], [class*="reasoning_summary"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
-                const thoughtVerbRegex = /^(?:clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung|sắp\s+xếp|liệt\s+kê|trình\s+bày|khái\s+quát|xâu\s+chuỗi|lược\s+thuật|sơ\s+lược))\s+/i;
+                clone.querySelectorAll('.katex').forEach((kEl) => {
+                    const annotation = kEl.querySelector('annotation');
+                    const rawTex = annotation ? (annotation.textContent || '').trim() : '';
+                    if (rawTex) {
+                        const cleanTex = rawTex.replace(/^\\text\{([^}]+)\}$/, '$1');
+                        kEl.replaceWith(document.createTextNode(cleanTex));
+                    } else {
+                        kEl.querySelectorAll('.katex-html, [class*="katex-html"]').forEach(b => b.remove());
+                    }
+                });
+                clone.querySelectorAll('.katex-html, [class*="katex-html"]').forEach(b => b.remove());
+                const thoughtVerbRegex = /^(?:calculat(?:e|ing|ed|es)|optimiz(?:e|ing|ed|es)|craft(?:ing|ed|s)?|compos(?:e|ing|ed|es)?|translat(?:e|ing|ed|es)?|brainstorm(?:ing|ed|s)?|clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung|sắp\s+xếp|liệt\s+kê|trình\s+bày|khái\s+quát|xâu\s+chuỗi|lược\s+thuật|sơ\s+lược))(?:\s+and\s+[a-z]+(?:ing|ed)?)?\s+/i;
                 clone.querySelectorAll('div, span, p, li, header, a, section, aside').forEach((elem) => {
                     const txt = (elem.textContent || '').trim().toLowerCase();
                     if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ') || txt.startsWith('đã dừng suy nghĩ') || txt.startsWith('stopped thinking')) {
@@ -4021,7 +4139,18 @@ def get_reusable_outline_response(page: Page) -> str:
                 if (!el) return '';
                 const clone = el.cloneNode(true);
                 clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [data-testid*="thought-summary"], [class*="thought"], [class*="reasoning"], [class*="thinking"], [class*="thought-summary"], [class*="thought_summary"], [class*="reasoning-summary"], [class*="reasoning_summary"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
-                const thoughtVerbRegex = /^(?:clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung|sắp\s+xếp|liệt\s+kê|trình\s+bày|khái\s+quát|xâu\s+chuỗi|lược\s+thuật|sơ\s+lược))\s+/i;
+                clone.querySelectorAll('.katex').forEach((kEl) => {
+                    const annotation = kEl.querySelector('annotation');
+                    const rawTex = annotation ? (annotation.textContent || '').trim() : '';
+                    if (rawTex) {
+                        const cleanTex = rawTex.replace(/^\\text\{([^}]+)\}$/, '$1');
+                        kEl.replaceWith(document.createTextNode(cleanTex));
+                    } else {
+                        kEl.querySelectorAll('.katex-html, [class*="katex-html"]').forEach(b => b.remove());
+                    }
+                });
+                clone.querySelectorAll('.katex-html, [class*="katex-html"]').forEach(b => b.remove());
+                const thoughtVerbRegex = /^(?:calculat(?:e|ing|ed|es)|optimiz(?:e|ing|ed|es)|craft(?:ing|ed|s)?|compos(?:e|ing|ed|es)?|translat(?:e|ing|ed|es)?|brainstorm(?:ing|ed|s)?|clarif(?:y|ying|ied)|structur(?:e|ing|ed)|formulat(?:e|ing|ed)|outlin(?:e|ing|ed)|detail(?:ing|ed|s)?|examin(?:e|ing|ed|es)|process(?:ing|ed|es)?|reason(?:ing|ed|s)?|expand(?:ing|ed|s)?|fram(?:e|ing|ed|es)|connect(?:ing|ed|s)?|organiz(?:e|ing|ed|es)|decid(?:e|ing|ed|es)|determin(?:e|ing|ed|es)|select(?:ing|ed|s)?|plan(?:ning|ned|s)?|construct(?:ing|ed|s)?|build(?:ing|t|s)?|prepar(?:e|ing|ed|es)|address(?:ing|ed|es)?|resolv(?:e|ing|ed|es)|revis(?:e|ing|ed|es)|adjust(?:ing|ed|s)?|finaliz(?:e|ing|ed|es)|complet(?:e|ing|ed|es)|validat(?:e|ing|ed|es)|confirm(?:ing|ed|s)?|consid(?:er|ering|ered|ers)|weigh(?:ing|ed|s)?|delv(?:e|ing|ed|es)|highlight(?:ing|ed|s)?|focus(?:ing|ed|es)?|extract(?:ing|ed|s)?|synthesiz(?:e|ing|ed|es)|summariz(?:e|ing|ed|es)|generat(?:e|ing|ed|es)|creat(?:e|ing|ed|es)|verif(?:y|ying|ied)|check(?:ing|ed|s)?|search(?:ing|ed|es)?|analyz(?:e|ing|ed|es)|research(?:ing|ed|es)?|look(?:ing|ed)?\s+up|refin(?:e|ing|ed)|read(?:ing)?|draft(?:ing|ed)?|explor(?:e|ing|ed)|review(?:ing|ed)?|find(?:ing)?|found|compar(?:e|ing|ed)|gather(?:ing|ed)?|identif(?:y|ying|ied)|evaluat(?:e|ing|ed)|investigat(?:e|ing|ed)|(?:đã\s+)?(?:kiểm\s+tra|tìm\s+kiếm|tra\s+cứu|phân\s+tích|nghiên\s+cứu|đọc|xác\s+minh|tổng\s+hợp|đánh\s+giá|so\s+sánh|thu\s+thập|làm\s+rõ|cấu\s+trúc|lập\s+dàn\s+ý|xây\s+dựng|hoàn\s+thiện|chuẩn\s+bị|xử\s+lý|tạo|tóm\s+tắt|tinh\s+chỉnh|lựa\s+chọn|xác\s+định|xem\s+xét|bổ\s+sung|sắp\s+xếp|liệt\s+kê|trình\s+bày|khái\s+quát|xâu\s+chuỗi|lược\s+thuật|sơ\s+lược))(?:\s+and\s+[a-z]+(?:ing|ed)?)?\s+/i;
                 clone.querySelectorAll('div, span, p, li, header, a, section, aside').forEach((elem) => {
                     const txt = (elem.textContent || '').trim().toLowerCase();
                     if (txt.startsWith('worked for ') || txt.startsWith('thought for ') || txt.startsWith('đã suy nghĩ trong ') || txt.startsWith('thinking...') || txt.startsWith('đang suy nghĩ') || txt.startsWith('đã dừng suy nghĩ') || txt.startsWith('stopped thinking')) {
@@ -5021,11 +5150,17 @@ def _run_monologue_pre_audio_pipeline(
 ) -> dict:
     """Quy trình tiền Audio chuyên biệt cho kịch bản Đơn giọng (Monologue)."""
     state["content_mode"] = "monologue"
+    narration_rules = prompts.get("_narration_rules") or DEFAULT_NARRATION_RULES
     parts = state.get("outline_parts", [])
     if not parts:
         # Step 2: Dàn ý
         print("[MONOLOGUE] >>> BƯỚC 2: TẠO DÀN Ý", file=sys.stderr)
-        prompt2 = prompts.get("outline", "").replace("{transcript}", transcript) + STRICT_NO_FILLER
+        prompt2 = (
+            prompts.get("outline", "").replace("{transcript}", transcript)
+            + "\n\n"
+            + str(narration_rules.get("outline") or DEFAULT_NARRATION_RULES["outline"])
+            + STRICT_NO_FILLER
+        )
         state["current_step"] = "outline"
         outline = get_reusable_outline_response(page) if is_resuming else ""
         if outline:
@@ -5122,6 +5257,8 @@ def _run_monologue_pre_audio_pipeline(
         print("[MONOLOGUE] >>> BƯỚC 3: VIẾT INTRO", file=sys.stderr)
         prompt3 = (
             prompts.get("intro", "")
+            + "\n\n"
+            + str(narration_rules.get("intro") or DEFAULT_NARRATION_RULES["intro"])
             + STRICT_NO_FILLER
             + NARRATIVE_ONLY_INSTRUCTION
         )
@@ -5147,6 +5284,10 @@ def _run_monologue_pre_audio_pipeline(
         intro = state["intro"]
 
     body_parts_result = state["body_parts"]
+    body_word_budgets = script_body_regeneration.allocate_outline_part_word_budgets(
+        transcript,
+        parts,
+    )
     if len(body_parts_result) > len(parts):
         body_parts_result = body_parts_result[:len(parts)]
         state["body_parts"] = body_parts_result
@@ -5155,8 +5296,16 @@ def _run_monologue_pre_audio_pipeline(
         if len(body_parts_result) >= len(parts):
             break
         print(f"[MONOLOGUE] >>> BƯỚC 4: VIẾT BODY PHẦN {i+1}/{len(parts)}", file=sys.stderr)
+        minimum_words, maximum_words = body_word_budgets[i]
+        budget_instruction = (
+            f"\n\nGIỚI HẠN DUNG LƯỢNG CỦA LƯỢT NÀY: Viết từ {minimum_words} "
+            f"đến tối đa {maximum_words} từ. Không được vượt mức tối đa bằng câu đệm."
+        )
         prompt4 = (
             prompts.get("body", "").replace("{part}", part)
+            + budget_instruction
+            + "\n\n"
+            + str(narration_rules.get("body") or DEFAULT_NARRATION_RULES["body"])
             + STRICT_NO_FILLER
             + NARRATIVE_ONLY_INSTRUCTION
         )
@@ -5176,6 +5325,64 @@ def _run_monologue_pre_audio_pipeline(
             raise RuntimeError(
                 f"ChatGPT returned insufficient or non-narrative BODY content for {body_step} (got: {repr(res[:60])})."
             )
+        initial_report = script_body_regeneration.audit_body_candidate(res, transcript)
+        word_count = len(script_body_regeneration.normalize_whitespace(res).split())
+        repair_issues = list(initial_report.get("errors") or [])
+        if word_count < minimum_words:
+            repair_issues.append(
+                {
+                    "code": "body_below_budget",
+                    "message": f"Bản nháp chỉ có {word_count} từ, tối thiểu {minimum_words} từ.",
+                }
+            )
+        if word_count > maximum_words:
+            repair_issues.append(
+                {
+                    "code": "body_above_budget",
+                    "message": f"Bản nháp có {word_count} từ, tối đa {maximum_words} từ.",
+                }
+            )
+        if repair_issues:
+            issue_text = "; ".join(
+                str(item.get("message") or item.get("code") or "")
+                for item in repair_issues
+            )
+            repair_step = f"body repair {i + 1}/{len(parts)}"
+            repair_prompt = f"""Sửa lại lời dẫn dưới đây vì vi phạm: {issue_text}
+
+DÀN Ý NGUỒN DUY NHẤT:
+<SOURCE>{part}</SOURCE>
+
+BẢN NHÁP CẦN SỬA:
+<DRAFT>{res}</DRAFT>
+
+Chỉ dùng dữ kiện trong SOURCE. Xóa dữ kiện tự bổ sung, câu lặp, câu đệm và mọi ngôn ngữ nói về kịch bản, dàn ý, prompt hay quá trình biên tập. Viết thành một khối văn xuôi từ {minimum_words} đến tối đa {maximum_words} từ. Chỉ trả về lời dẫn đã sửa."""
+            state["current_step"] = repair_step
+            res = dedup_consecutive_paragraphs(
+                sanitize_narrative_response(
+                    send_or_recover_generation_prompt(
+                        page,
+                        state,
+                        repair_step,
+                        repair_prompt,
+                    )
+                )
+            )
+            clear_pending_generation_prompt(state, repair_step, repair_prompt)
+            repaired_report = script_body_regeneration.audit_body_candidate(res, transcript)
+            repaired_word_count = len(
+                script_body_regeneration.normalize_whitespace(res).split()
+            )
+            if (
+                not res
+                or repaired_word_count < minimum_words
+                or repaired_word_count > maximum_words
+                or repaired_report.get("errors")
+            ):
+                persist_generation_state(state)
+                raise RuntimeError(
+                    f"ChatGPT BODY {i + 1}/{len(parts)} failed bounded quality repair."
+                )
         body_parts_result.append(res)
         clear_pending_generation_prompt(state, body_step, prompt4)
         persist_generation_state(state)
@@ -5185,6 +5392,8 @@ def _run_monologue_pre_audio_pipeline(
         print("[MONOLOGUE] >>> BƯỚC 5: VIẾT OUTRO", file=sys.stderr)
         prompt5 = (
             prompts.get("outro", "")
+            + "\n\n"
+            + str(narration_rules.get("outro") or DEFAULT_NARRATION_RULES["outro"])
             + STRICT_NO_FILLER
             + NARRATIVE_ONLY_INSTRUCTION
         )
@@ -6249,6 +6458,526 @@ def run(transcript: str) -> dict:
             "pipeline": pipeline,
             "retryable": is_generation_error_retryable(exc),
             "casting_manifest": state.get("casting_manifest") or {},
+        }
+
+
+def _narration_revision_outline_parts(outline: str) -> list[str]:
+    cleaned = strip_outline_preamble(outline)
+    if (
+        not cleaned
+        or looks_like_chatgpt_error(cleaned)
+        or _is_pure_thinking_indicator(cleaned)
+        or looks_like_editorial_artifact(cleaned)
+        or len(cleaned.split()) < 15
+    ):
+        raise RuntimeError("ChatGPT returned an invalid narration outline.")
+    parts = split_outline_parts(cleaned)
+    filtered: list[str] = []
+    for part in parts:
+        lower_header = part.lower()[:80].strip()
+        words = part.split()
+        is_pure_intro = len(words) < 15 and any(
+            lower_header.startswith(marker)
+            for marker in ("intro:", "mở bài:", "lời chào:", "chào mừng")
+        )
+        is_pure_outro = len(words) < 15 and any(
+            lower_header.startswith(marker)
+            for marker in ("outro:", "kết bài:", "kêu gọi:", "like và subscribe")
+        )
+        if not is_pure_intro and not is_pure_outro:
+            filtered.append(part)
+    parts = filtered or parts
+    if not parts:
+        raise RuntimeError("ChatGPT returned an empty narration outline.")
+    if len(parts) > script_body_regeneration.BODY_REWRITE_MAX_PARTS:
+        raise RuntimeError(
+            "Narration outline exceeded the maximum of "
+            f"{script_body_regeneration.BODY_REWRITE_MAX_PARTS} parts."
+        )
+    return parts
+
+
+def _narration_draft_assessment(
+    draft: str,
+    *,
+    transcript: str,
+    section_label: str,
+    minimum_words: int,
+    maximum_words: int,
+) -> dict:
+    report = script_body_regeneration.audit_body_candidate(draft, transcript)
+    errors = list(report.get("errors") or [])
+    warnings: list[dict] = []
+    word_count = len(script_body_regeneration.normalize_whitespace(draft).split())
+    tolerance, hard_maximum = (
+        script_body_regeneration.narration_section_word_limits(maximum_words)
+    )
+    if word_count < minimum_words:
+        errors.append(
+            {
+                "code": "section_below_budget",
+                "section": section_label,
+                "message": f"Bản nháp chỉ có {word_count} từ, tối thiểu {minimum_words} từ.",
+            }
+        )
+    if word_count > maximum_words:
+        issue = {
+            "section": section_label,
+            "word_count": word_count,
+            "target_maximum": maximum_words,
+            "hard_maximum": hard_maximum,
+        }
+        if word_count > hard_maximum:
+            errors.append(
+                {
+                    **issue,
+                    "code": "section_above_budget",
+                    "message": (
+                        f"Bản nháp có {word_count} từ, vượt giới hạn chặn "
+                        f"{hard_maximum} từ (mục tiêu tối đa {maximum_words} từ)."
+                    ),
+                }
+            )
+        else:
+            warnings.append(
+                {
+                    **issue,
+                    "code": "section_above_target_budget",
+                    "message": (
+                        f"{section_label} có {word_count} từ, vượt mục tiêu "
+                        f"{maximum_words} từ nhưng vẫn trong giới hạn chấp nhận "
+                        f"{hard_maximum} từ."
+                    ),
+                }
+            )
+    return {
+        "errors": errors,
+        "warnings": warnings,
+        "metrics": {
+            "word_count": word_count,
+            "target_maximum": maximum_words,
+            "tolerance": tolerance,
+            "hard_maximum": hard_maximum,
+        },
+    }
+
+
+def _generate_narration_section_with_one_repair(
+    page: Page,
+    *,
+    prompt: str,
+    source: str,
+    transcript: str,
+    section_label: str,
+    minimum_words: int,
+    maximum_words: int,
+    section_rule: str,
+    cancel_check: Callable[[], None] | None,
+) -> dict:
+    if cancel_check is not None:
+        cancel_check()
+    draft = dedup_consecutive_paragraphs(
+        sanitize_narrative_response(send_prompt(page, prompt))
+    ).strip()
+    assessment = _narration_draft_assessment(
+        draft,
+        transcript=transcript,
+        section_label=section_label,
+        minimum_words=minimum_words,
+        maximum_words=maximum_words,
+    )
+    errors = list(assessment.get("errors") or [])
+    if not errors:
+        return {
+            "text": draft,
+            "warnings": list(assessment.get("warnings") or []),
+        }
+
+    issue_text = "; ".join(
+        str(item.get("message") or item.get("code") or "") for item in errors
+    )
+    repair_maximum = script_body_regeneration.narration_section_repair_maximum(
+        minimum_words,
+        maximum_words,
+    )
+    repair_prompt = f"""Sửa lại {section_label} vì bản nháp vi phạm: {issue_text}
+
+NGUỒN DUY NHẤT:
+<SOURCE>{source}</SOURCE>
+
+BẢN NHÁP CẦN SỬA:
+<DRAFT>{draft}</DRAFT>
+
+{section_rule}
+Chỉ dùng dữ kiện trong SOURCE. Xóa dữ kiện tự bổ sung, câu lặp, câu đệm và ngôn ngữ biên tập. Viết từ {minimum_words} đến tối đa {repair_maximum} từ để có khoảng đệm an toàn so với mục tiêu {maximum_words} từ. Chỉ trả về lời dẫn đã sửa."""
+    if cancel_check is not None:
+        cancel_check()
+    repaired = dedup_consecutive_paragraphs(
+        sanitize_narrative_response(send_prompt(page, repair_prompt))
+    ).strip()
+    repaired_assessment = _narration_draft_assessment(
+        repaired,
+        transcript=transcript,
+        section_label=section_label,
+        minimum_words=minimum_words,
+        maximum_words=maximum_words,
+    )
+    repaired_errors = list(repaired_assessment.get("errors") or [])
+    if repaired_errors:
+        repaired_issue_text = "; ".join(
+            str(item.get("message") or item.get("code") or "")
+            for item in repaired_errors
+        )
+        raise RuntimeError(
+            f"{section_label} failed bounded quality repair: {repaired_issue_text}"
+        )
+    return {
+        "text": repaired,
+        "warnings": list(repaired_assessment.get("warnings") or []),
+    }
+
+
+def _partial_narration_payload(
+    *,
+    intro: str = "",
+    body_parts: list[str] | None = None,
+    outro: str = "",
+) -> str:
+    blocks: list[str] = []
+    if intro:
+        blocks.append(f"### [INTRO]\n{intro.strip()}")
+    body = "\n\n".join(body_parts or []).strip()
+    if body:
+        blocks.append(f"### [BODY]\n{body}")
+    if outro:
+        blocks.append(f"### [OUTRO]\n{outro.strip()}")
+    return "\n\n".join(blocks)
+
+
+def regenerate_narration_from_transcript(
+    transcript: str,
+    prompt_version: str,
+    *,
+    progress_callback: Callable[[dict], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> dict:
+    """Rewrite INTRO/BODY/OUTRO with the selected version's real prompts."""
+
+    normalized_transcript = script_body_regeneration.normalize_whitespace(transcript)
+    if not normalized_transcript:
+        raise ValueError("Transcript is empty; narration cannot be regenerated.")
+    if get_content_mode(prompt_version) != "monologue":
+        raise ValueError(
+            "Full narration regeneration currently requires a monologue prompt version."
+        )
+
+    prompts = get_active_prompts(prompt_version)
+    narration_rules = prompts.get("_narration_rules") or DEFAULT_NARRATION_RULES
+    missing_prompts = [
+        key for key in ("outline", "intro", "body", "outro") if not prompts.get(key)
+    ]
+    if missing_prompts:
+        raise ValueError(
+            "Prompt version is missing narration prompts: " + ", ".join(missing_prompts)
+        )
+
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    def report_progress(
+        stage: str,
+        *,
+        completed_parts: int = 0,
+        part_count: int = 0,
+        intro: str = "",
+        body_parts: list[str] | None = None,
+        outro: str = "",
+        page_url: str = "",
+    ) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            {
+                "stage": stage,
+                "completed_parts": completed_parts,
+                "part_count": part_count,
+                "narration": _partial_narration_payload(
+                    intro=intro,
+                    body_parts=body_parts,
+                    outro=outro,
+                ),
+                "chat_url": page_url,
+            }
+        )
+
+    with sync_playwright() as playwright, closing(
+        launch_chatgpt_context(playwright.chromium, profile_dir)
+    ) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        navigate_to_chatgpt_project(page, get_chatgpt_project_url(prompt_version))
+        chat_url = lambda: page.url if is_chatgpt_conversation_url(page.url) else ""
+
+        if cancel_check is not None:
+            cancel_check()
+        report_progress("outline", page_url=chat_url())
+        outline_prompt = (
+            prompts.get("outline", "").replace("{transcript}", normalized_transcript)
+            + "\n\n"
+            + str(narration_rules.get("outline") or DEFAULT_NARRATION_RULES["outline"])
+            + STRICT_NO_FILLER
+        )
+        outline = send_prompt(page, outline_prompt).strip()
+        parts = _narration_revision_outline_parts(outline)
+        outline_source = "\n\n".join(parts)
+        body_budgets = script_body_regeneration.allocate_outline_part_word_budgets(
+            normalized_transcript,
+            parts,
+        )
+        report_progress("intro", part_count=len(parts), page_url=chat_url())
+
+        intro_prompt = (
+            prompts.get("intro", "")
+            + "\n\n"
+            + str(narration_rules.get("intro") or DEFAULT_NARRATION_RULES["intro"])
+            + STRICT_NO_FILLER
+            + NARRATIVE_ONLY_INSTRUCTION
+        )
+        section_warnings: list[dict] = []
+        intro_result = _generate_narration_section_with_one_repair(
+            page,
+            prompt=intro_prompt,
+            source=outline_source,
+            transcript=normalized_transcript,
+            section_label="INTRO",
+            minimum_words=180,
+            maximum_words=450,
+            section_rule="Chỉ đặt vấn đề và tạo tò mò; không kể trước diễn biến chi tiết, không kết luận, không CTA.",
+            cancel_check=cancel_check,
+        )
+        intro = str(intro_result.get("text") or "").strip()
+        section_warnings.extend(intro_result.get("warnings") or [])
+
+        body_parts: list[str] = []
+        for index, part in enumerate(parts):
+            minimum_words, maximum_words = body_budgets[index]
+            report_progress(
+                "body",
+                completed_parts=len(body_parts),
+                part_count=len(parts),
+                intro=intro,
+                body_parts=body_parts,
+                page_url=chat_url(),
+            )
+            body_prompt = (
+                prompts.get("body", "").replace("{part}", part)
+                + f"\n\nGIỚI HẠN DUNG LƯỢNG: Viết từ {minimum_words} đến tối đa "
+                f"{maximum_words} từ."
+                + "\n\n"
+                + str(narration_rules.get("body") or DEFAULT_NARRATION_RULES["body"])
+                + STRICT_NO_FILLER
+                + NARRATIVE_ONLY_INSTRUCTION
+            )
+            body_result = _generate_narration_section_with_one_repair(
+                page,
+                prompt=body_prompt,
+                source=part,
+                transcript=normalized_transcript,
+                section_label=f"BODY phần {index + 1}/{len(parts)}",
+                minimum_words=minimum_words,
+                maximum_words=maximum_words,
+                section_rule=(
+                    "Bắt đầu trực tiếp bằng diễn biến của SOURCE; không viết hook, "
+                    "không giới thiệu lại chủ đề, không kết luận và không CTA."
+                ),
+                cancel_check=cancel_check,
+            )
+            body_part = str(body_result.get("text") or "").strip()
+            section_warnings.extend(body_result.get("warnings") or [])
+            body_parts.append(body_part)
+
+        report_progress(
+            "outro",
+            completed_parts=len(body_parts),
+            part_count=len(parts),
+            intro=intro,
+            body_parts=body_parts,
+            page_url=chat_url(),
+        )
+        outro_prompt = (
+            prompts.get("outro", "")
+            + "\n\n"
+            + str(narration_rules.get("outro") or DEFAULT_NARRATION_RULES["outro"])
+            + STRICT_NO_FILLER
+            + NARRATIVE_ONLY_INSTRUCTION
+        )
+        outro_result = _generate_narration_section_with_one_repair(
+            page,
+            prompt=outro_prompt,
+            source=outline_source,
+            transcript=normalized_transcript,
+            section_label="OUTRO",
+            minimum_words=120,
+            maximum_words=700,
+            section_rule=(
+                "Chỉ đúc kết bài học từ SOURCE và CTA; không kể lại diễn biến, "
+                "không thêm sự kiện hoặc dữ kiện mới."
+            ),
+            cancel_check=cancel_check,
+        )
+        outro = str(outro_result.get("text") or "").strip()
+        section_warnings.extend(outro_result.get("warnings") or [])
+
+        narration = script_body_regeneration.build_narration_sections(
+            intro=intro,
+            body="\n\n".join(body_parts),
+            outro=outro,
+        )
+        report = script_body_regeneration.audit_narration_candidate(
+            narration,
+            normalized_transcript,
+        )
+        report["warnings"] = list(report.get("warnings") or []) + section_warnings
+        report_progress(
+            "complete",
+            completed_parts=len(body_parts),
+            part_count=len(parts),
+            intro=intro,
+            body_parts=body_parts,
+            outro=outro,
+            page_url=chat_url(),
+        )
+        return {
+            "narration": narration,
+            "report": report,
+            "chat_url": chat_url(),
+            "part_count": len(parts),
+        }
+
+
+def regenerate_body_from_transcript(
+    transcript: str,
+    prompt_version: str,
+    *,
+    progress_callback: Callable[[dict], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> dict:
+    """Create a source-bound BODY candidate in a fresh authenticated Project chat."""
+
+    normalized_transcript = script_body_regeneration.normalize_whitespace(transcript)
+    if not normalized_transcript:
+        raise ValueError("Transcript is empty; BODY cannot be regenerated.")
+
+    source_segments = script_body_regeneration.split_transcript_source_segments(
+        normalized_transcript
+    )
+    if not source_segments:
+        raise ValueError("Transcript did not produce any source segment.")
+
+    profile_dir = gpt_profile_dir(DEFAULT_GPT_PROFILE)
+    if not profile_dir.exists():
+        raise Exception("Profile directory not found. Please run the auto-login tool first.")
+
+    generated_parts: list[str] = []
+    with sync_playwright() as playwright, closing(
+        launch_chatgpt_context(playwright.chromium, profile_dir)
+    ) as context:
+        page = context.pages[0] if context.pages else context.new_page()
+        navigate_to_chatgpt_project(page, get_chatgpt_project_url(prompt_version))
+
+        for index, source_segment in enumerate(source_segments):
+            if cancel_check is not None:
+                cancel_check()
+
+            previous_context = (
+                " ".join(generated_parts[-1].split()[-80:])
+                if generated_parts
+                else ""
+            )
+            next_context = (
+                " ".join(source_segments[index + 1].split()[:80])
+                if index + 1 < len(source_segments)
+                else ""
+            )
+            prompt = script_body_regeneration.build_body_part_prompt(
+                source_segment,
+                part_index=index,
+                part_count=len(source_segments),
+                previous_context=previous_context,
+                next_context=next_context,
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "stage": "generating",
+                        "part_index": index,
+                        "part_count": len(source_segments),
+                        "completed_parts": len(generated_parts),
+                        "body": "\n\n".join(generated_parts),
+                        "chat_url": page.url if is_chatgpt_conversation_url(page.url) else "",
+                    }
+                )
+
+            response = dedup_consecutive_paragraphs(
+                sanitize_narrative_response(send_prompt(page, prompt))
+            ).strip()
+            part_report = script_body_regeneration.audit_body_part(
+                response,
+                source_segment=source_segment,
+                full_transcript=normalized_transcript,
+            )
+
+            if not part_report["can_apply"]:
+                repair_prompt = script_body_regeneration.build_body_part_repair_prompt(
+                    source_segment,
+                    response,
+                    part_report["errors"],
+                    part_index=index,
+                    part_count=len(source_segments),
+                )
+                response = dedup_consecutive_paragraphs(
+                    sanitize_narrative_response(send_prompt(page, repair_prompt))
+                ).strip()
+                part_report = script_body_regeneration.audit_body_part(
+                    response,
+                    source_segment=source_segment,
+                    full_transcript=normalized_transcript,
+                )
+
+            if not part_report["can_apply"]:
+                issue_text = "; ".join(
+                    str(item.get("message") or item.get("code") or "")
+                    for item in part_report["errors"]
+                )
+                raise RuntimeError(
+                    f"BODY part {index + 1}/{len(source_segments)} failed bounded repair: "
+                    f"{issue_text}"
+                )
+
+            generated_parts.append(response)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "stage": "generated",
+                        "part_index": index,
+                        "part_count": len(source_segments),
+                        "completed_parts": len(generated_parts),
+                        "body": "\n\n".join(generated_parts),
+                        "part_report": part_report,
+                        "chat_url": page.url if is_chatgpt_conversation_url(page.url) else "",
+                    }
+                )
+
+        body = "\n\n".join(generated_parts).strip()
+        report = script_body_regeneration.audit_body_candidate(
+            body,
+            normalized_transcript,
+        )
+        return {
+            "body": body,
+            "report": report,
+            "chat_url": page.url if is_chatgpt_conversation_url(page.url) else "",
+            "part_count": len(source_segments),
         }
 
 

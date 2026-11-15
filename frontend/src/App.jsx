@@ -397,6 +397,10 @@ function App() {
   const [audioTaskProviderId, setAudioTaskProviderId] = useState('genmax')
   const [audioReview, setAudioReview] = useState(null)
   const [isLoadingAudioReview, setIsLoadingAudioReview] = useState(false)
+  const [bodyRevision, setBodyRevision] = useState(null)
+  const [isRegeneratingBody, setIsRegeneratingBody] = useState(false)
+  const [isApplyingBodyRevision, setIsApplyingBodyRevision] = useState(false)
+  const [bodyRevisionRefreshKey, setBodyRevisionRefreshKey] = useState(0)
   const [regenerateVoiceId, setRegenerateVoiceId] = useState('')
   const [publishFilter, setPublishFilter] = useState('unpublished') // 'all' | 'published' | 'unpublished' | 'error'
   const [promptVersionFilter, setPromptVersionFilter] = useState('all')
@@ -684,6 +688,55 @@ function App() {
   useEffect(() => {
     currentVideoIdRef.current = currentVideoId
   }, [currentVideoId])
+
+  useEffect(() => {
+    if (!currentVideoId) {
+      setBodyRevision(null)
+      setIsRegeneratingBody(false)
+      return undefined
+    }
+
+    let stopped = false
+    let timerId = null
+    let pollCount = 0
+    const maxPolls = 400
+    const syncBodyRevision = async () => {
+      if (stopped || pollCount >= maxPolls) {
+        if (!stopped) setIsRegeneratingBody(false)
+        return
+      }
+      pollCount += 1
+      try {
+        const response = await fetch(
+          `http://127.0.0.1:8080/api/videos/${currentVideoId}/body-revision`
+        )
+        const data = await response.json()
+        if (stopped || !response.ok || !data.success) return
+        const revision = data.revision || null
+        setBodyRevision(revision)
+        const active = Boolean(
+          revision &&
+          ['queued', 'generating'].includes(revision.status) &&
+          ['queued', 'running', 'retry_wait', 'paused'].includes(revision.job_status)
+        )
+        setIsRegeneratingBody(active)
+        if (active && pollCount < maxPolls) {
+          timerId = setTimeout(syncBodyRevision, 3000)
+        }
+      } catch (error) {
+        console.error('Failed to sync narration revision', error)
+        if (!stopped && pollCount < maxPolls) {
+          timerId = setTimeout(syncBodyRevision, 3000)
+        }
+      }
+    }
+
+    syncBodyRevision()
+    return () => {
+      stopped = true
+      if (timerId) clearTimeout(timerId)
+    }
+  }, [currentVideoId, bodyRevisionRefreshKey])
 
   useEffect(() => {
     let stopped = false
@@ -1035,6 +1088,8 @@ function App() {
       setActiveView('fetcher', String(normalizedId));
       setCurrentVideoId(normalizedId);  // track which video is loaded
       setAudioReview(null);
+      setBodyRevision(null);
+      setIsRegeneratingBody(false);
       setIsCurrentVideoPublished(Boolean(data.is_published));
       setCurrentVideoPublishStatus(data.publish_status || '');
       setCurrentVideoBlockingReason(data.blocking_reason || '');
@@ -1073,6 +1128,8 @@ function App() {
     setRegenerateVoiceId(selectedVoiceId);
     setShowResult(false);
     setAudioReview(null);
+    setBodyRevision(null);
+    setIsRegeneratingBody(false);
     setIsCurrentVideoPublished(false);
     setCurrentVideoPublications([]);
     setCurrentVideoDefaultChannelTitle('');
@@ -1542,6 +1599,67 @@ function App() {
     }
   };
 
+  const handleRegenerateBody = async () => {
+    if (!currentVideoId || currentVideoIsError || isRegeneratingBody) return
+    if (audioUrl || isAudioActive) {
+      alert('Video đã có audio hoặc audio đang được tạo. Không thể thay lời đọc lúc này.')
+      return
+    }
+    const confirmed = window.confirm(
+      'Hệ thống sẽ viết lại toàn bộ lời đọc INTRO, BODY và OUTRO bằng prompt của phiên bản video. Metadata, thumbnail và các phần khác vẫn được giữ nguyên. Tiếp tục?'
+    )
+    if (!confirmed) return
+
+    setIsRegeneratingBody(true)
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/body-revision/regenerate`,
+        { method: 'POST' }
+      )
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể tạo lại lời đọc.')
+      }
+      setBodyRevision(data.revision || null)
+      setBodyRevisionRefreshKey(value => value + 1)
+    } catch (error) {
+      setIsRegeneratingBody(false)
+      alert('Lỗi: ' + (error?.message || String(error)))
+    }
+  }
+
+  const handleApplyBodyRevision = async () => {
+    if (!currentVideoId || !bodyRevision?.can_apply || isApplyingBodyRevision) return
+    const confirmed = window.confirm(
+      'Áp dụng lời đọc mới vào video này? INTRO, BODY và OUTRO sẽ được thay đồng thời; metadata, thumbnail và các phần khác giữ nguyên.'
+    )
+    if (!confirmed) return
+
+    setIsApplyingBodyRevision(true)
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/body-revision/apply`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ revision_id: bodyRevision.id })
+        }
+      )
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.detail || data.error || 'Không thể áp dụng lời đọc mới.')
+      }
+      setResultText(data.script || resultText)
+      setBodyRevision(data.revision || null)
+      if (data.audio_review) setAudioReview(data.audio_review)
+      setBodyRevisionRefreshKey(value => value + 1)
+    } catch (error) {
+      alert('Lỗi: ' + (error?.message || String(error)))
+    } finally {
+      setIsApplyingBodyRevision(false)
+    }
+  }
+
   const handleGenerateAudio = async () => {
     if (!currentVideoId || currentVideoIsError) return;
     if (audioReview && !audioReview.can_approve) {
@@ -1579,6 +1697,61 @@ function App() {
       }
     } catch {
       alert('Không thể kết nối Backend.');
+    } finally {
+      setIsGenAudio(keepPolling);
+    }
+  };
+
+  const handleConfirmExpandedAudio = async () => {
+    if (!currentVideoId || currentVideoIsError || isGenAudio) return;
+    const reviewItems = Array.isArray(audioReview?.review_required)
+      ? audioReview.review_required
+      : [];
+    if (
+      reviewItems.length === 0 ||
+      reviewItems.some(item => item.code !== 'excessive_source_expansion')
+    ) return;
+
+    const ratio = Number(audioReview?.metrics?.source_expansion_ratio || 0);
+    const confirmed = window.confirm(
+      `Lời đọc dài gấp ${ratio.toLocaleString('vi-VN', { maximumFractionDigits: 2 })} lần transcript nguồn. ` +
+      'Việc tạo audio có thể tốn nhiều thời gian, tài nguyên hoặc chi phí. Bạn xác nhận tiếp tục?'
+    );
+    if (!confirmed) return;
+
+    setIsGenAudio(true);
+    let keepPolling = false;
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8080/api/videos/${currentVideoId}/audio-review/approve`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            confirm_credit_charge: true,
+            voice_id: currentVideoVoiceId || ''
+          })
+        }
+      );
+      const data = await response.json();
+      if (data.audio_review) setAudioReview(data.audio_review);
+      if (!response.ok || !data.success) {
+        applyAudioTask(data.audio_task);
+        throw new Error(data.detail || data.error || 'Không thể xác nhận và tạo audio.');
+      }
+
+      applyAudioTask(data.audio_task);
+      const status = data.audio_task?.status || 'pending';
+      keepPolling = status === 'pending' || status === 'processing';
+      if (status === 'completed') {
+        const videoResponse = await fetch(
+          `http://127.0.0.1:8080/api/videos/${currentVideoId}`
+        );
+        const video = await videoResponse.json();
+        setResultText(video.generated_script);
+      }
+    } catch (error) {
+      alert('Lỗi: ' + (error?.message || String(error)));
     } finally {
       setIsGenAudio(keepPolling);
     }
@@ -1861,9 +2034,14 @@ function App() {
         `http://127.0.0.1:8080/api/videos/${currentVideoId}/retry-new-flow-canvas`,
         { method: 'POST' }
       );
-      const data = await response.json();
+      let data = {};
+      try {
+        data = await response.json();
+      } catch {
+        data = {};
+      }
       if (!response.ok || !data.success) {
-        throw new Error(data.detail || data.error || 'Không thể tạo Canvas Flow mới.');
+        throw new Error(data.detail || data.error || `Lỗi máy chủ (${response.status})`);
       }
       alert(data.message || 'Đã tạo Canvas mới và tiếp tục chạy.');
       const statusRes = await fetch(`http://127.0.0.1:8080/api/videos/${currentVideoId}/render-status`);
@@ -2123,7 +2301,7 @@ function App() {
     
     if (mainScriptContent) {
       sections.unshift({
-        title: 'NỘI DUNG KỊCH BẢN',
+        title: 'LỜI ĐỌC HOÀN CHỈNH (INTRO · BODY · OUTRO)',
         content: mainScriptContent
       });
     }
@@ -3345,6 +3523,12 @@ function App() {
                         submitting={isGenAudio}
                         voiceName={getVoiceName(currentVideoVoiceId, currentVideoVoiceName)}
                         hasAudio={Boolean(audioUrl)}
+                        onConfirmExpansion={handleConfirmExpandedAudio}
+                        bodyRevision={bodyRevision}
+                        regeneratingBody={isRegeneratingBody}
+                        applyingBodyRevision={isApplyingBodyRevision}
+                        onRegenerateBody={handleRegenerateBody}
+                        onApplyBodyRevision={handleApplyBodyRevision}
                       />
                     )}
 
@@ -4745,7 +4929,7 @@ function App() {
                         
                         {activeTab === 'summary' ? (
                           parsedSections.map((section, idx) => {
-                            const isMainContent = section.title === 'NỘI DUNG KỊCH BẢN' || section.title === 'KỊCH BẢN CHÍNH';
+                            const isMainContent = section.title === 'LỜI ĐỌC HOÀN CHỈNH (INTRO · BODY · OUTRO)' || section.title === 'NỘI DUNG KỊCH BẢN' || section.title === 'KỊCH BẢN CHÍNH';
                             const isThumbnail = section.title.toUpperCase().includes('THUMBNAIL');
 
                             // Parse [IMAGE_URL:...] from content

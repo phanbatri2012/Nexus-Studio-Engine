@@ -12,7 +12,7 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException
 
 from nexus_engine.services import maintenance_guard
-from nexus_engine.services.system_cleaner import SystemCleaner
+from nexus_engine.services.system_cleaner import CleanupSummary, SystemCleaner
 
 
 UTC = datetime.timezone.utc
@@ -757,6 +757,7 @@ def test_cleanup_api_returns_sanitized_409(monkeypatch: pytest.MonkeyPatch):
 def test_cleanup_api_returns_preallocated_manifest_id(monkeypatch: pytest.MonkeyPatch):
     from nexus_engine import main
 
+    main._system_cleanup_runs.clear()
     monkeypatch.setattr(
         main.maintenance_guard,
         "get_cleanup_status",
@@ -766,7 +767,175 @@ def test_cleanup_api_returns_preallocated_manifest_id(monkeypatch: pytest.Monkey
 
     response = asyncio.run(main.run_system_cleanup_endpoint(background_tasks))
 
-    assert response["status"] == "ok"
+    assert response["status"] == "queued"
     assert response["manifest_id"]
+    assert response["run"]["status"] == "queued"
     assert len(background_tasks.tasks) == 1
     assert main.SYSTEM_CLEANUP_INTERVAL_SECONDS == 24 * 60 * 60
+    assert main.SYSTEM_CLEANUP_RETRY_INTERVAL_SECONDS == 60 * 60
+    assert main.SYSTEM_CLEANUP_MAX_RETRIES == 23
+
+
+def test_scheduled_cleanup_retries_busy_window_until_safe(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nexus_engine import main
+
+    waits: list[int] = []
+
+    class StopEvent:
+        def wait(self, seconds: int) -> bool:
+            waits.append(seconds)
+            return len(waits) >= 3
+
+    statuses = iter(
+        [
+            {
+                "safe_to_cleanup": False,
+                "total_blocking_jobs": 1,
+                "blocking_jobs": [
+                    {"type": "system_job", "id": "busy", "status": "running"}
+                ],
+                "verification_errors": [],
+            },
+            _safe_cleanup_status(),
+        ]
+    )
+    cleanup_calls: list[dict] = []
+    summary = CleanupSummary(
+        timestamp="2026-11-14T00:00:00+00:00",
+        dry_run=False,
+    )
+    monkeypatch.setattr(main, "_system_cleanup_stop_event", StopEvent())
+    monkeypatch.setattr(
+        main.maintenance_guard,
+        "get_cleanup_status",
+        lambda: next(statuses),
+    )
+    monkeypatch.setattr(
+        main.system_cleaner,
+        "run_full_cleanup",
+        lambda **kwargs: cleanup_calls.append(kwargs) or summary,
+    )
+
+    main._system_cleanup_scheduler()
+
+    assert cleanup_calls == [{"dry_run": False, "vacuum_db": True}]
+    assert waits == [
+        main.SYSTEM_CLEANUP_INTERVAL_SECONDS,
+        main.SYSTEM_CLEANUP_RETRY_INTERVAL_SECONDS,
+        main.SYSTEM_CLEANUP_INTERVAL_SECONDS,
+    ]
+
+
+def test_scheduled_cleanup_retry_window_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nexus_engine import main
+
+    waits: list[int] = []
+    probe_count = 0
+
+    class StopEvent:
+        def wait(self, seconds: int) -> bool:
+            waits.append(seconds)
+            return len(waits) >= 4
+
+    def busy_status() -> dict:
+        nonlocal probe_count
+        probe_count += 1
+        return {
+            "safe_to_cleanup": False,
+            "total_blocking_jobs": 1,
+            "blocking_jobs": [],
+            "verification_errors": [],
+        }
+
+    monkeypatch.setattr(main, "_system_cleanup_stop_event", StopEvent())
+    monkeypatch.setattr(main, "SYSTEM_CLEANUP_MAX_RETRIES", 2)
+    monkeypatch.setattr(main.maintenance_guard, "get_cleanup_status", busy_status)
+
+    main._system_cleanup_scheduler()
+
+    assert probe_count == 3
+    assert waits == [
+        main.SYSTEM_CLEANUP_INTERVAL_SECONDS,
+        main.SYSTEM_CLEANUP_RETRY_INTERVAL_SECONDS,
+        main.SYSTEM_CLEANUP_RETRY_INTERVAL_SECONDS,
+        main.SYSTEM_CLEANUP_INTERVAL_SECONDS,
+    ]
+
+
+def test_cleanup_background_run_exposes_sanitized_completion(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nexus_engine import main
+
+    main._system_cleanup_runs.clear()
+    monkeypatch.setattr(
+        main.maintenance_guard,
+        "get_cleanup_status",
+        _safe_cleanup_status,
+    )
+    summary = CleanupSummary(
+        timestamp="2026-11-14T00:00:00+00:00",
+        dry_run=False,
+        policy={"cleanup_scope_root": str(Path(main.DATA_DIR).parent)},
+    )
+    summary.manifest_path = str(Path(main.DATA_DIR) / "secret-local-path.json")
+    summary.policy["cleanup_scope_root"] = str(Path(main.DATA_DIR).parent)
+    monkeypatch.setattr(
+        main.system_cleaner,
+        "run_full_cleanup",
+        lambda **_kwargs: summary,
+    )
+    background_tasks = BackgroundTasks()
+    queued = asyncio.run(main.run_system_cleanup_endpoint(background_tasks))
+
+    asyncio.run(background_tasks())
+    response = asyncio.run(
+        main.get_system_cleanup_run_endpoint(queued["manifest_id"])
+    )
+
+    assert response["run"]["status"] == "completed"
+    assert "manifest_path" not in response["run"]["summary"]
+    assert "cleanup_scope_root" not in response["run"]["summary"]["policy"]
+
+
+def test_cleanup_status_endpoint_filters_blocker_payload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nexus_engine import main
+
+    monkeypatch.setattr(
+        main.maintenance_guard,
+        "get_cleanup_status",
+        lambda: {
+            "safe_to_cleanup": False,
+            "status_verified": True,
+            "total_blocking_jobs": 1,
+            "blocking_jobs": [
+                {
+                    "type": "system_job",
+                    "id": "job-2",
+                    "status": "running",
+                    "job_type": "comment_draft",
+                    "payload": {"token": "must-not-leak"},
+                }
+            ],
+            "verification_errors": [],
+            "reasons": ["1 active task"],
+        },
+    )
+
+    response = asyncio.run(main.get_system_cleanup_status_endpoint())
+
+    assert response["cleanup_status"]["blocking_jobs"] == [
+        {
+            "type": "system_job",
+            "id": "job-2",
+            "status": "running",
+            "job_type": "comment_draft",
+        }
+    ]
+    assert "must-not-leak" not in json.dumps(response)

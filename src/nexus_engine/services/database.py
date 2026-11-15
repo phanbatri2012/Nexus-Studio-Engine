@@ -186,6 +186,30 @@ def _is_likely_slug(val: str) -> bool:
     return bool(re.match(r"^[a-z0-9\-_]+$", v))
 
 
+def _looks_like_thinking_or_meta(val: str) -> bool:
+    v = str(val or "").strip()
+    if not v:
+        return True
+    lower = v.lower()
+    thinking_starters = (
+        "calculat", "optimiz", "craft", "compos", "translat", "brainstorm",
+        "clarif", "structur", "formulat", "outlin", "detail", "examin", "process",
+        "reason", "expand", "fram", "connect", "organiz", "decid", "determin",
+        "select", "plan", "construct", "build", "prepar", "address", "resolv",
+        "revis", "adjust", "finaliz", "complet", "validat", "confirm", "consid",
+        "weigh", "delv", "highlight", "focus", "extract", "synthesiz", "summariz",
+        "generat", "creat", "verif", "check", "search", "analyz", "research",
+        "look up", "refin", "draft", "explor", "review", "find", "gather",
+        "evaluat", "investigat", "thought for", "worked for", "thinking", "stopped thinking",
+        "đang suy nghĩ", "đã suy nghĩ", "đã dừng suy nghĩ",
+    )
+    if any(lower.startswith(starter) for starter in thinking_starters):
+        return True
+    if re.search(r"\b(?:title length|audio story|youtube title|ctr|seo keywords)\b", lower):
+        return True
+    return False
+
+
 def extract_generated_video_title(generated_script: str) -> str:
     if not generated_script:
         return ""
@@ -199,17 +223,17 @@ def extract_generated_video_title(generated_script: str) -> str:
             label, separator, inline_value = line_clean.partition(":")
             if separator and _normalize_metadata_label(label) in GENERATED_TITLE_LABELS:
                 title = _clean_generated_title(inline_value)
-                if title and not _looks_like_outro_or_cta(title):
+                if title and not _looks_like_outro_or_cta(title) and not _looks_like_thinking_or_meta(title):
                     return title
             cleaned = _clean_generated_title(line_clean)
-            if cleaned and not _looks_like_outro_or_cta(cleaned):
+            if cleaned and not _looks_like_outro_or_cta(cleaned) and not _looks_like_thinking_or_meta(cleaned):
                 return cleaned
 
         # Fallback: if lines in TITLE section were long paragraphs, extract the first sentence
         for line in lines:
             line_clean = line.strip("#*` ")
             first_sentence = _clean_generated_title(re.split(r"[.!?\n]", line_clean)[0])
-            if first_sentence and len(first_sentence) <= 100 and not _looks_like_outro_or_cta(first_sentence):
+            if first_sentence and len(first_sentence) <= 100 and not _looks_like_outro_or_cta(first_sentence) and not _looks_like_thinking_or_meta(first_sentence):
                 return first_sentence
 
     # Fallback: Check if SLUG section contains a title if title section was empty or outro
@@ -236,7 +260,7 @@ def extract_generated_video_title(generated_script: str) -> str:
 
         if separator:
             title = _clean_generated_title(inline_value)
-            if title and not _looks_like_outro_or_cta(title):
+            if title and not _looks_like_outro_or_cta(title) and not _looks_like_thinking_or_meta(title):
                 return title
 
         for following_line in lines[index + 1:]:
@@ -265,7 +289,7 @@ def extract_generated_video_title(generated_script: str) -> str:
                 "THUMBNAIL",
             }:
                 break
-            if not _looks_like_outro_or_cta(candidate):
+            if not _looks_like_outro_or_cta(candidate) and not _looks_like_thinking_or_meta(candidate):
                 return candidate
     return ""
 
@@ -944,6 +968,45 @@ def init_db():
             FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS script_body_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id INTEGER NOT NULL,
+            job_id TEXT NOT NULL DEFAULT '',
+            base_script_hash TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT 'body',
+            original_body TEXT NOT NULL,
+            original_narration TEXT NOT NULL DEFAULT '',
+            candidate_body TEXT NOT NULL DEFAULT '',
+            candidate_body_hash TEXT NOT NULL DEFAULT '',
+            candidate_narration TEXT NOT NULL DEFAULT '',
+            candidate_narration_hash TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'queued',
+            report_json TEXT NOT NULL DEFAULT '{}',
+            chat_url TEXT NOT NULL DEFAULT '',
+            prompt_version TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(video_id) REFERENCES videos(id) ON DELETE CASCADE
+        )
+    ''')
+    c.execute(
+        'CREATE INDEX IF NOT EXISTS idx_script_body_revisions_video '
+        'ON script_body_revisions(video_id, created_at DESC)'
+    )
+    for column_definition in (
+        "scope TEXT NOT NULL DEFAULT 'body'",
+        "original_narration TEXT NOT NULL DEFAULT ''",
+        "candidate_narration TEXT NOT NULL DEFAULT ''",
+        "candidate_narration_hash TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            c.execute(
+                f"ALTER TABLE script_body_revisions ADD COLUMN {column_definition}"
+            )
+        except sqlite3.OperationalError:
+            pass
     c.execute('''
         CREATE TABLE IF NOT EXISTS metadata_reviews (
             video_id INTEGER PRIMARY KEY,
@@ -3240,6 +3303,7 @@ def delete_video_with_dependencies(video_id: int) -> dict | None:
         conn.execute("DELETE FROM video_publications WHERE video_id = ?", (video_id,))
         conn.execute("DELETE FROM system_jobs WHERE video_id = ?", (video_id,))
         conn.execute("DELETE FROM audio_reviews WHERE video_id = ?", (video_id,))
+        conn.execute("DELETE FROM script_body_revisions WHERE video_id = ?", (video_id,))
         conn.execute("DELETE FROM audio_tasks WHERE video_id = ?", (video_id,))
         conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
         conn.execute("COMMIT")
@@ -4303,6 +4367,230 @@ def list_audio_reviews(limit: int | None = 100) -> list[dict]:
         review.pop("report_json", None)
         reviews.append(review)
     return reviews
+
+
+def _decode_script_body_revision(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    revision = dict(row)
+    try:
+        revision["report"] = json.loads(revision.get("report_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        revision["report"] = {}
+    revision.pop("report_json", None)
+    return revision
+
+
+def create_script_body_revision(
+    *,
+    video_id: int,
+    job_id: str,
+    base_script_hash: str,
+    original_body: str,
+    prompt_version: str,
+    scope: str = "body",
+    original_narration: str = "",
+) -> dict:
+    now = utc_now()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.execute(
+            '''
+            INSERT INTO script_body_revisions (
+                video_id, job_id, base_script_hash, scope, original_body,
+                original_narration, candidate_body, candidate_body_hash,
+                candidate_narration, candidate_narration_hash, status, report_json,
+                chat_url, prompt_version, created_at, updated_at, applied_at
+            ) VALUES (?, ?, ?, ?, ?, ?, '', '', '', '', 'queued', '{}', '', ?, ?, ?, '')
+            ''',
+            (
+                int(video_id),
+                str(job_id or ""),
+                str(base_script_hash or ""),
+                str(scope or "body"),
+                str(original_body or ""),
+                str(original_narration or ""),
+                str(prompt_version or ""),
+                now,
+                now,
+            ),
+        )
+        revision_id = int(cursor.lastrowid)
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM script_body_revisions WHERE id = ?",
+            (revision_id,),
+        ).fetchone()
+        return _decode_script_body_revision(row) or {}
+    finally:
+        conn.close()
+
+
+SCRIPT_BODY_REVISION_MUTABLE_FIELDS = {
+    "candidate_body",
+    "candidate_body_hash",
+    "candidate_narration",
+    "candidate_narration_hash",
+    "status",
+    "report_json",
+    "chat_url",
+    "job_id",
+    "applied_at",
+}
+
+
+def update_script_body_revision(revision_id: int, **changes) -> dict | None:
+    invalid = set(changes) - SCRIPT_BODY_REVISION_MUTABLE_FIELDS
+    if invalid:
+        raise ValueError(f"Unsupported script body revision fields: {sorted(invalid)}")
+    if not changes:
+        return get_script_body_revision(revision_id)
+    encoded = dict(changes)
+    if "report_json" in encoded and not isinstance(encoded["report_json"], str):
+        encoded["report_json"] = json.dumps(encoded["report_json"], ensure_ascii=False)
+    encoded["updated_at"] = utc_now()
+    assignments = ", ".join(f"{field} = ?" for field in encoded)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    try:
+        conn.execute(
+            f"UPDATE script_body_revisions SET {assignments} WHERE id = ?",
+            (*encoded.values(), int(revision_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_script_body_revision(revision_id)
+
+
+def get_script_body_revision(revision_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM script_body_revisions WHERE id = ?",
+            (int(revision_id),),
+        ).fetchone()
+        return _decode_script_body_revision(row)
+    finally:
+        conn.close()
+
+
+def get_script_body_revision_by_job_id(job_id: str) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM script_body_revisions WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+            (str(job_id or ""),),
+        ).fetchone()
+        return _decode_script_body_revision(row)
+    finally:
+        conn.close()
+
+
+def delete_script_body_revision(revision_id: int) -> bool:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    try:
+        cursor = conn.execute(
+            "DELETE FROM script_body_revisions WHERE id = ?",
+            (int(revision_id),),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def get_latest_script_body_revision(video_id: int) -> dict | None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            '''
+            SELECT * FROM script_body_revisions
+            WHERE video_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            ''',
+            (int(video_id),),
+        ).fetchone()
+        return _decode_script_body_revision(row)
+    finally:
+        conn.close()
+
+
+def apply_script_body_revision(
+    revision_id: int,
+    *,
+    expected_script: str,
+    new_script: str,
+) -> dict | None:
+    """Apply one draft only when the video script still equals its base snapshot."""
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        revision = conn.execute(
+            "SELECT * FROM script_body_revisions WHERE id = ?",
+            (int(revision_id),),
+        ).fetchone()
+        if revision is None:
+            conn.execute("ROLLBACK")
+            return None
+        if revision["status"] not in {"draft", "needs_review"}:
+            raise ValueError("Revision kịch bản không còn ở trạng thái có thể áp dụng.")
+
+        video = conn.execute(
+            "SELECT url, title, generated_script FROM videos WHERE id = ?",
+            (int(revision["video_id"]),),
+        ).fetchone()
+        if video is None:
+            raise ValueError("Video của revision không còn tồn tại.")
+        if str(video["generated_script"] or "") != str(expected_script or ""):
+            raise ValueError("Kịch bản đã thay đổi sau khi tạo revision; không ghi đè tự động.")
+
+        generated_title = extract_generated_video_title(new_script)
+        cursor = conn.execute(
+            '''
+            UPDATE videos
+            SET generated_script = ?, generated_title = ?, search_text = ?
+            WHERE id = ? AND generated_script = ?
+            ''',
+            (
+                new_script,
+                generated_title,
+                build_video_search_text(
+                    video["url"],
+                    video["title"],
+                    new_script,
+                    generated_title,
+                ),
+                int(revision["video_id"]),
+                expected_script,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("Kịch bản đã thay đổi đồng thời; không ghi đè tự động.")
+
+        now = utc_now()
+        conn.execute(
+            '''
+            UPDATE script_body_revisions
+            SET status = 'applied', applied_at = ?, updated_at = ?
+            WHERE id = ?
+            ''',
+            (now, now, int(revision_id)),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return get_script_body_revision(revision_id)
 
 
 def get_metadata_review(video_id: int) -> dict | None:
@@ -5531,6 +5819,95 @@ def claim_next_system_job(job_type: str) -> dict | None:
                 uses_scheduled_retry,
                 uses_scheduled_retry,
             ),
+        ).fetchone()
+        if row is None:
+            conn.execute("COMMIT")
+            return None
+        if (
+            row["status"] == "retry_wait"
+            and row["next_retry_at"]
+            and row["next_retry_at"] > now
+        ):
+            conn.execute("COMMIT")
+            return None
+        conn.execute(
+            '''
+            UPDATE system_jobs
+            SET status = 'running', progress = ?, attempt = attempt + 1,
+                error = '', started_at = ?, finished_at = '', next_retry_at = '', updated_at = ?
+            WHERE id = ? AND status IN ('queued', 'retry_wait')
+            ''',
+            ("Đang khởi động", now, now, row["id"]),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return get_system_job(row["id"])
+
+
+def claim_next_system_job_types(job_types: tuple[str, ...]) -> dict | None:
+    """Atomically claim the oldest runnable job across a bounded type group."""
+
+    from nexus_engine.services import drain_mode
+
+    normalized_types = tuple(dict.fromkeys(str(item or "").strip() for item in job_types))
+    normalized_types = tuple(item for item in normalized_types if item)
+    if not normalized_types or drain_mode.is_drain_mode_active():
+        return None
+    if len(normalized_types) == 1:
+        return claim_next_system_job(normalized_types[0])
+
+    now = utc_now()
+    type_placeholders = ", ".join("?" for _ in normalized_types)
+    scheduled_types = tuple(
+        item for item in normalized_types if item in SCHEDULED_RETRY_JOB_TYPES
+    )
+    if scheduled_types:
+        scheduled_placeholders = ", ".join("?" for _ in scheduled_types)
+        scheduled_expression = f"job_type IN ({scheduled_placeholders})"
+    else:
+        scheduled_expression = "0"
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        params = (
+            *normalized_types,
+            *scheduled_types,
+            now,
+            *scheduled_types,
+            *scheduled_types,
+        )
+        row = conn.execute(
+            f'''
+            SELECT * FROM system_jobs
+            WHERE job_type IN ({type_placeholders}) AND cancel_requested = 0
+              AND status IN ('queued', 'retry_wait')
+              AND (
+                  NOT ({scheduled_expression})
+                  OR status = 'queued'
+                  OR next_retry_at = '' OR next_retry_at <= ?
+              )
+              AND (
+                  video_id IS NULL OR EXISTS (
+                      SELECT 1 FROM videos
+                      WHERE videos.id = system_jobs.video_id
+                        AND videos.video_status = 'active'
+                  )
+              )
+            ORDER BY
+                CASE WHEN ({scheduled_expression}) AND status = 'queued' THEN 0 ELSE 1 END,
+                CASE WHEN ({scheduled_expression})
+                    THEN COALESCE(NULLIF(next_retry_at, ''), created_at)
+                    ELSE created_at END ASC,
+                created_at ASC
+            LIMIT 1
+            ''',
+            params,
         ).fetchone()
         if row is None:
             conn.execute("COMMIT")

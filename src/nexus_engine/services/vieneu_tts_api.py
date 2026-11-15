@@ -31,7 +31,10 @@ def _error(exc: Exception, *, status_code: int = 400) -> HTTPException:
 @router.get("/providers/vieneu_v3_turbo/profiles")
 def list_vieneu_profiles():
     try:
-        return {"items": vieneu_tts.api_voices()}
+        remote = tts_registry.get_provider(
+            voice_config.VIENEU_PROVIDER_ID
+        ).list_remote_voices()
+        return {"items": remote.get("profiles", [])}
     except Exception as exc:
         raise _error(exc, status_code=503) from exc
 

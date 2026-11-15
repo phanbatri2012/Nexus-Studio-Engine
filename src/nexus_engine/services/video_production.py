@@ -2401,6 +2401,25 @@ async def _generate_scene_video_async(
             existing.get("content_hash"),
         )
 
+    target = SCENES_DIR / f"{video_id}_{scene['index']}_video_{content_hash[:8]}.mp4"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if not force_new_project and target.exists() and target.stat().st_size > 1000:
+        try:
+            probe_check = probe_scene_video(target)
+            if probe_check and probe_check.get("duration_seconds", 0) > 0.5:
+                cached_hash = _sha256_file(target)
+                if existing_video_hashes is None or cached_hash not in existing_video_hashes:
+                    logger.info(
+                        "Reusing valid existing target video for video=%s scene=%s: %s",
+                        video_id,
+                        scene.get("index"),
+                        target,
+                    )
+                    return target
+        except Exception:
+            pass
+
     terminal_reason = str(existing_metadata.get("reason_code") or "")
     if (
         not force_new_project
@@ -2425,8 +2444,6 @@ async def _generate_scene_video_async(
             cached_error or "Google Flow đã từ chối yêu cầu tạo video."
         )
 
-    target = SCENES_DIR / f"{video_id}_{scene['index']}_video_{content_hash[:8]}.mp4"
-    target.parent.mkdir(parents=True, exist_ok=True)
     previous_attempt = int(existing_metadata.get("generation_attempt") or 0)
     generation_attempt = (
         previous_attempt if is_reconciliation_checkpoint else previous_attempt + 1
@@ -3561,6 +3578,64 @@ def generate_scene_media(
                 artifact_type = f"scene_video:{scene_index}"
                 current_artifact = artifact_snapshot.get(artifact_type)
                 current_status = str((current_artifact or {}).get("status") or "")
+
+                # Preflight validation: reuse valid existing scene video on disk
+                existing_video_path = None
+                if current_artifact and current_artifact.get("path"):
+                    art_p = Path(current_artifact["path"])
+                    if art_p.is_file() and art_p.stat().st_size > 1000:
+                        existing_video_path = art_p
+                if not existing_video_path:
+                    for cand in SCENES_DIR.glob(f"{video_id}_{scene_index}_video_*.mp4"):
+                        if cand.is_file() and cand.stat().st_size > 1000:
+                            existing_video_path = cand
+                            break
+
+                if existing_video_path and not force_new_project:
+                    try:
+                        probe_info = probe_scene_video(existing_video_path)
+                        if probe_info and float(probe_info.get("duration_seconds") or 0) > 0.5:
+                            cand_hash = _sha256_file(existing_video_path)
+                            if cand_hash not in video_hashes:
+                                video_paths[index] = existing_video_path
+                                video_hashes.add(cand_hash)
+                                summary["generated_count"] += 1
+                                if current_status != "completed":
+                                    expected_hash = str(
+                                        (current_artifact or {}).get("content_hash") or cand_hash
+                                    )
+                                    artifact_snapshot[artifact_type] = db.upsert_video_artifact(
+                                        video_id=video_id,
+                                        artifact_type=artifact_type,
+                                        path=str(existing_video_path),
+                                        content_hash=expected_hash,
+                                        status="completed",
+                                        mime_type="video/mp4",
+                                        size_bytes=existing_video_path.stat().st_size,
+                                        duration_seconds=float(probe_info.get("duration_seconds", 4.0)),
+                                        width=int(probe_info.get("width", 1280)),
+                                        height=int(probe_info.get("height", 720)),
+                                        codecs={"video_codec": str(probe_info.get("video_codec", "h264"))},
+                                        metadata={
+                                            **((current_artifact or {}).get("metadata") or {}),
+                                            **scene,
+                                            "completed_at": db.utc_now(),
+                                        },
+                                    )
+                                logger.info(
+                                    "flow_generation media=video scene=%s reused_existing_valid_video path=%s",
+                                    scene_index,
+                                    existing_video_path,
+                                )
+                                continue
+                    except Exception as probe_err:
+                        logger.warning(
+                            "Existing scene video validation failed for video=%s scene=%s: %s",
+                            video_id,
+                            scene_index,
+                            probe_err,
+                        )
+
                 image_remote, video_remote = remote_counts()
                 can_advance = current_status in {"completed", "queued", "failed"}
                 if not can_advance and (
@@ -4418,6 +4493,7 @@ def _plan_video_extension(
     source_duration: float,
     target_duration: float,
     has_fallback_image: bool,
+    preserve_video: bool = False,
 ) -> dict:
     """Choose a deterministic, non-looping strategy for one video segment."""
     source = float(source_duration or 0.0)
@@ -4472,7 +4548,7 @@ def _plan_video_extension(
 
     slowed_duration = source * VIDEO_MAX_DURATION_FACTOR
     remaining = max(0.0, target - slowed_duration)
-    if remaining <= VIDEO_MAX_HOLD_AFTER_SLOWDOWN_SECONDS:
+    if remaining <= VIDEO_MAX_HOLD_AFTER_SLOWDOWN_SECONDS or preserve_video:
         return {
             **common,
             "strategy": "slowdown_then_hold",
@@ -4566,10 +4642,16 @@ def _render_segments(
                         f"Clip scene {index + 1} bị lỗi và không có ảnh fallback hợp lệ."
                     )
                 source_duration = 0.0
+            scene_preserve = bool(
+                scene.get("is_video")
+                or scene.get("media_type") == "video"
+                or scene.get("preserve_video", True)
+            )
             extension_plan = _plan_video_extension(
                 source_duration=source_duration,
                 target_duration=float(scene["duration"]),
                 has_fallback_image=fallback_available,
+                preserve_video=scene_preserve,
             )
             if extension_plan["strategy"] == "degraded_to_image":
                 effective_media_path = Path(fallback_image_path)

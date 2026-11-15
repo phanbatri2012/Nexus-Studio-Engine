@@ -26,10 +26,12 @@ class DialogueSegment(TypedDict):
     characters: int
 
 
-# Pattern nhận diện tag vai ở đầu câu/lượt thoại: [MC]:, [KHACH_1]:, [Khách 1]:, [Host]:, etc.
+# Pattern nhận diện tag vai ở đầu câu/lượt thoại:
+# 1. Dạng chuẩn có ngoặc: [MC]:, [KHACH_1]:, [Khách 1]:, [Host]:, etc. (kèm hỗ trợ LaTeX escape: \[MC\]:)
+# 2. Dạng không có ngoặc ở đầu dòng: MC:, KHACH_1:, KHACH_2:, HOST:, GUEST_1:, etc.
 DIALOGUE_TAG_REGEX = re.compile(
-    r'\[([A-Za-z0-9_\u00C0-\u024F\u1EA0-\u1EF9\s\-]+)\]\s*:\s*',
-    flags=re.IGNORECASE
+    r'(?:\\?\[([A-Za-z0-9_\u00C0-\u024F\u1EA0-\u1EF9\s\-]+)\\?\]|^\s*(MC|HOST|KHACH_\d+|KHACH\s*\d+|GUEST_\d+|GUEST\s*\d+|NGUOI_DAN|KHACH_MOI(?:_\d+)?))\s*:\s*',
+    flags=re.IGNORECASE | re.MULTILINE
 )
 
 # Pattern ngắt câu chuẩn mực cho OmniVoice (không cắt ngang số từ thô)
@@ -62,7 +64,8 @@ def is_dialogue_script(script_text: str) -> bool:
     """Kiểm tra xem kịch bản có chứa các tag đối thoại hay không."""
     if not script_text or not isinstance(script_text, str):
         return False
-    return bool(DIALOGUE_TAG_REGEX.search(script_text))
+    normalized = unicodedata.normalize("NFKC", script_text)
+    return bool(DIALOGUE_TAG_REGEX.search(normalized))
 
 
 def clean_turn_text_for_tts(text: str) -> str:
@@ -81,6 +84,7 @@ def clean_turn_text_for_tts(text: str) -> str:
         return ""
     cleaned = html.unescape(text.strip())
     cleaned = cleaned.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
+    cleaned = unicodedata.normalize("NFKC", cleaned)
     
     # Loại bỏ thẻ Canvas directive :::writing...:::
     cleaned = re.sub(r":::[a-zA-Z0-9_\-]*(?:\{[^}]*\})?", "", cleaned, flags=re.DOTALL)
@@ -91,17 +95,17 @@ def clean_turn_text_for_tts(text: str) -> str:
     cleaned = re.sub(r'###\s*\[[^\]]+\]', '', cleaned)
     cleaned = re.sub(r'\[PHAN\s*\d+[^\]]*\]', '', cleaned, flags=re.IGNORECASE)
 
-    # Loại bỏ tag vai nếu còn sót ở đầu chuỗi: [MC]:, [KHACH_1]:, MC:, Khách:
+    # Loại bỏ tag vai nếu còn sót ở đầu chuỗi: [MC]:, \[MC\]:, [KHACH_1]:, MC:, Khách:
     cleaned = re.sub(
-        r'^\s*\[?(?:MC|HOST|KHACH(?:_\d+)?|GUEST(?:_\d+)?|NGUOI_DAN|KHACH_MOI(?:_\d+)?)\]?\s*:\s*',
+        r'^\s*\\?\[?(?:MC|HOST|KHACH(?:_\d+)?|GUEST(?:_\d+)?|NGUOI_DAN|KHACH_MOI(?:_\d+)?)\\?\]?\s*:\s*',
         '',
         cleaned,
         flags=re.IGNORECASE
     )
 
-    # Loại bỏ các tag vai kỹ thuật bị lọt vào giữa câu văn: [MC], [KHACH_1], [GUEST], etc.
+    # Loại bỏ các tag vai kỹ thuật bị lọt vào giữa câu văn: [MC], \[MC\], [KHACH_1], [GUEST], etc.
     cleaned = re.sub(
-        r'\[(?:MC|HOST|KHACH(?:_\d+)?|GUEST(?:_\d+)?|NGUOI_DAN|KHACH_MOI(?:_\d+)?)\]',
+        r'\\?\[(?:MC|HOST|KHACH(?:_\d+)?|GUEST(?:_\d+)?|NGUOI_DAN|KHACH_MOI(?:_\d+)?)\\?\]',
         '',
         cleaned,
         flags=re.IGNORECASE
@@ -154,6 +158,7 @@ def sanitize_dialogue_script(script_text: str) -> str:
     # Giải mã HTML entities và chuẩn hóa khoảng trắng Unicode
     script_text = html.unescape(script_text)
     script_text = script_text.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
+    script_text = unicodedata.normalize("NFKC", script_text)
     
     # Loại bỏ thẻ Canvas directive :::writing...:::
     script_text = re.sub(r":::[a-zA-Z0-9_\-]*(?:\{[^}]*\})?", "", script_text, flags=re.DOTALL)
@@ -170,8 +175,10 @@ def sanitize_dialogue_script(script_text: str) -> str:
     # 2. Bảo vệ các tag phân vai hợp lệ ([TAG]:) trước khi làm sạch bên trong câu
     placeholder_map = {}
     def _protect_tag(m):
+        raw_role = m.group(1) or m.group(2)
+        role = normalize_role_tag(raw_role)
         key = f"__DIALOGUE_TAG_{len(placeholder_map)}__"
-        placeholder_map[key] = m.group(0).strip() + " "
+        placeholder_map[key] = f"[{role}]: "
         return key
 
     protected = DIALOGUE_TAG_REGEX.sub(_protect_tag, formatted)
@@ -217,11 +224,13 @@ def parse_dialogue_turns(script_text: str, default_role: str = "MC") -> list[Dia
     if not script_text or not isinstance(script_text, str):
         return []
 
+    normalized_script = unicodedata.normalize("NFKC", script_text)
+
     # Tìm tất cả vị trí xuất hiện của tag vai
-    matches = list(DIALOGUE_TAG_REGEX.finditer(script_text))
+    matches = list(DIALOGUE_TAG_REGEX.finditer(normalized_script))
     if not matches:
         # Nếu là kịch bản đơn thoại thông thường, coi như 1 lượt thoại của default_role
-        cleaned = clean_turn_text_for_tts(script_text)
+        cleaned = clean_turn_text_for_tts(normalized_script)
         if not cleaned:
             return []
         return [{
@@ -234,7 +243,7 @@ def parse_dialogue_turns(script_text: str, default_role: str = "MC") -> list[Dia
     
     # Xử lý đoạn văn bản mở đầu trước khi có tag đầu tiên (nếu có)
     if matches[0].start() > 0:
-        prelude = script_text[:matches[0].start()].strip()
+        prelude = normalized_script[:matches[0].start()].strip()
         cleaned_prelude = clean_turn_text_for_tts(prelude)
         if cleaned_prelude:
             turns.append({
@@ -244,11 +253,11 @@ def parse_dialogue_turns(script_text: str, default_role: str = "MC") -> list[Dia
             })
 
     for i, match in enumerate(matches):
-        raw_role = match.group(1)
+        raw_role = match.group(1) or match.group(2)
         role = normalize_role_tag(raw_role)
         start_pos = match.end()
-        end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(script_text)
-        turn_content = script_text[start_pos:end_pos].strip()
+        end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(normalized_script)
+        turn_content = normalized_script[start_pos:end_pos].strip()
         cleaned_content = clean_turn_text_for_tts(turn_content)
         if cleaned_content:
             turns.append({

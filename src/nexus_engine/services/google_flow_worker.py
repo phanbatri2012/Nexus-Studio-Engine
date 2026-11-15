@@ -2168,6 +2168,7 @@ class GoogleFlowWorker:
                 "flow-ingredient-chip, flow-prompt-box, [role='menu'], flow-upload-card, " +
                 "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker";
             const cardSelector =
+                "flow-grid-tile-container, flow-tile-container, flow-video-tile, " +
                 "flow-media-tile, flow-canvas-tile, flow-canvas-item, " +
                 "[data-media-id], [data-asset-id], [data-testid*='media' i], " +
                 ".media-card, .canvas-tile";
@@ -2280,22 +2281,25 @@ class GoogleFlowWorker:
                     url.toLowerCase().includes('/asb/')
                 );
                 if (posterUrl) identityKeys.push(`poster:${posterUrl}`);
+                const cardAria = card.getAttribute('aria-label') || '';
+                if (cardAria) identityKeys.push(`label:${cardAria.toLowerCase()}`);
                 const stableLabel = `${card.getAttribute('id') || ''}|` +
-                    `${card.getAttribute('data-testid') || ''}|${card.getAttribute('aria-label') || ''}`;
+                    `${card.getAttribute('data-testid') || ''}|${cardAria}`;
                 if (!identityKeys.length && stableLabel !== '||') {
                     identityKeys.push(`card:${stableLabel}`);
                 }
                 if (!identityKeys.length && urls.length) identityKeys.push(`url:${urls[0]}`);
                 if (!identityKeys.length) continue;
 
-                const dedupeKey = assetId || identityKeys[0] || urls[0];
+                const dedupeKey = assetId || (cardAria ? `label:${cardAria}` : '') || identityKeys[0] || urls[0];
                 if (seen.has(dedupeKey)) continue;
                 seen.add(dedupeKey);
                 candidates.push({
-                    src: urls[0] || '',
+                    src: urls[0] || (cardAria ? `flow_canvas_tile:${cardAria}` : ''),
                     urls,
                     matchUrls,
                     assetId,
+                    cardAria,
                     identityKeys,
                     completed,
                     source: card.closest(
@@ -2676,17 +2680,26 @@ class GoogleFlowWorker:
                         )) {
                             queued = true;
                         }
-                        const nodes = Array.from(agent.querySelectorAll(
-                            'flow-video-tile, flow-a2ui-video-option, flow-media-tile, flow-canvas-tile, flow-canvas-item, ' +
+                        let nodes = Array.from(agent.querySelectorAll(
+                            'flow-grid-tile-container, flow-tile-container, flow-video-tile, ' +
+                            'flow-a2ui-video-option, flow-media-tile, flow-canvas-tile, flow-canvas-item, ' +
                             '[data-testid*="media" i], .media-card, .canvas-tile, ' +
                             'video, source[src], ' +
                             '[data-video-url], [data-media-url], [data-download-url], ' +
                             'a[download][href], [data-media-id], [data-asset-id]'
                         ));
+                        if (!nodes.length) {
+                            nodes = Array.from(document.querySelectorAll(
+                                'flow-grid-tile-container:has(flow-video-tile), flow-grid-tile-container, flow-video-tile'
+                            ));
+                        }
                         for (const node of nodes) {
-                            const card = node.closest('[data-media-id], [data-asset-id]') || node;
+                            const card = node.closest(
+                                'flow-grid-tile-container, flow-tile-container, flow-video-tile, [data-media-id], [data-asset-id]'
+                            ) || node;
                             const assetId = card.getAttribute('data-media-id') ||
                                 card.getAttribute('data-asset-id') || '';
+                            const cardAria = card.getAttribute('aria-label') || '';
                             const urls = [];
                             const matchUrls = [];
                             const addUrl = (value, playable) => {
@@ -2722,6 +2735,10 @@ class GoogleFlowWorker:
                                 addUrl(media.getAttribute('data-media-url'), playable);
                                 addUrl(media.getAttribute('data-download-url'), true);
                             }
+                            for (const img of card.querySelectorAll('img[src], img[srcset]')) {
+                                const iUrl = String(img.currentSrc || img.src || '').trim();
+                                if (iUrl && !matchUrls.includes(iUrl)) matchUrls.push(iUrl);
+                            }
                             const state = (
                                 `${card.getAttribute('data-state') || ''} ` +
                                 `${card.getAttribute('data-tile-state') || ''}`
@@ -2734,15 +2751,18 @@ class GoogleFlowWorker:
                             const completed = /completed|complete|ready|succeeded|success/.test(state) ||
                                 /(^|\s)(play|phát|play_arrow|play_circle)(\s|$)/i.test(controls) ||
                                 urls.length > 0;
-                            if (!assetId && !matchUrls.length) continue;
-                            const key = `${assetId}|${matchUrls[0] || ''}`;
+                            if (!assetId && !matchUrls.length && !cardAria) continue;
+                            const key = `${assetId}|${matchUrls[0] || ''}|${cardAria}`;
                             if (seen.has(key)) continue;
                             seen.add(key);
+                            const identityKeys = [];
+                            if (assetId) identityKeys.push(`asset:${assetId}`);
+                            if (matchUrls.length) identityKeys.push(`poster:${matchUrls[0]}`);
+                            if (cardAria) identityKeys.push(`label:${cardAria.toLowerCase()}`);
                             candidates.push({
-                                src: urls[0] || '', urls, matchUrls, assetId,
-                                identityKeys: assetId
-                                    ? [`asset:${assetId}`]
-                                    : (matchUrls.length ? [`poster:${matchUrls[0]}`] : []),
+                                src: urls[0] || (cardAria ? `flow_canvas_tile:${cardAria}` : ''),
+                                urls, matchUrls, assetId, cardAria,
+                                identityKeys,
                                 completed,
                             });
                         }
@@ -5329,17 +5349,55 @@ class GoogleFlowWorker:
         self._inspected_video_detail_keys.add(detail_key)
         payload = {
             "assetId": str(candidate.get("assetId") or ""),
+            "cardAria": str(candidate.get("cardAria") or ""),
             "matchUrls": [
                 str(url or "").strip()
                 for url in candidate.get("matchUrls") or []
                 if str(url or "").strip()
             ],
         }
-        clicked = await self.page.evaluate(
-            r'''({assetId, matchUrls}) => {
+
+        card_aria = str(candidate.get("cardAria") or "").strip()
+        asset_id = str(candidate.get("assetId") or "").strip()
+        clicked = False
+
+        # Try Playwright locator click first for Angular custom elements
+        if card_aria:
+            for selector in [
+                f"flow-grid-tile-container[aria-label*='{card_aria}' i]",
+                f"flow-tile-container[aria-label*='{card_aria}' i]",
+                f"[aria-label*='{card_aria}' i]",
+            ]:
+                loc = self.page.locator(selector).first
+                try:
+                    if await loc.is_visible(timeout=1000):
+                        await loc.click(timeout=3000)
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+
+        if not clicked and asset_id:
+            for selector in [
+                f"[data-media-id='{asset_id}']",
+                f"[data-asset-id='{asset_id}']",
+            ]:
+                loc = self.page.locator(selector).first
+                try:
+                    if await loc.is_visible(timeout=1000):
+                        await loc.click(timeout=3000)
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+
+        if not clicked:
+            clicked = await self.page.evaluate(
+                r'''({assetId, cardAria, matchUrls}) => {
                 const normalizeUrl = (value) => String(value || '').split('?', 1)[0].toLowerCase();
                 const normalizedMatchUrls = matchUrls.map(normalizeUrl);
                 const cards = Array.from(document.querySelectorAll(
+                    "flow-grid-tile-container, flow-tile-container, flow-video-tile, " +
                     "flow-media-tile, flow-canvas-tile, flow-canvas-item, " +
                     "[data-media-id], [data-asset-id], [data-testid*='media' i], " +
                     ".media-card, .canvas-tile"
@@ -5351,6 +5409,7 @@ class GoogleFlowWorker:
                     )) continue;
                     const cardId = card.getAttribute('data-media-id') ||
                         card.getAttribute('data-asset-id') || card.getAttribute('data-id') || '';
+                    const aria = card.getAttribute('aria-label') || '';
                     const cardUrls = Array.from(card.querySelectorAll(
                         "video, source[src], img[src], img[srcset], a[href], " +
                         "[data-video-url], [data-media-url], [data-download-url]"
@@ -5361,6 +5420,7 @@ class GoogleFlowWorker:
                         node.getAttribute('data-download-url') || ''
                     ]).filter(Boolean);
                     if ((assetId && cardId === assetId) ||
+                        (cardAria && aria && aria.toLowerCase() === cardAria.toLowerCase()) ||
                         cardUrls.some((url) => normalizedMatchUrls.includes(normalizeUrl(url)))) {
                         card.click();
                         return true;
@@ -5368,8 +5428,8 @@ class GoogleFlowWorker:
                 }
                 return false;
             }''',
-            payload,
-        )
+                payload,
+            )
         if not clicked:
             return ""
 
@@ -5379,9 +5439,15 @@ class GoogleFlowWorker:
             str(candidate.get("assetId") or "")[:80],
         )
         self._record_video_timing("detail_opened")
+        await asyncio.sleep(1.0)
+        if self._is_asset_edit_url(str(self.page.url or "")):
+            return str(self.page.url)
+
         deadline = time.monotonic() + VIDEO_DETAIL_SCAN_TIMEOUT_SECONDS
         try:
             while True:
+                if self._is_asset_edit_url(str(self.page.url or "")):
+                    return str(self.page.url)
                 candidates = await self._collect_video_candidates()
                 source = self._find_new_video_source(candidates, baseline_keys)
                 if source:
@@ -6491,11 +6557,99 @@ class GoogleFlowWorker:
         self._log_generation_event("video", "video_completed", submitted_at)
         return result
 
+    async def _download_video_from_ui(self, edit_url_or_asset_id: str, target: Path) -> bool:
+        """Download video using Google Flow's native 720p download menu."""
+        try:
+            current_url = str(self.page.url or "")
+            target_url = edit_url_or_asset_id if str(edit_url_or_asset_id).startswith("http") else ""
+            if not self._is_asset_edit_url(current_url):
+                if target_url and "/edit/" in target_url and target_url != current_url:
+                    await self.page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    await self.wait_for_load()
+                else:
+                    card_aria = ""
+                    if str(edit_url_or_asset_id).startswith("flow_canvas_tile:"):
+                        card_aria = str(edit_url_or_asset_id).split("flow_canvas_tile:", 1)[1].strip()
+                    elif not str(edit_url_or_asset_id).startswith("http"):
+                        card_aria = str(edit_url_or_asset_id).strip()
+
+                    selectors = []
+                    if card_aria:
+                        selectors.extend([
+                            f"flow-grid-tile-container[aria-label*='{card_aria}' i]",
+                            f"flow-tile-container[aria-label*='{card_aria}' i]",
+                            f"[aria-label*='{card_aria}' i]",
+                        ])
+                    selectors.append("flow-grid-tile-container:has(flow-video-tile)")
+                    for sel in selectors:
+                        tile = self.page.locator(sel).first
+                        try:
+                            if await tile.is_visible(timeout=2000):
+                                await tile.click(timeout=3000)
+                                await asyncio.sleep(1.5)
+                                break
+                        except Exception:
+                            pass
+
+            dl_btn = self.page.locator(
+                "button[aria-label*='Tải' i], button[aria-label*='Download' i], "
+                "button:has(mat-icon:text-is('download'))"
+            ).first
+            if not await dl_btn.is_visible(timeout=8000):
+                return False
+
+            await dl_btn.click(timeout=4000)
+            await asyncio.sleep(0.5)
+
+            menu_item_720 = self.page.locator(
+                "button:has-text('720p'), [role='menuitem']:has-text('720p'), "
+                "button:has-text('1080p'), [role='menuitem']:has-text('1080p')"
+            ).first
+            if not await menu_item_720.is_visible(timeout=5000):
+                await self.page.keyboard.press("Escape")
+                return False
+
+            async with self.page.expect_download(timeout=45000) as download_info:
+                await menu_item_720.click(timeout=4000)
+            download = await download_info.value
+            await download.save_as(str(target))
+
+            if target.exists() and target.stat().st_size > 1000:
+                logger.info(
+                    "Downloaded video from Google Flow UI (%d bytes) to %s",
+                    target.stat().st_size,
+                    target,
+                )
+                self._record_video_timing("download_completed")
+                return True
+        except Exception as exc:
+            logger.warning("UI video download failed: %s", exc)
+        finally:
+            try:
+                await self.page.keyboard.press("Escape")
+                done_btn = self.page.locator("button:has-text('Xong'), button:has-text('Done')").first
+                if await done_btn.is_visible(timeout=1500):
+                    await done_btn.click(timeout=2000)
+                    await asyncio.sleep(1.0)
+                elif self._is_asset_edit_url(str(self.page.url or "")):
+                    await self._restore_project_canvas()
+            except Exception:
+                pass
+        return False
+
     async def download_video(self, asset_url: str, save_path: str) -> None:
         """Download generated video file from URL/Blob to local path."""
         target = Path(save_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         self._record_video_timing("download_started")
+
+        if (
+            self._is_asset_edit_url(asset_url)
+            or self._is_asset_edit_url(str(self.page.url or ""))
+            or str(asset_url).startswith("flow_")
+        ):
+            if await self._download_video_from_ui(asset_url, target):
+                return
 
         last_error = None
         for attempt in range(3):
@@ -6523,7 +6677,7 @@ class GoogleFlowWorker:
                             logger.info("Downloaded video from blob successfully (%d bytes) to %s", len(raw_bytes), target)
                             self._record_video_timing("download_completed")
                             return
-                else:
+                elif str(asset_url).startswith("http"):
                     response = await self.page.request.get(asset_url, timeout=60000)
                     if response.status == 200:
                         body = await response.body()
@@ -6534,9 +6688,15 @@ class GoogleFlowWorker:
                             return
                         raise RuntimeError(f"Tải video từ Google Flow rỗng hoặc quá nhỏ ({len(body) if body else 0} bytes).")
                     raise RuntimeError(f"HTTP {response.status} khi tải video từ Google Flow: {asset_url}")
+                else:
+                    if await self._download_video_from_ui(asset_url, target):
+                        return
+                    raise RuntimeError(f"Không thể xử lý URL video Google Flow: {asset_url}")
             except Exception as e:
                 last_error = e
                 logger.warning("Attempt %d/3 download_video failed: %s", attempt + 1, e)
+                if await self._download_video_from_ui(asset_url, target):
+                    return
                 await asyncio.sleep(2)
 
         raise RuntimeError(f"Không thể tải video sau 3 lần thử: {last_error}")

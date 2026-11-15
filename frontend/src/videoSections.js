@@ -255,7 +255,7 @@ export function parseVideoSections(text) {
   const sections = []
   if (mainScriptParts.length) {
     sections.push({
-      title: 'NỘI DUNG KỊCH BẢN',
+      title: 'LỜI ĐỌC HOÀN CHỈNH (INTRO · BODY · OUTRO)',
       content: mainScriptParts.join('\n\n')
     })
   }

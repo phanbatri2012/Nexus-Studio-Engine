@@ -307,6 +307,7 @@ export default function TTSSettings() {
         }), 'Đã cập nhật provider.')} /> Bật provider</label></div>
       {provider.id === 'genmax' && <div className="tts-provider-config"><label>API key<input ref={credentialRef} type="password" autoComplete="new-password" placeholder={provider.health?.configured ? '•••••••• (đã cấu hình)' : 'Nhập API key mới'} /></label><button className="tts-button primary" onClick={saveCredential}>Thay thế key</button><button className="tts-button danger" onClick={() => { if (confirm('Xóa API key Genmax đã lưu?')) run('credential-delete', () => api('/providers/genmax/credentials', { method: 'DELETE' }), 'Đã xóa API key Genmax.') }}>Xóa key</button></div>}
       {provider.id === 'omnivoice' && <button className="tts-button" onClick={() => run('sync', () => api('/providers/omnivoice/sync', { method: 'POST' }), 'Đã đồng bộ OmniVoice.')}>Đồng bộ profile .pt</button>}
+      {provider.id === 'vieneu_v3_turbo' && <button className="tts-button" onClick={() => run('sync-vieneu', () => api('/providers/vieneu_v3_turbo/sync', { method: 'POST' }), 'Đã đồng bộ giọng VieNeu.')}>Đồng bộ giọng VieNeu</button>}
     </article>)}</div>
 
     <section className="tts-card tts-preview" ref={previewRef}><div className="tts-card-title"><div><h2>Nghe thử OmniVoice và VieNeu</h2><span className="tts-provider-kind">Hỗ trợ OmniVoice active và VieNeu active/draft.</span></div>

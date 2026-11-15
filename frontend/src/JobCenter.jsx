@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { openVideoStudioInGpm } from './gpmOpener.js'
+import SystemCleanupPanel from './SystemCleanupPanel.jsx'
 
 const DRAIN_MODE_STORAGE_KEY = 'nexus_drain_mode_enabled'
 const LEGACY_DRAIN_MODE_STORAGE_KEY = 'autoyt_drain_mode_enabled'
@@ -604,6 +605,8 @@ function JobCenter({ onOpenVideo, refreshKey }) {
         Theo dõi hàng đợi tạo video, audio, ChatGPT và tải YouTube tại một nơi.
       </p>
 
+      <SystemCleanupPanel />
+
       <div className="result-panel" style={{ padding: '13px 16px', marginTop: '24px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <span aria-hidden="true" style={{ color: '#999' }}>⌕</span>
@@ -684,6 +687,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
         >
           <option value="all">Mọi loại job</option>
           <option value="video_generation">Tạo video</option>
+          <option value="script_body_regeneration">Tạo lại toàn bộ lời đọc</option>
           <option value="short_video_generation">Tạo Short Video</option>
           <option value="audio_review">Kiểm duyệt audio</option>
           <option value="audio">Tạo audio</option>
@@ -1058,6 +1062,25 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     <div style={{ color: '#999', marginTop: '7px', fontSize: '0.86em' }}>
                       {job.progress || 'Chưa có cập nhật'}
                     </div>
+                    {job.type === 'audio_review' && Array.isArray(job.review_required) && job.review_required.length > 0 && (
+                      <details style={{ marginTop: '9px', color: '#f5b041', fontSize: '0.84em' }}>
+                        <summary>Xem {job.review_required.length} vấn đề cần sửa</summary>
+                        {job.review_required.map((item, index) => {
+                          const location = [
+                            item.section,
+                            Number.isInteger(item.paragraph_index) ? `đoạn ${item.paragraph_index + 1}` : ''
+                          ].filter(Boolean).join(' · ')
+                          return (
+                            <div key={`${item.code || 'review'}-${index}`} style={{ marginTop: '8px', paddingLeft: '10px', borderLeft: '2px solid rgba(245,176,65,0.45)' }}>
+                              <div>{location ? `${location}: ` : ''}{item.message}</div>
+                              {item.preview && (
+                                <div style={{ color: '#bbb', marginTop: '3px', whiteSpace: 'pre-wrap' }}>{item.preview}</div>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </details>
+                    )}
                     {Number(job.intro_video_summary?.fallback_count || 0) > 0 && (
                       <div
                         role="status"

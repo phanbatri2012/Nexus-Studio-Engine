@@ -542,13 +542,18 @@ def validate_cast_policy(
             )
         requirement = manifest_by_key.get(role_key)
         if requirement:
+            is_manual_or_approved = (
+                str(assignment.get("approval_status") or "") == "approved"
+                or str(assignment.get("source") or "") == "manual_override"
+            )
             if int(assignment.get("casting_version") or 1) >= CASTING_VERSION:
                 if str(assignment.get("manifest_hash") or "") != expected_hash:
-                    raise AutoCastingAttentionRequired(
-                        f"Casting của {role_key} đã cũ so với manifest hiện tại."
-                    )
+                    if not is_manual_or_approved:
+                        raise AutoCastingAttentionRequired(
+                            f"Casting của {role_key} đã cũ so với manifest hiện tại."
+                        )
             if (
-                str(assignment.get("approval_status") or "") != "approved"
+                not is_manual_or_approved
                 and _score_voice(requirement, voice, guest_voice_pool=pool_id) is None
             ):
                 raise AutoCastingAttentionRequired(

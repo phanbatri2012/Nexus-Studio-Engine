@@ -9,13 +9,17 @@ from collections import Counter
 from collections.abc import Callable
 
 
-QUALITY_GATE_VERSION = 2
+QUALITY_GATE_VERSION = 3
 REQUIRED_AUDIO_SECTIONS = ("INTRO", "BODY", "OUTRO")
 DUPLICATE_PARAGRAPH_MIN_WORDS = 25
 MIN_AUDIO_SCRIPT_WORDS = 15
 MIN_SECTION_WORDS = {"INTRO": 3, "BODY": 5, "OUTRO": 3}
 WORDS_PER_MINUTE_SLOW = 160
 WORDS_PER_MINUTE_FAST = 300
+SOURCE_EXPANSION_WARNING_RATIO = 1.5
+SOURCE_EXPANSION_REVIEW_RATIO = 2.0
+SOURCE_COMPARISON_MIN_SOURCE_WORDS = 100
+SOURCE_COMPARISON_MIN_OUTPUT_WORDS = 500
 
 SECTION_PATTERN = re.compile(
     r"(?ms)^### \[([^\]]+)\][ \t]*\r?\n(.*?)(?=^### \[[^\]]+\][ \t]*$|\Z)"
@@ -117,7 +121,8 @@ HIGH_CONFIDENCE_EDITORIAL_PATTERN = re.compile(
 
 SELF_REFERENCE_PATTERNS = (
     re.compile(
-        r"\b(?:theo|trong|ở)\s+(?:nội\s+dung\s+)?(?:bản\s+)?kịch\s*bản(?:\s+(?:này|gốc|trên|dưới))?\b",
+        r"\b(?:theo|trong|ở)\s+(?:nội\s+dung\s+)?(?:bản\s+)?kịch\s*bản"
+        r"(?:\s+(?:này|gốc|trên|dưới))?\b(?!\s+(?:phim|sân\s+khấu))",
         re.IGNORECASE,
     ),
     re.compile(
@@ -167,6 +172,20 @@ HIGH_CONFIDENCE_SCRIPT_REFERENCE_PATTERN = re.compile(
     r"(?:\s+(?:này|gốc|trên|dưới))?\s*[,;:]\s*"
     r"(?P<next>[^\W\d_])",
     re.IGNORECASE | re.MULTILINE | re.UNICODE,
+)
+HIGH_CONFIDENCE_INLINE_SCRIPT_ATTRIBUTION_PATTERN = re.compile(
+    r"\s+được\s+(?:nhắc\s+(?:đến|tới)|dẫn\s+lại|đề\s+cập|nêu|ghi\s+nhận)\s+"
+    r"(?:ở|trong)\s+(?:nội\s+dung\s+)?(?:bản\s+)?kịch\s*bản"
+    r"(?:\s+(?:này|gốc|trên|dưới))?\b"
+    r"(?!\s+(?:phim|sân\s+khấu))",
+    re.IGNORECASE,
+)
+HIGH_CONFIDENCE_SCRIPT_METHOD_REFERENCE_PATTERN = re.compile(
+    r"\b(?P<label>cách\s+(?:tính|diễn\s+đạt|trình\s+bày))\s+"
+    r"được\s+sử\s+dụng\s+(?:ở|trong)\s+"
+    r"(?:nội\s+dung\s+)?(?:bản\s+)?kịch\s*bản"
+    r"(?:\s+(?:này|gốc|trên|dưới))?\b",
+    re.IGNORECASE,
 )
 HIGH_CONFIDENCE_REQUIREMENT_REFERENCE_PATTERN = re.compile(
     r"(?P<boundary>^|(?<=[.!?…])\s+)"
@@ -320,6 +339,18 @@ def _auto_fix_self_references(value: str) -> tuple[str, int]:
 
     cleaned = str(value or "")
     total = 0
+
+    cleaned, count = HIGH_CONFIDENCE_INLINE_SCRIPT_ATTRIBUTION_PATTERN.subn(
+        "",
+        cleaned,
+    )
+    total += count
+
+    cleaned, count = HIGH_CONFIDENCE_SCRIPT_METHOD_REFERENCE_PATTERN.subn(
+        lambda match: f"{match.group('label')} tham khảo",
+        cleaned,
+    )
+    total += count
 
     cleaned, count = HIGH_CONFIDENCE_NARRATION_REFERENCE_PATTERN.subn(
         lambda match: match.group("prefix").rstrip(),
@@ -583,7 +614,13 @@ class ScriptQualityGate:
     def __init__(self, sanitizer: Callable[[str], str] | None = None):
         self.sanitizer = sanitizer
 
-    def run(self, script_text: str, *, auto_fix: bool = True) -> dict:
+    def run(
+        self,
+        script_text: str,
+        *,
+        auto_fix: bool = True,
+        source_text: str = "",
+    ) -> dict:
         original = str(script_text or "")
         cleaned = original
         fixes: list[dict] = []
@@ -606,7 +643,7 @@ class ScriptQualityGate:
                         )
                     )
 
-        report = self.audit(cleaned)
+        report = self.audit(cleaned, source_text=source_text)
         report.update(
             {
                 "quality_gate_version": QUALITY_GATE_VERSION,
@@ -619,7 +656,7 @@ class ScriptQualityGate:
         )
         return report
 
-    def audit(self, script_text: str) -> dict:
+    def audit(self, script_text: str, *, source_text: str = "") -> dict:
         text = str(script_text or "")
         matches = list(SECTION_PATTERN.finditer(text))
         narrative_matches = [
@@ -740,6 +777,41 @@ class ScriptQualityGate:
         warnings.extend(content_warnings)
         warnings.extend(_find_unbalanced_delimiters(sections))
 
+        source_word_count = _word_count(str(source_text or ""))
+        expansion_ratio = (
+            total_words / source_word_count if source_word_count > 0 else 0.0
+        )
+        if (
+            source_word_count >= SOURCE_COMPARISON_MIN_SOURCE_WORDS
+            and total_words >= SOURCE_COMPARISON_MIN_OUTPUT_WORDS
+        ):
+            if expansion_ratio > SOURCE_EXPANSION_REVIEW_RATIO:
+                review_required.append(
+                    _issue(
+                        "excessive_source_expansion",
+                        (
+                            "Lời đọc dài gấp "
+                            f"{expansion_ratio:.2f} lần transcript nguồn; cần xác nhận "
+                            "dung lượng trước khi tạo audio."
+                        ),
+                        severity="review",
+                        confidence=1.0,
+                    )
+                )
+            elif expansion_ratio > SOURCE_EXPANSION_WARNING_RATIO:
+                warnings.append(
+                    _issue(
+                        "source_expansion_warning",
+                        (
+                            "Lời đọc dài gấp "
+                            f"{expansion_ratio:.2f} lần transcript nguồn; nên kiểm tra "
+                            "lại yêu cầu dung lượng."
+                        ),
+                        severity="warning",
+                        confidence=1.0,
+                    )
+                )
+
         if errors:
             decision = "block"
         elif review_required:
@@ -777,6 +849,8 @@ class ScriptQualityGate:
                 "estimated_max_seconds": round(
                     total_words / WORDS_PER_MINUTE_SLOW * 60
                 ),
+                "source_word_count": source_word_count,
+                "source_expansion_ratio": round(expansion_ratio, 3),
                 "sections": section_metrics,
             },
         }

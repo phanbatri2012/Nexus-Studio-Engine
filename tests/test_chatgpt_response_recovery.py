@@ -10,6 +10,7 @@ from nexus_engine.services.chatgpt_worker import (
     extract_assistant_response_from_conversation_payload,
     recover_assistant_response_from_backend,
     _accept_or_recover_assistant_response,
+    accept_external_app_permission_dialog,
     wait_for_assistant_response,
     split_outline_parts,
     get_reusable_outline_response,
@@ -62,6 +63,66 @@ def test_looks_like_chatgpt_error():
     assert looks_like_chatgpt_error("Something went wrong") is True
     assert looks_like_chatgpt_error("There was an error generating a response") is True
     assert looks_like_chatgpt_error("[PHAN 1] Nội dung phần 1") is False
+
+
+def test_external_app_permission_does_not_scan_buttons_outside_dialogs():
+    page = MagicMock()
+    dialogs = MagicMock()
+    dialogs.count.return_value = 0
+    page.locator.return_value = dialogs
+
+    accepted = accept_external_app_permission_dialog(page)
+
+    assert accepted is False
+    page.locator.assert_called_once_with('[role="dialog"], [role="alertdialog"]')
+
+
+def test_external_app_permission_ignores_unrelated_dialog_with_prompt_text():
+    page = MagicMock()
+    dialogs = MagicMock()
+    dialog = MagicMock()
+    dialogs.count.return_value = 1
+    dialogs.nth.return_value = dialog
+    dialog.is_visible.return_value = True
+    dialog.inner_text.return_value = (
+        "Transcript yêu cầu chính phủ đồng ý cho lưu hành tiền Việt Nam."
+    )
+    page.locator.return_value = dialogs
+
+    accepted = accept_external_app_permission_dialog(page)
+
+    assert accepted is False
+    dialog.locator.assert_not_called()
+
+
+def test_external_app_permission_accepts_scoped_consent_button():
+    page = MagicMock()
+    dialogs = MagicMock()
+    dialog = MagicMock()
+    buttons = MagicMock()
+    deny_button = MagicMock()
+    allow_button = MagicMock()
+    dialogs.count.return_value = 1
+    dialogs.nth.return_value = dialog
+    dialog.is_visible.return_value = True
+    dialog.inner_text.return_value = (
+        "Search outside this project. ChatGPT will use an external app "
+        "to help answer your request."
+    )
+    dialog.locator.return_value = buttons
+    buttons.count.return_value = 2
+    buttons.nth.side_effect = [deny_button, allow_button]
+    deny_button.is_visible.return_value = True
+    deny_button.inner_text.return_value = "Don't allow"
+    allow_button.is_visible.return_value = True
+    allow_button.inner_text.return_value = "Always allow"
+    page.locator.return_value = dialogs
+
+    accepted = accept_external_app_permission_dialog(page)
+
+    assert accepted is True
+    deny_button.click.assert_not_called()
+    allow_button.click.assert_called_once()
 
 
 def test_payload_content_text_filtering():
@@ -653,7 +714,6 @@ def test_set_primary_thumbnail_and_remove_models():
 
     req2 = RemoveThumbnailRequest(thumbnail_url="/api/thumbnails/thumb_123.png")
     assert req2.thumbnail_url == "/api/thumbnails/thumb_123.png"
-
 
 
 
