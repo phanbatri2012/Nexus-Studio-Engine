@@ -25,6 +25,7 @@ REFERENCE_ATTACH_RETRY_COUNT = 2
 REFERENCE_POST_UPLOAD_RETRY_COUNT = 3
 REFERENCE_CHIP_CONFIRM_TIMEOUT_SECONDS = 5.0
 REFERENCE_CHIP_CONFIRM_POLL_SECONDS = 0.2
+REFERENCE_SYNC_TIMEOUT_SECONDS = 45.0
 REFERENCE_RESULT_ATTACHED = "attached"
 REFERENCE_RESULT_NOT_FOUND = "not_found"
 REFERENCE_RESULT_UI_ERROR = "ui_error"
@@ -674,6 +675,23 @@ class GoogleFlowWorker:
             self._project_id(),
             filename,
             detail,
+        )
+
+    def _log_reference_timing(
+        self,
+        stage: str,
+        filename: str,
+        started_at: float,
+        *,
+        outcome: str = "ok",
+    ) -> None:
+        logger.info(
+            "flow_reference_timing stage=%s project=%s filename=%s elapsed_ms=%d outcome=%s",
+            stage,
+            self._project_id(),
+            filename,
+            int(max(0.0, time.monotonic() - started_at) * 1000),
+            outcome,
         )
 
     async def wait_for_load(self, timeout_ms: int = 15000):
@@ -3771,6 +3789,9 @@ class GoogleFlowWorker:
 
     async def clear_ingredient_chips(self) -> None:
         """Clear all ingredient chips currently attached to the prompt box."""
+        if not await self._has_ingredient_chip():
+            return
+
         chip_selectors = [
             "flow-creative-agent-prompt-box flow-image-ingredient-chip",
             "flow-creative-agent-prompt-box flow-ingredient-chip",
@@ -3816,15 +3837,18 @@ class GoogleFlowWorker:
             "flow-base-prompt-box button[aria-label*='Xóa' i]",
         ]
 
-        for c_sel in clear_btn_selectors:
-            try:
-                c_btn = self.page.locator(c_sel).first
-                if await c_btn.is_visible(timeout=500):
-                    await c_btn.click()
+        try:
+            clear_buttons = self.page.locator(", ".join(clear_btn_selectors))
+            for index in range(min(await clear_buttons.count(), 8)):
+                clear_button = clear_buttons.nth(index)
+                if await clear_button.is_visible(timeout=150):
+                    await clear_button.click(timeout=1000)
                     await asyncio.sleep(0.3)
+                    if not await self._has_ingredient_chip():
+                        return
                     break
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         # Direct close/remove buttons inside prompt box
         direct_close_selectors = [
@@ -3846,61 +3870,53 @@ class GoogleFlowWorker:
             "flow-prompt-box mat-icon:has-text('close')",
             "flow-prompt-box mat-icon:has-text('cancel')",
         ]
-        for d_sel in direct_close_selectors:
-            try:
-                btns = self.page.locator(d_sel)
-                cnt = await btns.count()
-                for i in range(cnt):
-                    b = btns.nth(i)
-                    if await b.is_visible(timeout=200):
-                        await b.click(timeout=1000)
-                        await asyncio.sleep(0.2)
-            except Exception:
-                pass
+        try:
+            direct_close_buttons = self.page.locator(", ".join(direct_close_selectors))
+            for index in range(min(await direct_close_buttons.count(), 16)):
+                button = direct_close_buttons.nth(index)
+                if await button.is_visible(timeout=100):
+                    await button.click(timeout=1000)
+                    await asyncio.sleep(0.2)
+            if not await self._has_ingredient_chip():
+                return
+        except Exception:
+            pass
 
         # Dismiss / remove individual chips
         for _ in range(8):
-            found_any = False
-            for sel in chip_selectors:
+            if not await self._has_ingredient_chip():
+                return
+            removed_any = False
+            try:
+                chips = self.page.locator(", ".join(chip_selectors))
+                count = min(await chips.count(), 16)
+            except Exception:
+                break
+            for index in range(count):
+                chip = chips.nth(index)
                 try:
-                    chips = self.page.locator(sel)
-                    count = await chips.count()
-                    if count > 0:
-                        found_any = True
-                        for i in range(count):
-                            c = chips.nth(i)
-                            if await c.is_visible(timeout=300):
-                                await c.hover()
-                                await asyncio.sleep(0.1)
-                                del_btn_selectors = [
-                                    "mat-icon:has-text('cancel')",
-                                    "mat-icon:has-text('close')",
-                                    "mat-icon:has-text('clear')",
-                                    "mat-icon:has-text('x')",
-                                    ".hover-icon-overlay",
-                                    "button.delete-button",
-                                    "button[aria-label*='Remove' i]",
-                                    "button[aria-label*='Delete' i]",
-                                    "button[aria-label*='Xóa' i]",
-                                    "button[aria-label*='Đóng' i]",
-                                    "button[aria-label*='Close' i]",
-                                    "button:has(mat-icon:has-text('close'))",
-                                    "button:has(mat-icon:has-text('cancel'))",
-                                    ".remove-chip-button",
-                                    ".close-button",
-                                ]
-                                for d_sel in del_btn_selectors:
-                                    try:
-                                        d_btn = c.locator(d_sel).first
-                                        if await d_btn.is_visible(timeout=300):
-                                            await d_btn.click()
-                                            await asyncio.sleep(0.2)
-                                            break
-                                    except Exception:
-                                        pass
+                    if not await chip.is_visible(timeout=100):
+                        continue
+                    await chip.hover()
+                    await asyncio.sleep(0.1)
+                    delete_button = chip.locator(
+                        "mat-icon:has-text('cancel'), mat-icon:has-text('close'), "
+                        "mat-icon:has-text('clear'), mat-icon:has-text('x'), "
+                        ".hover-icon-overlay, button.delete-button, "
+                        "button[aria-label*='Remove' i], button[aria-label*='Delete' i], "
+                        "button[aria-label*='Xóa' i], button[aria-label*='Đóng' i], "
+                        "button[aria-label*='Close' i], "
+                        "button:has(mat-icon:has-text('close')), "
+                        "button:has(mat-icon:has-text('cancel')), "
+                        ".remove-chip-button, .close-button"
+                    ).first
+                    if await delete_button.is_visible(timeout=150):
+                        await delete_button.click(timeout=1000)
+                        await asyncio.sleep(0.2)
+                        removed_any = True
                 except Exception:
-                    pass
-            if not found_any:
+                    continue
+            if not removed_any:
                 break
 
     @staticmethod
@@ -3911,6 +3927,51 @@ class GoogleFlowWorker:
         lines = [line.strip().casefold() for line in str(text or "").splitlines()]
         return expected in lines
 
+    def _reference_identity_matches(
+        self,
+        identity: dict[str, object],
+        filename: str,
+        cached_identity: dict[str, object] | None,
+    ) -> bool:
+        if self._text_matches_asset_filename(
+            str(identity.get("labelText") or ""),
+            filename,
+        ):
+            return True
+        expected_asset_id = str(
+            (cached_identity or {}).get("asset_id") or ""
+        ).strip().casefold()
+        current_asset_id = str(identity.get("assetId") or "").strip().casefold()
+        if expected_asset_id and current_asset_id == expected_asset_id:
+            return True
+        expected_media_keys = {
+            self._media_key(str(value or ""))
+            for value in (cached_identity or {}).get("media_keys") or []
+            if self._media_key(str(value or ""))
+        }
+        current_media_keys = {
+            self._media_key(str(value or ""))
+            for value in identity.get("urls") or []
+            if self._media_key(str(value or ""))
+        }
+        return bool(expected_media_keys & current_media_keys)
+
+    async def _has_expected_reference_attached(self, filename: str) -> bool:
+        try:
+            identities = await self._prompt_attachment_identities()
+        except Exception:
+            return False
+        if len(identities) != 1:
+            return False
+        cached_identity = self._project_reference_asset_cache().get(
+            filename.casefold()
+        )
+        return self._reference_identity_matches(
+            identities[0],
+            filename,
+            cached_identity,
+        )
+
     async def _find_exact_picker_asset(self, filename: str) -> Locator | None:
         asset_items = self.page.locator(
             ".cdk-overlay-container button.asset-item, "
@@ -3919,12 +3980,24 @@ class GoogleFlowWorker:
             ".cdk-overlay-container .asset-title, "
             ".cdk-overlay-container [data-testid*='asset']"
         )
-        count = await asset_items.count()
-        for index in range(min(count, REFERENCE_ASSET_SCAN_LIMIT)):
-            item = asset_items.nth(index)
-            text = await item.inner_text(timeout=1000)
-            if self._text_matches_asset_filename(text, filename):
-                return item
+        try:
+            match_index = await asset_items.evaluate_all(
+                r'''(nodes, options) => {
+                    const expected = String(options.filename || '').trim().toLowerCase();
+                    const limit = Math.min(nodes.length, Number(options.limit || 0));
+                    for (let index = 0; index < limit; index += 1) {
+                        const text = String(nodes[index].innerText || nodes[index].textContent || '');
+                        const lines = text.split(/\r?\n/).map((line) => line.trim().toLowerCase());
+                        if (lines.includes(expected)) return index;
+                    }
+                    return -1;
+                }''',
+                {"filename": filename, "limit": REFERENCE_ASSET_SCAN_LIMIT},
+            )
+        except Exception:
+            return None
+        if isinstance(match_index, int) and 0 <= match_index < REFERENCE_ASSET_SCAN_LIMIT:
+            return asset_items.nth(match_index)
         return None
 
     async def _remember_reference_locator_keys(
@@ -3984,20 +4057,76 @@ class GoogleFlowWorker:
         identity: dict[str, object] | None,
     ) -> Locator | None:
         asset_id = str((identity or {}).get("asset_id") or "").strip().casefold()
-        if not asset_id:
+        media_keys = {
+            self._media_key(str(value or ""))
+            for value in (identity or {}).get("media_keys") or []
+            if self._media_key(str(value or ""))
+        }
+        if not asset_id and not media_keys:
             return None
         candidates = self.page.locator(
-            ".cdk-overlay-container [data-media-id], "
-            ".cdk-overlay-container [data-asset-id], "
-            ".cdk-overlay-container [data-id]"
+            ".cdk-overlay-container button.asset-item, "
+            ".cdk-overlay-container [role='option'], "
+            ".cdk-overlay-container [role='listitem'], "
+            ".cdk-overlay-container .asset-title, "
+            ".cdk-overlay-container [data-testid*='asset']"
         )
-        count = await candidates.count()
-        for index in range(min(count, REFERENCE_ASSET_SCAN_LIMIT)):
-            candidate = candidates.nth(index)
-            for attribute in ("data-media-id", "data-asset-id", "data-id"):
-                value = str(await candidate.get_attribute(attribute) or "").strip().casefold()
-                if value == asset_id:
-                    return candidate
+        try:
+            match_index = await candidates.evaluate_all(
+                r'''(nodes, options) => {
+                    const expectedAssetId = String(options.assetId || '').trim().toLowerCase();
+                    const expectedMediaKeys = new Set(options.mediaKeys || []);
+                    const limit = Math.min(nodes.length, Number(options.limit || 0));
+                    const mediaKey = (value) => {
+                        let clean = String(value || '').split('?', 1)[0].trim().toLowerCase();
+                        if (clean.includes('googleusercontent.com') ||
+                            clean.includes('flow-content.google') || clean.includes('google.com')) {
+                            clean = clean.replace(/=(?:s\d+|w\d+-h\d+)(?:-[a-z0-9_-]+)?$/i, '');
+                        }
+                        return clean;
+                    };
+                    for (let index = 0; index < limit; index += 1) {
+                        const node = nodes[index];
+                        const card = node.closest(
+                            '[data-media-id], [data-asset-id], [data-id], [role="option"], [role="listitem"]'
+                        ) || node;
+                        const currentAssetId = String(
+                            card.getAttribute('data-media-id') ||
+                            card.getAttribute('data-asset-id') ||
+                            card.getAttribute('data-id') || ''
+                        ).trim().toLowerCase();
+                        if (expectedAssetId && currentAssetId === expectedAssetId) return index;
+                        if (!expectedMediaKeys.size) continue;
+                        const mediaNodes = card.querySelectorAll(
+                            'img[src], img[srcset], [data-image-url], [data-media-url], a[href]'
+                        );
+                        for (const mediaNode of mediaNodes) {
+                            const values = [
+                                mediaNode.currentSrc || '', mediaNode.src || '', mediaNode.href || '',
+                                mediaNode.getAttribute('data-image-url') || '',
+                                mediaNode.getAttribute('data-media-url') || ''
+                            ];
+                            const srcset = mediaNode.getAttribute('srcset') || '';
+                            for (const part of srcset.split(',')) {
+                                values.push(part.trim().split(/\s+/)[0]);
+                            }
+                            if (values.some((value) => expectedMediaKeys.has(mediaKey(value)))) {
+                                return index;
+                            }
+                        }
+                    }
+                    return -1;
+                }''',
+                {
+                    "assetId": asset_id,
+                    "mediaKeys": sorted(media_keys),
+                    "limit": REFERENCE_ASSET_SCAN_LIMIT,
+                },
+            )
+        except Exception:
+            return None
+        if isinstance(match_index, int) and 0 <= match_index < REFERENCE_ASSET_SCAN_LIMIT:
+            return candidates.nth(match_index)
         return None
 
     async def _remember_attached_reference_keys(self) -> None:
@@ -4062,67 +4191,8 @@ class GoogleFlowWorker:
             }
 
     async def _has_ingredient_chip(self) -> bool:
-        selectors = [
-            "flow-creative-agent-prompt-box flow-image-ingredient-chip",
-            "flow-creative-agent-prompt-box flow-ingredient-chip",
-            "flow-creative-agent-prompt-box flow-prompt-attachment",
-            "flow-creative-agent-prompt-box [data-testid*='attachment' i]",
-            "flow-creative-agent-prompt-box img:not([alt*='profile' i]):not([alt*='account' i]):not([alt*='avatar' i])",
-            "flow-base-prompt-box flow-image-ingredient-chip",
-            "flow-base-prompt-box flow-ingredient-chip",
-            "flow-base-prompt-box flow-prompt-attachment",
-            "flow-base-prompt-box [data-testid*='attachment' i]",
-            "flow-base-prompt-box img:not([alt*='profile' i]):not([alt*='account' i]):not([alt*='avatar' i])",
-            "flow-prompt-box flow-ingredient-chip",
-            "flow-prompt-box flow-prompt-attachment",
-            "flow-prompt-box flow-attachment",
-            "flow-prompt-box flow-reference-chip",
-            "flow-prompt-box [data-testid*='ingredient' i]",
-            "flow-prompt-box [data-testid*='attachment' i]",
-            "flow-prompt-box [data-testid*='reference' i]",
-            "flow-prompt-box .ingredient-chip",
-            "flow-prompt-box .reference-chip",
-            "flow-prompt-box .attachment-chip",
-            "flow-prompt-box .mat-mdc-chip",
-            "flow-prompt-box mat-chip",
-            "flow-prompt-box img:not([alt*='profile' i]):not([alt*='account' i]):not([alt*='avatar' i])",
-            "flow-prompt-box button:has(mat-icon:has-text('close'))",
-            "flow-prompt-box button:has(mat-icon:has-text('cancel'))",
-            "flow-prompt-box button[aria-label*='Remove' i]",
-            "flow-prompt-box button[aria-label*='Delete' i]",
-            "flow-prompt-box button[aria-label*='Xóa' i]",
-            "flow-prompt-box mat-icon:has-text('close')",
-        ]
-        for sel in selectors:
-            try:
-                chip = self.page.locator(sel).first
-                if await chip.is_visible(timeout=300):
-                    return True
-            except Exception:
-                continue
-
         try:
-            return bool(await self.page.evaluate(r'''() => {
-                const promptBox = document.querySelector(
-                    'flow-creative-agent-prompt-box, flow-base-prompt-box, flow-prompt-box'
-                );
-                if (!promptBox) return false;
-                const images = promptBox.querySelectorAll('img');
-                for (const img of images) {
-                    const src = (img.src || img.currentSrc || '').toLowerCase();
-                    const alt = (img.alt || '').toLowerCase();
-                    if (src && !src.includes('profile') && !src.includes('s32-c-mo') &&
-                        !alt.includes('profile') && !alt.includes('account')) {
-                        return true;
-                    }
-                }
-                const chipNodes = promptBox.querySelectorAll(
-                    'flow-image-ingredient-chip, flow-ingredient-chip, flow-attachment, flow-prompt-attachment, ' +
-                    '.ingredient-chip, .reference-chip, .attachment-chip, mat-chip, .mat-mdc-chip, ' +
-                    '[data-testid*="attachment" i], [data-testid*="reference" i]'
-                );
-                return chipNodes.length > 0;
-            }'''))
+            return bool(await self._prompt_attachment_identities())
         except Exception:
             return False
 
@@ -4149,7 +4219,15 @@ class GoogleFlowWorker:
                 'flow-attachment, flow-reference-chip, [data-testid*="attachment" i], ' +
                 '[data-testid*="ingredient" i], [data-testid*="reference" i]'
             ));
-            if (!nodes.length) nodes = Array.from(root.querySelectorAll('img'));
+            if (!nodes.length) {
+                nodes = Array.from(root.querySelectorAll('img')).filter((img) => {
+                    const src = String(img.currentSrc || img.src || '').toLowerCase();
+                    const alt = String(img.alt || '').toLowerCase();
+                    return src && !src.includes('profile') && !src.includes('s32-c-mo') &&
+                        !alt.includes('profile') && !alt.includes('account') &&
+                        !alt.includes('avatar');
+                });
+            }
             const unique = [];
             const seen = new Set();
             for (const node of nodes) {
@@ -4186,7 +4264,13 @@ class GoogleFlowWorker:
                     attachmentKey: String(unique.length),
                     assetId: chip.getAttribute('data-media-id') ||
                         chip.getAttribute('data-asset-id') || chip.getAttribute('data-id') || '',
-                    urls: Array.from(new Set(urls.filter(Boolean)))
+                    urls: Array.from(new Set(urls.filter(Boolean))),
+                    labelText: [
+                        chip.textContent || '',
+                        chip.getAttribute('aria-label') || '',
+                        chip.getAttribute('title') || '',
+                        ...Array.from(chip.querySelectorAll('img')).map((img) => img.alt || '')
+                    ].filter(Boolean).join('\n')
                 });
             }
             return unique;
@@ -4205,6 +4289,9 @@ class GoogleFlowWorker:
                 if str(url or "").strip()
             ))
             attachment_key = str(item.get("attachmentKey") or "").strip()
+            label_text = str(item.get("labelText") or "").strip()
+            if not attachment_key and not asset_id and not urls and not label_text:
+                continue
             identity_key: tuple[str, object] | None = None
             if attachment_key:
                 identity_key = ("attachment", attachment_key)
@@ -4216,7 +4303,9 @@ class GoogleFlowWorker:
                 if identity_key in seen_keys:
                     continue
                 seen_keys.add(identity_key)
-            identities.append({"assetId": asset_id, "urls": urls})
+            identities.append(
+                {"assetId": asset_id, "urls": urls, "labelText": label_text}
+            )
         return identities
 
     async def _wait_for_prompt_attachment_count(
@@ -4677,6 +4766,7 @@ class GoogleFlowWorker:
         cached_identity: dict[str, object] | None = None,
     ) -> str:
         """Attach an existing upload by exact filename using the searchable picker."""
+        picker_started = time.monotonic()
         await self.dismiss_blocking_dialogs()
         add_btn = self.page.locator(
             "flow-creative-agent-prompt-box button[aria-label*='Add ingredients' i], "
@@ -4688,6 +4778,9 @@ class GoogleFlowWorker:
         ).first
         try:
             if not await add_btn.is_visible(timeout=4000):
+                self._log_reference_timing(
+                    "picker_total", filename, picker_started, outcome="button_missing"
+                )
                 return REFERENCE_RESULT_UI_ERROR
             await add_btn.click()
             await asyncio.sleep(0.8)
@@ -4704,6 +4797,7 @@ class GoogleFlowWorker:
                 await uploads_tab.click()
                 await asyncio.sleep(0.5)
 
+            lookup_started = time.monotonic()
             asset_item = await self._find_cached_picker_asset(cached_identity)
             if asset_item is not None:
                 logger.info(
@@ -4732,8 +4826,17 @@ class GoogleFlowWorker:
                 await self.page.keyboard.press("Enter")
                 await asyncio.sleep(0.8)
                 asset_item = await self._find_exact_picker_asset(filename)
+            self._log_reference_timing(
+                "picker_lookup",
+                filename,
+                lookup_started,
+                outcome="found" if asset_item is not None else "not_found",
+            )
             if asset_item is None:
                 await self._close_reference_ui()
+                self._log_reference_timing(
+                    "picker_total", filename, picker_started, outcome="not_found"
+                )
                 return REFERENCE_RESULT_NOT_FOUND
 
             await self._remember_reference_locator_keys(asset_item)
@@ -4753,11 +4856,25 @@ class GoogleFlowWorker:
             else:
                 # Older Flow versions attach immediately when the asset is clicked.
                 await self._close_reference_ui()
+            confirm_started = time.monotonic()
             attached = await self._wait_for_ingredient_chip()
-            return REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
+            self._log_reference_timing(
+                "chip_confirm",
+                filename,
+                confirm_started,
+                outcome="attached" if attached else "missing",
+            )
+            result = REFERENCE_RESULT_ATTACHED if attached else REFERENCE_RESULT_UI_ERROR
+            self._log_reference_timing(
+                "picker_total", filename, picker_started, outcome=result
+            )
+            return result
         except Exception as exc:
             logger.warning("Reference picker failed for '%s': %s", filename, exc)
             await self._close_reference_ui()
+            self._log_reference_timing(
+                "picker_total", filename, picker_started, outcome="ui_error"
+            )
             return REFERENCE_RESULT_UI_ERROR
 
     async def _attach_reference_from_gallery(self, filename: str) -> str:
@@ -4970,21 +5087,89 @@ class GoogleFlowWorker:
     ) -> None:
         """Ensure the prompt box has the desired reference image attached as an ingredient chip."""
         ref_ids = [str(r).strip() for r in (reference_ids or []) if str(r).strip()]
+        target_ref = ref_ids[0] if ref_ids else "none"
+        reference_path = str((reference_paths or {}).get(target_ref) or "").strip()
+        filename = self._reference_filename(reference_path) if reference_path else target_ref
+        started_at = time.monotonic()
+        outcome = "ok"
+        try:
+            async with asyncio.timeout(REFERENCE_SYNC_TIMEOUT_SECONDS):
+                await self._sync_reference_ingredients_impl(
+                    reference_ids,
+                    reference_paths,
+                )
+        except TimeoutError as exc:
+            outcome = "timeout"
+            try:
+                await self._close_reference_ui()
+            except Exception:
+                pass
+            raise FlowUiStateError(
+                "Hết thời gian xác minh ảnh tham chiếu trên Google Flow; "
+                "hệ thống sẽ thử lại từ checkpoint."
+            ) from exc
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            self._log_reference_timing(
+                "sync_total",
+                filename,
+                started_at,
+                outcome=outcome,
+            )
+
+    async def _sync_reference_ingredients_impl(
+        self,
+        reference_ids: list[str] | None,
+        reference_paths: dict[str, str] | None = None,
+    ) -> None:
+        ref_ids = [str(r).strip() for r in (reference_ids or []) if str(r).strip()]
         await self.dismiss_blocking_dialogs()
 
         if not ref_ids:
-            await self.clear_ingredient_chips()
+            if await self._has_ingredient_chip():
+                clear_started = time.monotonic()
+                await self.clear_ingredient_chips()
+                self._log_reference_timing("clear_chips", "none", clear_started)
+                if await self._has_ingredient_chip():
+                    raise FlowUiStateError(
+                        "Không thể xóa ảnh tham chiếu cũ khỏi prompt Google Flow."
+                    )
             return
 
         target_ref = ref_ids[0]
-
-        # Clear existing chips to avoid mixing wrong references
-        await self.clear_ingredient_chips()
-
         reference_path = str((reference_paths or {}).get(target_ref) or "").strip()
         if reference_path:
+            filename = self._reference_filename(reference_path)
+            if await self._has_expected_reference_attached(filename):
+                await self._remember_attached_reference_keys()
+                self._project_reference_cache().add(filename.casefold())
+                identity = dict(self._last_reference_identity)
+                if identity.get("asset_id") or identity.get("media_keys"):
+                    self._project_reference_asset_cache()[filename.casefold()] = identity
+                self._log_reference_event(
+                    "reused_attached",
+                    filename,
+                    detail="verified_prompt_chip",
+                )
+                return
+
+            if await self._has_ingredient_chip():
+                clear_started = time.monotonic()
+                await self.clear_ingredient_chips()
+                self._log_reference_timing("clear_chips", filename, clear_started)
+                if await self._has_ingredient_chip():
+                    raise FlowUiStateError(
+                        "Không thể xóa ảnh tham chiếu cũ trước khi gắn ảnh mới."
+                    )
             await self._sync_required_scene_reference(target_ref, reference_path)
             return
+
+        # Legacy reference ids do not have a required local file. Keep their
+        # best-effort attachment flow, but avoid scanning the clear UI when empty.
+        if await self._has_ingredient_chip():
+            await self.clear_ingredient_chips()
 
         add_btn = self.page.locator(
             "flow-creative-agent-prompt-box button[aria-label*='Add ingredients' i], "
@@ -5997,7 +6182,13 @@ class GoogleFlowWorker:
         # References must be visible before the baseline is captured so they can
         # never be mistaken for the result of the next prompt.
         await self.sync_reference_ingredients(reference_ids, reference_paths)
+        baseline_started = time.monotonic()
         baseline_keys = await self._capture_stable_image_baseline()
+        self._log_reference_timing(
+            "baseline",
+            next(iter(self._active_reference_filenames), "none"),
+            baseline_started,
+        )
         initial_error_texts = await self._get_existing_image_error_texts()
 
         # Locate prompt editor
@@ -6051,12 +6242,18 @@ class GoogleFlowWorker:
         async def restore_references_after_session_reset() -> None:
             await self.sync_reference_ingredients(reference_ids, reference_paths)
 
+        submit_started = time.monotonic()
         submitted_at, immediate_source = await self._submit_prompt_and_wait_for_ack(
             editor=editor,
             full_prompt=full_prompt,
             media_type="image",
             baseline_keys=baseline_keys,
             on_agent_session_reset=restore_references_after_session_reset,
+        )
+        self._log_reference_timing(
+            "submit_ack",
+            next(iter(self._active_reference_filenames), "none"),
+            submit_started,
         )
         receipt = self._remember_generation_receipt(
             request_key=request_key,

@@ -308,23 +308,27 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_clear_ingredient_chips_clicks_clear_button(self):
         page = MagicMock()
-        chips_loc = MagicMock()
-        chips_loc.count = AsyncMock(return_value=1)
         clear_btn = MagicMock()
-        clear_btn.first.is_visible = AsyncMock(return_value=True)
-        clear_btn.first.click = AsyncMock()
+        clear_btn.is_visible = AsyncMock(return_value=True)
+        clear_btn.click = AsyncMock()
+        clear_buttons = MagicMock()
+        clear_buttons.count = AsyncMock(return_value=1)
+        clear_buttons.nth.return_value = clear_btn
 
         def loc_router(sel):
-            if "flow-ingredient-chip" in sel:
-                return chips_loc
             if "clear" in sel.lower():
-                return clear_btn
+                return clear_buttons
             return MagicMock()
 
         page.locator.side_effect = loc_router
         worker = GoogleFlowWorker(page)
-        await worker.clear_ingredient_chips()
-        clear_btn.first.click.assert_called_once()
+        with patch.object(
+            worker,
+            "_has_ingredient_chip",
+            AsyncMock(side_effect=[True, False]),
+        ):
+            await worker.clear_ingredient_chips()
+        clear_btn.click.assert_awaited_once()
 
     async def test_sync_reference_ingredients_attaches_asset(self):
         page = MagicMock()
@@ -732,6 +736,112 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             "C:/assets/le_trong_tan.jpg",
         )
 
+    async def test_sync_reference_ingredients_reuses_verified_prompt_chip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "le_trong_tan.jpg"
+            reference_path.write_bytes(b"portrait")
+            page = MagicMock()
+            page.url = "https://flow.google.com/project/project-one"
+            page.context = object()
+            worker = GoogleFlowWorker(page)
+            worker._project_reference_asset_cache()[reference_path.name.casefold()] = {
+                "asset_id": "asset-one",
+                "media_keys": [],
+            }
+
+            with (
+                patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
+                patch.object(
+                    worker,
+                    "_prompt_attachment_identities",
+                    AsyncMock(
+                        return_value=[
+                            {"assetId": "asset-one", "urls": [], "labelText": ""}
+                        ]
+                    ),
+                ),
+                patch.object(
+                    worker,
+                    "_remember_attached_reference_keys",
+                    AsyncMock(),
+                ) as remember,
+                patch.object(worker, "clear_ingredient_chips", AsyncMock()) as clear,
+                patch.object(
+                    worker,
+                    "_sync_required_scene_reference",
+                    AsyncMock(),
+                ) as sync_required,
+            ):
+                await worker.sync_reference_ingredients(
+                    ["le_trong_tan"],
+                    {"le_trong_tan": str(reference_path)},
+                )
+
+            remember.assert_awaited_once()
+            clear.assert_not_awaited()
+            sync_required.assert_not_awaited()
+
+    async def test_sync_reference_ingredients_clears_mismatched_chip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "le_trong_tan.jpg"
+            reference_path.write_bytes(b"portrait")
+            page = MagicMock()
+            page.url = "https://flow.google.com/project/project-one"
+            worker = GoogleFlowWorker(page)
+
+            with (
+                patch.object(worker, "dismiss_blocking_dialogs", AsyncMock()),
+                patch.object(
+                    worker,
+                    "_has_expected_reference_attached",
+                    AsyncMock(return_value=False),
+                ),
+                patch.object(
+                    worker,
+                    "_has_ingredient_chip",
+                    AsyncMock(side_effect=[True, False]),
+                ),
+                patch.object(worker, "clear_ingredient_chips", AsyncMock()) as clear,
+                patch.object(
+                    worker,
+                    "_sync_required_scene_reference",
+                    AsyncMock(),
+                ) as sync_required,
+            ):
+                await worker.sync_reference_ingredients(
+                    ["le_trong_tan"],
+                    {"le_trong_tan": str(reference_path)},
+                )
+
+            clear.assert_awaited_once()
+            sync_required.assert_awaited_once_with(
+                "le_trong_tan",
+                str(reference_path),
+            )
+
+    async def test_reference_sync_timeout_is_transient_ui_error(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+
+        async def slow_sync(*args, **kwargs):
+            await asyncio.sleep(0.05)
+
+        with (
+            patch(
+                "nexus_engine.services.google_flow_worker.REFERENCE_SYNC_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            patch.object(
+                worker,
+                "_sync_reference_ingredients_impl",
+                AsyncMock(side_effect=slow_sync),
+            ),
+            patch.object(worker, "_close_reference_ui", AsyncMock()),
+        ):
+            with self.assertRaises(FlowUiStateError):
+                await worker.sync_reference_ingredients(["le_trong_tan"])
+
     async def test_same_filename_ignores_changed_file_content(self):
         with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
             first_path = Path(first_dir) / "le_trong_tan.jpg"
@@ -776,21 +886,44 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         page = MagicMock()
         page.url = "https://flow.google.com/project/project-one"
         asset_items = MagicMock()
-        asset_items.count = AsyncMock(return_value=3)
-        similar = MagicMock()
-        similar.inner_text = AsyncMock(return_value="le_trong_tan_old.jpg\nHình ảnh")
         first_exact = MagicMock()
-        first_exact.inner_text = AsyncMock(return_value="le_trong_tan.jpg\nHình ảnh")
-        second_exact = MagicMock()
-        second_exact.inner_text = AsyncMock(return_value="le_trong_tan.jpg\nHình ảnh")
-        asset_items.nth.side_effect = [similar, first_exact, second_exact]
+        asset_items.evaluate_all = AsyncMock(return_value=1)
+        asset_items.nth.return_value = first_exact
         page.locator.return_value = asset_items
         worker = GoogleFlowWorker(page)
 
         result = await worker._find_exact_picker_asset("le_trong_tan.jpg")
 
         self.assertIs(result, first_exact)
-        second_exact.inner_text.assert_not_awaited()
+        asset_items.evaluate_all.assert_awaited_once()
+        payload = asset_items.evaluate_all.await_args.args[1]
+        self.assertEqual(payload["filename"], "le_trong_tan.jpg")
+
+    async def test_cached_picker_asset_uses_media_key_without_asset_id(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        candidates = MagicMock()
+        matched = MagicMock()
+        candidates.evaluate_all = AsyncMock(return_value=0)
+        candidates.nth.return_value = matched
+        page.locator.return_value = candidates
+        worker = GoogleFlowWorker(page)
+
+        result = await worker._find_cached_picker_asset(
+            {
+                "asset_id": "",
+                "media_keys": [
+                    "https://flow-content.google/reference/portrait=s0?size=thumb"
+                ],
+            }
+        )
+
+        self.assertIs(result, matched)
+        payload = candidates.evaluate_all.await_args.args[1]
+        self.assertEqual(
+            payload["mediaKeys"],
+            ["https://flow-content.google/reference/portrait"],
+        )
 
     async def test_wait_for_image_accepts_result_while_progress_is_stale(self):
         page = MagicMock()
@@ -3589,22 +3722,39 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_has_ingredient_chip_finds_prompt_attachment_image(self):
         page = MagicMock()
+        page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "attachmentKey": "0",
+                    "assetId": "",
+                    "urls": ["https://flow-content.google/reference/portrait"],
+                    "labelText": "",
+                }
+            ]
+        )
         worker = GoogleFlowWorker(page)
-        page.locator = MagicMock()
-        img_loc = MagicMock()
-        img_loc.first = MagicMock()
-        img_loc.first.is_visible = AsyncMock(return_value=True)
-
-        def loc_router(sel):
-            if "flow-prompt-box" in sel:
-                return img_loc
-            mock_none = MagicMock()
-            mock_none.first.is_visible = AsyncMock(return_value=False)
-            return mock_none
-
-        page.locator.side_effect = loc_router
         has_chip = await worker._has_ingredient_chip()
+
         self.assertTrue(has_chip)
+        page.evaluate.assert_awaited_once()
+
+    async def test_has_ingredient_chip_ignores_unrelated_evaluate_records(self):
+        page = MagicMock()
+        page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "src": "https://flow-content.google/image/generated",
+                    "className": "image",
+                    "width": 1376,
+                    "height": 768,
+                }
+            ]
+        )
+        worker = GoogleFlowWorker(page)
+
+        has_chip = await worker._has_ingredient_chip()
+
+        self.assertFalse(has_chip)
 
     async def test_new_agent_reference_chip_identity_is_excluded_from_results(self):
         page = MagicMock()

@@ -6156,6 +6156,18 @@ def resume_background_jobs() -> None:
         "fb_crosspost_sync",
     ):
         db.recover_interrupted_system_jobs(prod_job)
+    reset_fb_schedules = db.reset_fb_queue_schedules_outside_meta_window()
+    if reset_fb_schedules["reset_count"]:
+        logger.info(
+            "Đã đưa %d lịch Facebook local-only ngoài cửa sổ Meta về hàng đợi.",
+            reset_fb_schedules["reset_count"],
+        )
+    paused_fb_checkpoints = db.pause_interrupted_fb_queue_checkpoints()
+    if paused_fb_checkpoints:
+        logger.info(
+            "Đã tạm dừng %d checkpoint Facebook bị gián đoạn để tiếp tục an toàn.",
+            paused_fb_checkpoints,
+        )
     paused_muse_jobs = _pause_muse_jobs_for_manual_resume_after_restart()
     if paused_muse_jobs:
         logger.info(
@@ -17901,6 +17913,11 @@ def open_animated_icons_folder():
 
 from nexus_engine.services import fb_crossposter_service
 from nexus_engine.services import fb_token_service
+from nexus_engine.services.facebook_schedule_policy import (
+    META_MAX_SCHEDULE_AHEAD_DAYS,
+    MetaScheduleWindowError,
+    validate_meta_schedule_epoch,
+)
 
 try:
     fb_crossposter_service.scheduler.start()
@@ -17983,7 +18000,7 @@ class FBCrossPosterClearPayload(BaseModel):
 
 class FBCrossPosterScheduleAheadPayload(BaseModel):
     page_id: str = ""
-    days_ahead: int = 7
+    days_ahead: int = Field(default=7, ge=1, le=META_MAX_SCHEDULE_AHEAD_DAYS)
 
 
 @app.get("/api/fb-crossposter/campaigns")
@@ -18545,6 +18562,14 @@ def update_fb_crossposter_item(item_id: int, payload: FBCrossPosterItemUpdatePay
                     )
                 fields["scheduled_publish_time"] = int(zoned_value.timestamp())
         except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    scheduled_epoch = int(fields.get("scheduled_publish_time") or 0)
+    if scheduled_epoch:
+        try:
+            fields["scheduled_publish_time"] = validate_meta_schedule_epoch(
+                scheduled_epoch
+            )
+        except MetaScheduleWindowError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
     if payload.fb_description is not None:
         fields["fb_description_source"] = "manual"

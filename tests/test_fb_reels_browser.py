@@ -1,7 +1,9 @@
 """Unit tests for Facebook Reels browser automation and dispatcher."""
 
+import asyncio
 import datetime
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 import sys
@@ -33,6 +35,174 @@ import nexus_engine.services.database as db
 
 
 class TestFbReelsBrowser(unittest.TestCase):
+    def test_meta_upload_timeout_scales_with_file_size_and_is_bounded(self):
+        self.assertEqual(
+            fb_browser._meta_upload_timeout_seconds(0),
+            fb_browser.META_UPLOAD_MIN_TIMEOUT_SECONDS,
+        )
+        self.assertGreater(
+            fb_browser._meta_upload_timeout_seconds(248_227_449),
+            fb_browser.META_UPLOAD_MIN_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            fb_browser._meta_upload_timeout_seconds(10_000_000_000),
+            fb_browser.META_UPLOAD_MAX_TIMEOUT_SECONDS,
+        )
+
+    def test_meta_upload_snapshot_rejects_unrelated_visible_100_percent(self):
+        state = fb_browser._resolve_meta_upload_snapshot(
+            {
+                "percentage_samples": [
+                    {
+                        "percent": 100,
+                        "context": "Cài đặt bố cục: chiều rộng 100%",
+                    }
+                ],
+                "next_enabled": False,
+            },
+            "video_2282.mp4",
+        )
+
+        self.assertFalse(state["complete"])
+        self.assertIsNone(state["percent"])
+
+    def test_meta_upload_snapshot_accepts_media_scoped_progress(self):
+        waiting_state = fb_browser._resolve_meta_upload_snapshot(
+            {
+                "percentage_samples": [
+                    {
+                        "percent": 0,
+                        "context": "File phương tiện video_2282.mp4 0%",
+                    }
+                ],
+                "next_enabled": False,
+            },
+            "video_2282.mp4",
+        )
+        completed_state = fb_browser._resolve_meta_upload_snapshot(
+            {
+                "percentage_samples": [
+                    {
+                        "percent": 100,
+                        "context": "File phương tiện video_2282.mp4 100%",
+                    }
+                ],
+                "next_enabled": True,
+            },
+            "video_2282.mp4",
+        )
+
+        self.assertEqual(waiting_state["percent"], 0)
+        self.assertFalse(waiting_state["complete"])
+        self.assertEqual(completed_state["percent"], 100)
+        self.assertTrue(completed_state["complete"])
+
+    def test_meta_upload_wait_honors_cancel_before_reading_page(self):
+        reader = AsyncMock()
+
+        with self.assertRaisesRegex(FbBrowserAutomationError, "yêu cầu dừng") as caught:
+            asyncio.run(
+                fb_browser._wait_for_meta_upload(
+                    object(),
+                    "video.mp4",
+                    timeout_seconds=2,
+                    cancel_check=lambda: True,
+                    poll_interval_seconds=1,
+                    state_reader=reader,
+                    sleep_func=AsyncMock(),
+                )
+            )
+
+        self.assertEqual(caught.exception.phase, "CP5_ASSET_UPLOADED")
+        reader.assert_not_awaited()
+
+    def test_meta_upload_wait_times_out_at_zero_percent(self):
+        reader = AsyncMock(
+            return_value={
+                "complete": False,
+                "percent": 0,
+                "failure_marker": "",
+            }
+        )
+
+        with self.assertRaisesRegex(FbBrowserAutomationError, "0%") as caught:
+            asyncio.run(
+                fb_browser._wait_for_meta_upload(
+                    object(),
+                    "video.mp4",
+                    timeout_seconds=2,
+                    poll_interval_seconds=1,
+                    state_reader=reader,
+                    sleep_func=AsyncMock(),
+                )
+            )
+
+        self.assertEqual(caught.exception.phase, "CP5_ASSET_UPLOADED")
+        self.assertEqual(reader.await_count, 2)
+
+    def test_meta_upload_wait_returns_only_after_verified_completion(self):
+        reader = AsyncMock(
+            side_effect=[
+                {"complete": False, "percent": 0, "failure_marker": ""},
+                {"complete": True, "percent": 100, "failure_marker": ""},
+            ]
+        )
+
+        state = asyncio.run(
+            fb_browser._wait_for_meta_upload(
+                object(),
+                "video.mp4",
+                timeout_seconds=2,
+                poll_interval_seconds=1,
+                state_reader=reader,
+                sleep_func=AsyncMock(),
+            )
+        )
+
+        self.assertTrue(state["complete"])
+        self.assertEqual(state["percent"], 100)
+
+    def test_enabled_button_wait_fails_closed_when_button_stays_disabled(self):
+        button = AsyncMock()
+        button.is_visible.return_value = True
+        button.is_enabled.return_value = False
+
+        with self.assertRaisesRegex(FbBrowserAutomationError, "vẫn bị khóa") as caught:
+            asyncio.run(
+                fb_browser._wait_for_enabled_button(
+                    button,
+                    button_label="Tiếp",
+                    phase="CP6_METADATA_FILLED",
+                    timeout_seconds=2,
+                    poll_interval_seconds=1,
+                    sleep_func=AsyncMock(),
+                )
+            )
+
+        self.assertEqual(caught.exception.phase, "CP6_METADATA_FILLED")
+        self.assertEqual(button.is_enabled.await_count, 2)
+        button.get_attribute.assert_not_awaited()
+
+    def test_browser_rejects_schedule_outside_meta_window_before_cdp(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "video.mp4"
+            video_path.write_bytes(b"test")
+            far_schedule = int(
+                (
+                    datetime.datetime.now(datetime.timezone.utc)
+                    + datetime.timedelta(days=30)
+                ).timestamp()
+            )
+            with self.assertRaisesRegex(ValueError, "29 ngày"):
+                asyncio.run(
+                    fb_browser.schedule_reel_via_gpm(
+                        profile_id="profile-test",
+                        video_path=video_path,
+                        caption="test",
+                        schedule_datetime=far_schedule,
+                    )
+                )
+
     def test_legacy_crossposter_timestamp_assumes_vietnam_timezone(self):
         expected = int(
             datetime.datetime(
@@ -145,6 +315,43 @@ class TestFbReelsBrowser(unittest.TestCase):
                 datetime.date(2026, 10, 7),
             ),
             (1, 0),
+        )
+
+    def test_calendar_cards_create_facebook_occupancy_only(self):
+        zone = datetime.timezone(datetime.timedelta(hours=7))
+        expected = int(datetime.datetime(2026, 11, 28, 19, 0, tzinfo=zone).timestamp())
+        cards = [
+            {
+                "title": "Bài Facebook thực tế",
+                "time": "19:00",
+                "platforms": ["Facebook"],
+                "column_index": 6,
+            },
+            {
+                "title": "Bài chỉ Instagram",
+                "time": "11:00",
+                "platforms": ["Instagram"],
+                "column_index": 6,
+            },
+        ]
+
+        occupancy = fb_browser._calendar_cards_to_occupancy(
+            cards,
+            week_start=datetime.date(2026, 11, 22),
+            timezone_name="Asia/Bangkok",
+            earliest_ts=expected - 86400,
+            latest_ts=expected + 86400,
+        )
+
+        self.assertEqual(
+            occupancy,
+            [
+                {
+                    "scheduled_publish_time": expected,
+                    "title": "Bài Facebook thực tế",
+                    "source": "meta_calendar",
+                }
+            ],
         )
 
     def test_db_fb_crossposter_settings_upload_mode(self):

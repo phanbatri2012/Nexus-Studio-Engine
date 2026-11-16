@@ -10,6 +10,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from nexus_engine.paths import DATA_DIR
+from nexus_engine.services.facebook_schedule_policy import (
+    META_MAX_SCHEDULE_AHEAD_DAYS,
+    META_MIN_SCHEDULE_LEAD_MINUTES,
+    MetaScheduleCapacityError,
+    meta_schedule_window_epochs,
+)
 
 # Fix the path to point correctly from where the app runs
 # Since main.py is run from the project root usually, we can resolve relative to this file
@@ -1454,6 +1460,20 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_fb_crossposter_queue_status ON fb_crossposter_queue(status)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_fb_crossposter_queue_sort ON fb_crossposter_queue(sort_order)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_fb_queue_page_status ON fb_crossposter_queue(target_page_id, status, scheduled_publish_time)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS fb_meta_calendar_occupancy (
+            target_page_id TEXT NOT NULL,
+            scheduled_publish_time INTEGER NOT NULL,
+            title TEXT DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'meta_calendar',
+            synced_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (target_page_id, scheduled_publish_time)
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fb_meta_calendar_page_time "
+        "ON fb_meta_calendar_occupancy(target_page_id, scheduled_publish_time)"
+    )
 
     try:
         c.execute(
@@ -7257,12 +7277,147 @@ def append_fb_recovery_history(item_id: int, event: str, details: dict | None = 
         conn.close()
 
 
+def _ensure_fb_meta_calendar_occupancy_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fb_meta_calendar_occupancy (
+            target_page_id TEXT NOT NULL,
+            scheduled_publish_time INTEGER NOT NULL,
+            title TEXT DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'meta_calendar',
+            synced_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (target_page_id, scheduled_publish_time)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fb_meta_calendar_page_time "
+        "ON fb_meta_calendar_occupancy(target_page_id, scheduled_publish_time)"
+    )
+
+
+def replace_fb_meta_calendar_occupancy(
+    target_page_id: str,
+    slots: list[dict],
+    *,
+    source: str = "meta_calendar",
+) -> int:
+    """Atomically replace one Fanpage's verified Meta Calendar occupancy."""
+    page_id = str(target_page_id or "").strip()
+    if not page_id:
+        raise ValueError("Thiếu Fanpage ID khi đồng bộ lịch Meta")
+    normalized: dict[int, str] = {}
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        try:
+            scheduled_time = int(slot.get("scheduled_publish_time") or 0)
+        except (TypeError, ValueError):
+            continue
+        if scheduled_time <= 0:
+            continue
+        normalized[scheduled_time] = str(slot.get("title") or "").strip()[:500]
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_fb_meta_calendar_occupancy_table(conn)
+        conn.execute(
+            "DELETE FROM fb_meta_calendar_occupancy WHERE target_page_id = ?",
+            (page_id,),
+        )
+        synced_at = utc_now()
+        conn.executemany(
+            """
+            INSERT INTO fb_meta_calendar_occupancy (
+                target_page_id, scheduled_publish_time, title, source, synced_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (page_id, scheduled_time, title, str(source or "meta_calendar"), synced_at)
+                for scheduled_time, title in sorted(normalized.items())
+            ],
+        )
+        conn.commit()
+        return len(normalized)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_fb_meta_calendar_occupancy(
+    target_page_id: str,
+    *,
+    earliest_ts: int = 0,
+    latest_ts: int = 0,
+) -> list[dict]:
+    """Return the latest verified occupancy snapshot for one Fanpage."""
+    page_id = str(target_page_id or "").strip()
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        _ensure_fb_meta_calendar_occupancy_table(conn)
+        filters = ["target_page_id = ?"]
+        params: list[object] = [page_id]
+        if int(earliest_ts or 0) > 0:
+            filters.append("scheduled_publish_time >= ?")
+            params.append(int(earliest_ts))
+        if int(latest_ts or 0) > 0:
+            filters.append("scheduled_publish_time <= ?")
+            params.append(int(latest_ts))
+        rows = conn.execute(
+            f"""
+            SELECT target_page_id, scheduled_publish_time, title, source, synced_at
+            FROM fb_meta_calendar_occupancy
+            WHERE {' AND '.join(filters)}
+            ORDER BY scheduled_publish_time ASC
+            """,
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def fb_meta_calendar_slot_is_occupied(
+    target_page_id: str,
+    scheduled_publish_time: int,
+    *,
+    tolerance_seconds: int = 15 * 60,
+) -> bool:
+    """Return whether a verified Meta Calendar card occupies this local slot."""
+    page_id = str(target_page_id or "").strip()
+    scheduled_time = int(scheduled_publish_time or 0)
+    if not page_id or scheduled_time <= 0:
+        return False
+    tolerance = max(0, int(tolerance_seconds))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        _ensure_fb_meta_calendar_occupancy_table(conn)
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM fb_meta_calendar_occupancy
+            WHERE target_page_id = ?
+              AND scheduled_publish_time >= ?
+              AND scheduled_publish_time <= ?
+            LIMIT 1
+            """,
+            (page_id, scheduled_time - tolerance, scheduled_time + tolerance),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def reserve_next_fb_queue_slot(
     item_id: int,
     *,
     minimum_lead_minutes: int = 30,
     clear_meta_object: bool = False,
-    max_horizon_days: int = 70,
+    max_horizon_days: int = META_MAX_SCHEDULE_AHEAD_DAYS,
     now_utc: datetime.datetime | None = None,
 ) -> int:
     """Atomically reserve the next configured free slot for an item on its Fanpage."""
@@ -7310,11 +7465,16 @@ def reserve_next_fb_queue_slot(
             now_value = now_value.replace(tzinfo=datetime.timezone.utc)
         now_value = now_value.astimezone(datetime.timezone.utc)
         local_now = now_value.astimezone(publication_zone)
-        earliest_ts = int((now_value + datetime.timedelta(minutes=lead_minutes)).timestamp())
+        earliest_ts, latest_ts = meta_schedule_window_epochs(
+            now_utc=now_value,
+            minimum_lead_minutes=lead_minutes,
+        )
 
         occupied_rows = conn.execute(
             """
-            SELECT scheduled_publish_time, meta_scheduled_publish_time
+            SELECT id, status, scheduled_publish_time, meta_scheduled_publish_time,
+                   fb_post_id, upload_video_id, upload_session_id,
+                   checkpoint_phase, can_resume, meta_state
             FROM fb_crossposter_queue
             WHERE id != ? AND COALESCE(target_page_id, '') = ?
               AND (
@@ -7322,6 +7482,7 @@ def reserve_next_fb_queue_slot(
                         'scheduled', 'downloading', 'uploading', 'verifying', 'processing',
                         'retryable', 'meta_scheduled', 'schedule_mismatch', 'stalled'
                     )
+                    OR COALESCE(can_resume, 0) = 1
                     OR COALESCE(fb_post_id, '') != ''
                   )
             """,
@@ -7331,42 +7492,80 @@ def reserve_next_fb_queue_slot(
             int(value)
             for row in occupied_rows
             for value in (row["scheduled_publish_time"], row["meta_scheduled_publish_time"])
-            if int(value or 0) > 0
+            if earliest_ts <= int(value or 0) <= latest_ts
         }
+        _ensure_fb_meta_calendar_occupancy_table(conn)
+        remote_occupied_rows = conn.execute(
+            """
+            SELECT scheduled_publish_time
+            FROM fb_meta_calendar_occupancy
+            WHERE target_page_id = ?
+              AND scheduled_publish_time >= ?
+              AND scheduled_publish_time <= ?
+            """,
+            (page_id, earliest_ts, latest_ts),
+        ).fetchall()
+        remote_occupied = {
+            int(row["scheduled_publish_time"])
+            for row in remote_occupied_rows
+            if int(row["scheduled_publish_time"] or 0) > 0
+        }
+        occupied.update(remote_occupied)
+        remote_schedule_frontier = max(remote_occupied, default=0)
 
         reserved_ts = 0
-        horizon_limit = max(1, min(int(max_horizon_days), 366))
-        for day_offset in range(horizon_limit):
+        candidate_slots: list[int] = []
+        horizon_limit = max(1, min(int(max_horizon_days), META_MAX_SCHEDULE_AHEAD_DAYS))
+        for day_offset in range(horizon_limit + 1):
             target_date = local_now.date() + datetime.timedelta(days=day_offset)
             for slot_time in valid_times:
                 candidate_ts = _local_slot_epoch(target_date, slot_time, publication_zone)
                 if candidate_ts is None:
                     continue
-                if candidate_ts <= earliest_ts:
+                if candidate_ts < earliest_ts or candidate_ts > latest_ts:
                     continue
+                if candidate_ts <= remote_schedule_frontier:
+                    continue
+                candidate_slots.append(candidate_ts)
                 if any(abs(candidate_ts - occupied_ts) < 900 for occupied_ts in occupied):
                     continue
                 reserved_ts = candidate_ts
                 break
             if reserved_ts:
                 break
-        if not reserved_ts and horizon_limit < 366:
-            for day_offset in range(horizon_limit, 367):
-                target_date = local_now.date() + datetime.timedelta(days=day_offset)
-                for slot_time in valid_times:
-                    candidate_ts = _local_slot_epoch(target_date, slot_time, publication_zone)
-                    if candidate_ts is None:
-                        continue
-                    if candidate_ts <= earliest_ts:
-                        continue
-                    if any(abs(candidate_ts - occupied_ts) < 900 for occupied_ts in occupied):
-                        continue
-                    reserved_ts = candidate_ts
-                    break
-                if reserved_ts:
-                    break
         if not reserved_ts:
-            raise RuntimeError("Không tìm được slot Facebook trống trong 366 ngày tới")
+            candidate_slot_set = set(candidate_slots)
+            evictable_rows = [
+                row
+                for row in occupied_rows
+                if str(row["status"] or "") == "scheduled"
+                and int(row["scheduled_publish_time"] or 0) in candidate_slot_set
+                and not str(row["fb_post_id"] or "").strip()
+                and not str(row["upload_video_id"] or "").strip()
+                and not str(row["upload_session_id"] or "").strip()
+                and int(row["meta_scheduled_publish_time"] or 0) == 0
+                and str(row["checkpoint_phase"] or "") != "CP8_SUBMITTED"
+                and int(row["can_resume"] or 0) == 0
+                and str(row["meta_state"] or "") != "scheduled"
+            ]
+            if evictable_rows:
+                displaced = max(
+                    evictable_rows,
+                    key=lambda row: int(row["scheduled_publish_time"] or 0),
+                )
+                reserved_ts = int(displaced["scheduled_publish_time"])
+                conn.execute(
+                    """
+                    UPDATE fb_crossposter_queue
+                    SET scheduled_publish_time = 0, status = 'pending', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (utc_now(), int(displaced["id"])),
+                )
+        if not reserved_ts:
+            raise MetaScheduleCapacityError(
+                f"Không còn slot Facebook trống trong {META_MAX_SCHEDULE_AHEAD_DAYS} ngày tới"
+            )
 
         previous_video_id = str(item["fb_post_id"] or "")
         assignments = [
@@ -7493,6 +7692,7 @@ def recalculate_fb_queue_schedule(
     sort_order_mode: str = "oldest_first",
     timezone_name: str = "Asia/Ho_Chi_Minh",
     now_utc: datetime.datetime | None = None,
+    max_horizon_days: int = META_MAX_SCHEDULE_AHEAD_DAYS,
 ) -> int:
     """Recalculate scheduled_publish_time for pending/scheduled items of a specific Fanpage with smart collision prevention."""
     if daily_quota <= 0 or not times_list:
@@ -7506,6 +7706,7 @@ def recalculate_fb_queue_schedule(
             WHERE status IN ('pending', 'scheduled') 
               AND (fb_post_id IS NULL OR fb_post_id = '')
               AND (upload_video_id IS NULL OR upload_video_id = '')
+              AND COALESCE(can_resume, 0) = 0
               AND (checkpoint_phase IS NULL OR checkpoint_phase != 'CP8_SUBMITTED')
               AND status != 'meta_scheduled'
               AND (meta_state IS NULL OR meta_state != 'scheduled')
@@ -7539,12 +7740,16 @@ def recalculate_fb_queue_schedule(
         if not rows:
             return 0
 
-        # Phase 1: Reset scheduled_publish_time to 0 for items being recalculated
-        # to prevent intermediate UNIQUE constraint collisions on idx_fb_queue_unique_active_slot
+        # Reset local-only items first to prevent intermediate unique-slot collisions.
+        # Overflow remains pending instead of receiving a date Meta will reject.
         placeholders = ",".join("?" for _ in rows)
         conn.execute(
-            f"UPDATE fb_crossposter_queue SET scheduled_publish_time = 0 WHERE id IN ({placeholders})",
-            [r[0] for r in rows],
+            f"""
+            UPDATE fb_crossposter_queue
+            SET scheduled_publish_time = 0, status = 'pending', updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            [utc_now(), *[r[0] for r in rows]],
         )
 
         publication_zone = _publication_zone(timezone_name)
@@ -7552,9 +7757,12 @@ def recalculate_fb_queue_schedule(
         if now_value.tzinfo is None:
             now_value = now_value.replace(tzinfo=datetime.timezone.utc)
         now_value = now_value.astimezone(datetime.timezone.utc)
-        now_ts = int(now_value.timestamp())
         local_now = now_value.astimezone(publication_zone)
         current_date = start_date or local_now.date()
+        earliest_ts, latest_ts = meta_schedule_window_epochs(
+            now_utc=now_value,
+            minimum_lead_minutes=META_MIN_SCHEDULE_LEAD_MINUTES,
+        )
         time_slots: list[datetime.time] = []
         for raw_time in times_list:
             try:
@@ -7565,16 +7773,13 @@ def recalculate_fb_queue_schedule(
         time_slots = sorted(time_slots)[:daily_quota]
         if not time_slots:
             raise ValueError("Fanpage chưa có khung giờ đăng hợp lệ")
-        slot_count = len(time_slots)
-        effective_slots_per_day = slot_count
-
         # 1. Collect all occupied slots (published, in-flight, or already uploaded to Meta Cloud with future publish time, excluding rows to be rescheduled)
         row_ids = [r[0] for r in rows]
-        occ_params = [now_ts]
+        occ_params = [earliest_ts, latest_ts]
         id_exclusion_sql = f"AND id NOT IN ({placeholders})"
         occ_params.extend(row_ids)
 
-        occ_where = f"WHERE scheduled_publish_time > ? {id_exclusion_sql} AND ((fb_post_id IS NOT NULL AND fb_post_id != '') OR status IN ('scheduled', 'downloading', 'uploading', 'verifying', 'processing', 'retryable', 'meta_scheduled', 'schedule_mismatch', 'stalled', 'published'))"
+        occ_where = f"WHERE scheduled_publish_time >= ? AND scheduled_publish_time <= ? {id_exclusion_sql} AND ((fb_post_id IS NOT NULL AND fb_post_id != '') OR COALESCE(can_resume, 0) = 1 OR status IN ('scheduled', 'downloading', 'uploading', 'verifying', 'processing', 'retryable', 'meta_scheduled', 'schedule_mismatch', 'stalled', 'published'))"
         if target_pid:
             occ_where += " AND target_page_id = ?"
             occ_params.append(target_pid)
@@ -7587,57 +7792,45 @@ def recalculate_fb_queue_schedule(
         """, occ_params).fetchall()
 
         occupied_slots: set[int] = {r[0] for r in occupied_rows if r[0] and r[0] > 0}
+        _ensure_fb_meta_calendar_occupancy_table(conn)
+        remote_occupied_rows = conn.execute(
+            """
+            SELECT scheduled_publish_time
+            FROM fb_meta_calendar_occupancy
+            WHERE target_page_id = ?
+              AND scheduled_publish_time >= ?
+              AND scheduled_publish_time <= ?
+            """,
+            (target_pid, earliest_ts, latest_ts),
+        ).fetchall()
+        remote_occupied_slots = {
+            int(row[0])
+            for row in remote_occupied_rows
+            if int(row[0] or 0) > 0
+        }
+        occupied_slots.update(remote_occupied_slots)
+        remote_schedule_frontier = max(remote_occupied_slots, default=0)
 
-        slot_index = 0
-        date_offset = 0
-        updated_count = 0
-
-        for row in rows:
-            item_id = row[0]
-
-            # Find next free, non-colliding time slot
-            while True:
-                target_date = current_date + datetime.timedelta(days=date_offset)
-                slot_time = time_slots[slot_index % slot_count]
-                candidate_ts = _local_slot_epoch(
-                    target_date,
-                    slot_time,
-                    publication_zone,
-                )
-
+        horizon_limit = max(1, min(int(max_horizon_days), META_MAX_SCHEDULE_AHEAD_DAYS))
+        available_slots: list[int] = []
+        for date_offset in range(horizon_limit + 1):
+            target_date = current_date + datetime.timedelta(days=date_offset)
+            for slot_time in time_slots:
+                candidate_ts = _local_slot_epoch(target_date, slot_time, publication_zone)
                 if candidate_ts is None:
-                    slot_index += 1
-                    if slot_index % effective_slots_per_day == 0:
-                        date_offset += 1
-                        slot_index = 0
                     continue
-
-                # If candidate slot is in the past or < 10 mins in future, advance to next slot
-                if candidate_ts <= (now_ts + 600):
-                    slot_index += 1
-                    if slot_index % effective_slots_per_day == 0:
-                        date_offset += 1
-                        slot_index = 0
+                if candidate_ts < earliest_ts or candidate_ts > latest_ts:
                     continue
-
-                # Check collision with already occupied slots (within 15 minutes window)
-                is_colliding = any(abs(candidate_ts - occ_ts) < 900 for occ_ts in occupied_slots)
-                if is_colliding:
-                    slot_index += 1
-                    if slot_index % effective_slots_per_day == 0:
-                        date_offset += 1
-                        slot_index = 0
+                if candidate_ts <= remote_schedule_frontier:
                     continue
+                if any(abs(candidate_ts - occ_ts) < 900 for occ_ts in occupied_slots):
+                    continue
+                available_slots.append(candidate_ts)
+                occupied_slots.add(candidate_ts)
 
-                # Found free slot!
-                scheduled_ts = candidate_ts
-                occupied_slots.add(scheduled_ts)
-                slot_index += 1
-                if slot_index % effective_slots_per_day == 0:
-                    date_offset += 1
-                    slot_index = 0
-                break
-
+        updated_count = 0
+        for row, scheduled_ts in zip(rows, available_slots):
+            item_id = row[0]
             conn.execute("""
                 UPDATE fb_crossposter_queue
                 SET scheduled_publish_time = ?, status = 'scheduled', updated_at = ?
@@ -7647,6 +7840,110 @@ def recalculate_fb_queue_schedule(
 
         conn.commit()
         return updated_count
+    finally:
+        conn.close()
+
+
+def reset_fb_queue_schedules_outside_meta_window(
+    target_page_id: str = "",
+    *,
+    now_utc: datetime.datetime | None = None,
+) -> dict[str, int]:
+    """Reset local-only schedules beyond Meta's safe window without clearing checkpoints."""
+    _, latest_ts = meta_schedule_window_epochs(now_utc=now_utc)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        where_sql = """
+            WHERE scheduled_publish_time > ?
+              AND COALESCE(fb_post_id, '') = ''
+              AND COALESCE(upload_video_id, '') = ''
+              AND COALESCE(meta_scheduled_publish_time, 0) = 0
+              AND COALESCE(checkpoint_phase, '') != 'CP8_SUBMITTED'
+              AND COALESCE(meta_state, '') != 'scheduled'
+        """
+        params: list[object] = [latest_ts]
+        target_pid = str(target_page_id or "").strip()
+        if target_pid:
+            where_sql += " AND target_page_id = ?"
+            params.append(target_pid)
+
+        affected = conn.execute(
+            f"SELECT id, status, COALESCE(can_resume, 0) AS can_resume FROM fb_crossposter_queue {where_sql}",
+            params,
+        ).fetchall()
+        if not affected:
+            conn.commit()
+            return {"reset_count": 0, "pending_count": 0, "checkpoint_count": 0}
+
+        ids = [int(row["id"]) for row in affected]
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"""
+            UPDATE fb_crossposter_queue
+            SET scheduled_publish_time = 0,
+                status = CASE
+                    WHEN status = 'checkpoint_paused' THEN status
+                    WHEN COALESCE(can_resume, 0) = 1 THEN 'checkpoint_paused'
+                    ELSE 'pending'
+                END,
+                updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            [utc_now(), *ids],
+        )
+        conn.commit()
+        checkpoint_count = sum(
+            1
+            for row in affected
+            if row["status"] == "checkpoint_paused" or int(row["can_resume"] or 0) == 1
+        )
+        return {
+            "reset_count": len(ids),
+            "pending_count": len(ids) - checkpoint_count,
+            "checkpoint_count": checkpoint_count,
+        }
+    finally:
+        conn.close()
+
+
+def pause_interrupted_fb_queue_checkpoints() -> int:
+    """Pause resumable pre-Meta queue work left in-flight by a stopped process."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE fb_crossposter_queue
+            SET status = 'checkpoint_paused',
+                scheduled_publish_time = 0,
+                can_resume = 1,
+                error_message = CASE
+                    WHEN COALESCE(error_message, '') = ''
+                    THEN 'Tác vụ trước bị gián đoạn; có thể tiếp tục từ checkpoint đã lưu.'
+                    ELSE error_message
+                END,
+                updated_at = ?
+            WHERE status IN (
+                    'downloading', 'uploading', 'verifying', 'processing',
+                    'checkpoint_paused'
+                  )
+              AND COALESCE(checkpoint_phase, '') != ''
+              AND COALESCE(checkpoint_phase, '') != 'CP8_SUBMITTED'
+              AND COALESCE(fb_post_id, '') = ''
+              AND COALESCE(upload_session_id, '') = ''
+              AND COALESCE(upload_video_id, '') = ''
+              AND COALESCE(meta_scheduled_publish_time, 0) = 0
+              AND COALESCE(meta_state, '') != 'scheduled'
+              AND (
+                    status != 'checkpoint_paused'
+                    OR COALESCE(scheduled_publish_time, 0) != 0
+                  )
+            """,
+            (utc_now(),),
+        )
+        conn.commit()
+        return int(cursor.rowcount or 0)
     finally:
         conn.close()
 
@@ -7721,19 +8018,20 @@ def get_next_queue_items_for_pre_schedule(target_page_id: str, count: int) -> li
     conn.row_factory = sqlite3.Row
     try:
         now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        _, latest_ts = meta_schedule_window_epochs()
         where_sql = "WHERE status IN ('pending', 'scheduled', 'error', 'failed', 'missing', 'checkpoint_paused') AND (fb_post_id IS NULL OR fb_post_id = '' OR status = 'missing')"
         params: list[object] = []
         if target_page_id and target_page_id.strip():
             where_sql += " AND target_page_id = ?"
             params.append(target_page_id.strip())
-        params.extend([now_ts, now_ts, max(1, count)])
+        params.extend([now_ts, latest_ts, now_ts, latest_ts, max(1, count)])
 
         rows = conn.execute(f"""
             SELECT * FROM fb_crossposter_queue
             {where_sql}
             ORDER BY 
-                CASE WHEN scheduled_publish_time > ? THEN 0 ELSE 1 END,
-                CASE WHEN scheduled_publish_time > ? THEN scheduled_publish_time ELSE 9999999999 END ASC,
+                CASE WHEN scheduled_publish_time > ? AND scheduled_publish_time <= ? THEN 0 ELSE 1 END,
+                CASE WHEN scheduled_publish_time > ? AND scheduled_publish_time <= ? THEN scheduled_publish_time ELSE 9999999999 END ASC,
                 sort_order ASC,
                 id ASC
             LIMIT ?
@@ -7745,6 +8043,10 @@ def get_next_queue_items_for_pre_schedule(target_page_id: str, count: int) -> li
 
 def get_fb_queue_items_for_schedule_ahead(days_ahead: int, target_page_id: str = "") -> list[dict]:
     """Retrieve queue items for pre-scheduling based on days_ahead and daily quota."""
+    if int(days_ahead) < 1 or int(days_ahead) > META_MAX_SCHEDULE_AHEAD_DAYS:
+        raise ValueError(
+            f"Số ngày đặt lịch trước phải từ 1 đến {META_MAX_SCHEDULE_AHEAD_DAYS} ngày"
+        )
     settings = get_fb_crossposter_settings(target_page_id)
     daily_quota = settings.get("daily_quota", 2)
     count = max(1, int(days_ahead) * int(daily_quota))

@@ -34,6 +34,11 @@ from yt_dlp import YoutubeDL
 from nexus_engine.services.youtube_downloader import ensure_ffmpeg_directory
 import nexus_engine.services.database as db
 from nexus_engine.paths import DATA_DIR
+from nexus_engine.services.facebook_schedule_policy import (
+    META_MAX_SCHEDULE_AHEAD_DAYS,
+    MetaScheduleWindowError,
+    validate_meta_schedule_epoch,
+)
 from nexus_engine.services import (
     channel_scanner_service,
     gpm_service,
@@ -203,20 +208,22 @@ def pause_fb_browser_checkpoint(
     attention_required = (
         FB_BROWSER_CDP_ATTENTION if is_cdp_wait else FB_BROWSER_REVIEW_ATTENTION
     )
+    can_resume = bool(getattr(error, "can_resume", True))
+    persisted_status = "checkpoint_paused" if can_resume else "verifying"
     db.update_fb_checkpoint(
         item_id,
         phase=clean_phase,
-        status="checkpoint_paused",
+        status=persisted_status,
         screenshot_path=screenshot_path,
-        can_resume=True,
+        can_resume=can_resume,
         error_message=error_message,
     )
     result = {
         "success": False,
-        "status": "checkpoint_paused",
+        "status": persisted_status,
         "item_id": item_id,
         "checkpoint_phase": clean_phase,
-        "can_resume": True,
+        "can_resume": can_resume,
         "attention_required": attention_required,
         "missing_configuration": ["browser_cdp"] if is_cdp_wait else [],
     }
@@ -226,7 +233,11 @@ def pause_fb_browser_checkpoint(
         db.update_system_job(
             sys_job_id,
             status="paused",
-            progress=f"Tạm dừng tại [{clean_phase}]: {error_message[:80]}",
+            progress=(
+                f"Tạm dừng tại [{clean_phase}]: {error_message[:80]}"
+                if can_resume
+                else f"Cần đối chiếu Meta tại [{clean_phase}]: {error_message[:80]}"
+            ),
             result_json=result,
             error=error_message,
             next_retry_at="",
@@ -1061,6 +1072,8 @@ def upload_large_video_resumable(
     clean_token = sanitize_fb_token(access_token)
     if not clean_page_id or not clean_token:
         raise ValueError("Page ID hoặc Access Token không hợp lệ")
+    if scheduled_publish_time:
+        validate_meta_schedule_epoch(scheduled_publish_time)
 
     if not video_path.is_file():
         raise FileNotFoundError(f"File video không tồn tại: {video_path}")
@@ -1223,16 +1236,8 @@ def upload_large_video_resumable(
     if custom_labels:
         finish_params["custom_labels"] = json.dumps(custom_labels, ensure_ascii=False)
 
-    now_ts = int(time.time())
     if scheduled_publish_time:
-        if scheduled_publish_time <= now_ts + 600:
-            raise RuntimeError(
-                "Thời điểm đặt lịch còn dưới 10 phút; cần phân bổ slot mới trước khi hoàn tất upload"
-            )
-        if scheduled_publish_time > now_ts + (70 * 86400):
-            raise RuntimeError(
-                "Thời điểm đặt lịch vượt quá giới hạn 70 ngày của Meta; cần phân bổ slot mới trước khi upload"
-            )
+        validate_meta_schedule_epoch(scheduled_publish_time)
         finish_params["published"] = "false"
         finish_params["scheduled_publish_time"] = str(scheduled_publish_time)
     else:
@@ -1404,6 +1409,8 @@ def upload_video_to_facebook(
     clean_token = sanitize_fb_token(access_token)
     if not clean_page_id or not clean_token:
         raise ValueError("Page ID hoặc Access Token không hợp lệ")
+    if scheduled_publish_time:
+        validate_meta_schedule_epoch(scheduled_publish_time)
 
     if not video_path.is_file():
         raise FileNotFoundError(f"File video không tồn tại: {video_path}")
@@ -1447,16 +1454,8 @@ def upload_video_to_facebook(
     if custom_labels:
         fields["custom_labels"] = json.dumps(custom_labels, ensure_ascii=False)
 
-    now_ts = int(time.time())
     if scheduled_publish_time:
-        if scheduled_publish_time <= now_ts + 600:
-            raise RuntimeError(
-                "Thời điểm đặt lịch còn dưới 10 phút; cần phân bổ slot mới trước khi upload"
-            )
-        if scheduled_publish_time > now_ts + (70 * 86400):
-            raise RuntimeError(
-                "Thời điểm đặt lịch vượt quá giới hạn 70 ngày của Meta; cần phân bổ slot mới trước khi upload"
-            )
+        validate_meta_schedule_epoch(scheduled_publish_time)
         fields["published"] = "false"
         fields["scheduled_publish_time"] = str(scheduled_publish_time)
     else:
@@ -2110,6 +2109,7 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
                 fields = {
                     "fb_post_id": meta_post_id,
                     "status": "published",
+                    "can_resume": 0,
                     "meta_published": 1,
                     "meta_video_status": "ready",
                     "meta_state": "published",
@@ -2128,29 +2128,45 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
                     "message": f"Đã khớp với bài đăng thực tế trên Meta: {meta_post_id}",
                 }
             else:
+                actual_schedule = int(matched_meta.get("scheduled_publish_time") or 0)
                 sched_str = _format_fanpage_schedule(
-                    requested_schedule or 0,
+                    actual_schedule,
                     publication_timezone,
+                )
+                schedule_matches = bool(
+                    actual_schedule
+                    and requested_schedule
+                    and abs(actual_schedule - requested_schedule) <= 60
+                )
+                verified_status = (
+                    "meta_scheduled"
+                    if schedule_matches
+                    else "schedule_mismatch" if actual_schedule else "verifying"
                 )
                 fields = {
                     "fb_post_id": meta_post_id,
                     "upload_video_id": meta_post_id,
-                    "status": "meta_scheduled",
+                    "status": verified_status,
+                    "can_resume": 0,
                     "meta_published": 0,
-                    "meta_video_status": "ready",
-                    "meta_state": "scheduled",
+                    "meta_video_status": "ready" if actual_schedule else "",
+                    "meta_scheduled_publish_time": actual_schedule,
+                    "meta_state": verified_status,
                     "meta_state_since": created_iso,
-                    "meta_verified_at": db.utc_now(),
-                    "error_message": "",
-                    "meta_error_message": "",
+                    "meta_verified_at": db.utc_now() if actual_schedule else "",
+                    "error_message": "" if schedule_matches else "Meta chưa xác nhận đúng lịch yêu cầu",
+                    "meta_error_message": "" if schedule_matches else "Meta chưa xác nhận đúng lịch yêu cầu",
                 }
                 if not dry_run:
                     db.update_fb_crossposter_queue_item(item_id, fields)
                 return {
                     "item_id": item_id,
                     "fb_post_id": meta_post_id,
-                    "status": "meta_scheduled",
-                    "message": f"Đã khớp với video đã lên lịch trên Meta: {meta_post_id}" + (f" (lịch {sched_str})" if sched_str else ""),
+                    "status": verified_status,
+                    "message": (
+                        f"Đã đọc lịch thực tế trên Meta: {meta_post_id}"
+                        + (f" (lịch {sched_str})" if sched_str else "")
+                    ),
                 }
 
         # If not matched on published feed, check if it is still scheduled in the future
@@ -2164,20 +2180,21 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
                 publication_timezone,
             )
             fields = {
-                "status": "meta_scheduled",
-                "meta_state": "scheduled",
-                "meta_video_status": "ready",
-                "meta_verified_at": db.utc_now(),
-                "error_message": "",
-                "meta_error_message": "",
+                "status": "verifying",
+                "can_resume": 0,
+                "meta_state": "verifying",
+                "meta_video_status": "",
+                "meta_verified_at": "",
+                "error_message": "Chưa tìm thấy thẻ lịch thực tế trên Meta Calendar",
+                "meta_error_message": "Chưa tìm thấy thẻ lịch thực tế trên Meta Calendar",
             }
             if not dry_run:
                 db.update_fb_crossposter_queue_item(item_id, fields)
             return {
                 "item_id": item_id,
                 "fb_post_id": "",
-                "status": "meta_scheduled",
-                "message": f"Meta đã nhận lịch phát sóng lúc {sched_str}",
+                "status": "verifying",
+                "message": f"Chưa tìm thấy lịch thực tế trên Meta cho giờ yêu cầu {sched_str}",
             }
 
         if is_browser_submitted and requested_schedule and (now_ts - requested_schedule) < 3600:
@@ -2258,13 +2275,13 @@ def reconcile_fb_queue_item(item_id: int, *, dry_run: bool = False) -> dict[str,
                 "description": item.get("fb_description") or item.get("original_description") or "",
             }
             sched_ts = int(item.get("scheduled_publish_time") or 0)
-            now_ts = int(time.time())
             if sched_ts:
-                if sched_ts > now_ts + 600 and sched_ts <= now_ts + (70 * 86400):
+                try:
+                    validate_meta_schedule_epoch(sched_ts)
                     finish_params["published"] = "false"
                     finish_params["scheduled_publish_time"] = str(sched_ts)
-                else:
-                    sched_ts = db.reserve_next_fb_queue_slot(item_id, max_horizon_days=70)
+                except MetaScheduleWindowError:
+                    sched_ts = db.reserve_next_fb_queue_slot(item_id)
                     finish_params["published"] = "false"
                     finish_params["scheduled_publish_time"] = str(sched_ts)
                     requested_schedule = sched_ts
@@ -2392,8 +2409,18 @@ def _fetch_meta_page_posts_index(target_page_id: str, access_token: str, target_
 
     # 1. Fetch published feed posts
     try:
-        feed_url = f"{GRAPH_API_BASE}/{target_page_id}/published_posts?fields=id,message,created_time&limit=100&access_token={urllib.parse.quote(access_token)}"
-        feed_req = urllib.request.Request(feed_url, headers={"User-Agent": "NexusStudio/1.0"})
+        feed_query = urllib.parse.urlencode({
+            "fields": "id,message,created_time",
+            "limit": 100,
+        })
+        feed_url = f"{GRAPH_API_BASE}/{target_page_id}/published_posts?{feed_query}"
+        feed_req = urllib.request.Request(
+            feed_url,
+            headers={
+                "User-Agent": "NexusStudio/1.0",
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
         with opener.open(feed_req, timeout=20) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             for p in data.get("data", []):
@@ -2411,8 +2438,18 @@ def _fetch_meta_page_posts_index(target_page_id: str, access_token: str, target_
 
     # 2. Fetch videos
     try:
-        vid_url = f"{GRAPH_API_BASE}/{target_page_id}/videos?fields=id,title,description,scheduled_publish_time,published,status,created_time&limit=100&access_token={urllib.parse.quote(access_token)}"
-        vid_req = urllib.request.Request(vid_url, headers={"User-Agent": "NexusStudio/1.0"})
+        video_query = urllib.parse.urlencode({
+            "fields": "id,title,description,scheduled_publish_time,published,status,created_time",
+            "limit": 100,
+        })
+        vid_url = f"{GRAPH_API_BASE}/{target_page_id}/videos?{video_query}"
+        vid_req = urllib.request.Request(
+            vid_url,
+            headers={
+                "User-Agent": "NexusStudio/1.0",
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
         with opener.open(vid_req, timeout=20) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             for v in data.get("data", []):
@@ -2442,6 +2479,7 @@ def reconcile_fb_queue(
     counts = {
         "checked": 0,
         "meta_scheduled": 0,
+        "verifying": 0,
         "processing": 0,
         "schedule_mismatch": 0,
         "stalled": 0,
@@ -2498,6 +2536,7 @@ def reconcile_fb_queue(
                 update_fields = {
                     "fb_post_id": meta_post_id,
                     "status": "published",
+                    "can_resume": 0,
                     "meta_published": 1,
                     "meta_video_status": "ready",
                     "meta_state": "published",
@@ -2519,31 +2558,44 @@ def reconcile_fb_queue(
                 })
                 continue
             else:
+                actual_schedule = int(matched_meta.get("scheduled_publish_time") or 0)
                 sched_str = _format_fanpage_schedule(
-                    sched_ts,
+                    actual_schedule,
                     page_timezone_cache.get(pid, "Asia/Ho_Chi_Minh"),
+                )
+                schedule_matches = bool(
+                    actual_schedule
+                    and sched_ts
+                    and abs(actual_schedule - sched_ts) <= 60
+                )
+                verified_status = (
+                    "meta_scheduled"
+                    if schedule_matches
+                    else "schedule_mismatch" if actual_schedule else "verifying"
                 )
                 update_fields = {
                     "fb_post_id": meta_post_id,
                     "upload_video_id": meta_post_id,
-                    "status": "meta_scheduled",
+                    "status": verified_status,
+                    "can_resume": 0,
                     "meta_published": 0,
-                    "meta_video_status": "ready",
-                    "meta_state": "scheduled",
+                    "meta_video_status": "ready" if actual_schedule else "",
+                    "meta_scheduled_publish_time": actual_schedule,
+                    "meta_state": verified_status,
                     "meta_state_since": created_iso,
-                    "meta_verified_at": db.utc_now(),
-                    "error_message": "",
-                    "meta_error_message": "",
+                    "meta_verified_at": db.utc_now() if actual_schedule else "",
+                    "error_message": "" if schedule_matches else "Meta chưa xác nhận đúng lịch yêu cầu",
+                    "meta_error_message": "" if schedule_matches else "Meta chưa xác nhận đúng lịch yêu cầu",
                 }
                 if not dry_run:
                     db.update_fb_crossposter_queue_item(item_id, update_fields)
-                counts["meta_scheduled"] += 1
+                counts[verified_status] = counts.get(verified_status, 0) + 1
                 counts["checked"] += 1
                 items_report.append({
                     "item_id": item_id,
                     "fb_post_id": meta_post_id,
-                    "status": "meta_scheduled",
-                    "message": f"Đã khớp với video đã lên lịch trên Meta: {meta_post_id}" + (f" (lịch {sched_str})" if sched_str else ""),
+                    "status": verified_status,
+                    "message": f"Đã đọc lịch thực tế trên Meta: {meta_post_id}" + (f" (lịch {sched_str})" if sched_str else ""),
                 })
                 continue
 
@@ -2558,22 +2610,23 @@ def reconcile_fb_queue(
                 page_timezone_cache.get(pid, "Asia/Ho_Chi_Minh"),
             )
             update_fields = {
-                "status": "meta_scheduled",
-                "meta_state": "scheduled",
-                "meta_video_status": "ready",
-                "meta_verified_at": db.utc_now(),
-                "error_message": "",
-                "meta_error_message": "",
+                "status": "verifying",
+                "can_resume": 0,
+                "meta_state": "verifying",
+                "meta_video_status": "",
+                "meta_verified_at": "",
+                "error_message": "Chưa tìm thấy thẻ lịch thực tế trên Meta Calendar",
+                "meta_error_message": "Chưa tìm thấy thẻ lịch thực tế trên Meta Calendar",
             }
             if not dry_run:
                 db.update_fb_crossposter_queue_item(item_id, update_fields)
-            counts["meta_scheduled"] += 1
+            counts["verifying"] += 1
             counts["checked"] += 1
             items_report.append({
                 "item_id": item_id,
                 "fb_post_id": "",
-                "status": "meta_scheduled",
-                "message": f"Meta đã nhận lịch phát sóng lúc {sched_str}",
+                "status": "verifying",
+                "message": f"Chưa tìm thấy lịch thực tế trên Meta cho giờ yêu cầu {sched_str}",
             })
             continue
 
@@ -3051,8 +3104,12 @@ def repair_fb_queue_item(
     )
     title = str(item.get("fb_title") or source_title)
     requested_schedule = int(item.get("scheduled_publish_time") or 0)
-    minimum_future_ts = int(time.time()) + (MIN_REPAIR_LEAD_MINUTES * 60)
-    if requested_schedule <= minimum_future_ts:
+    try:
+        validate_meta_schedule_epoch(
+            requested_schedule,
+            minimum_lead_minutes=MIN_REPAIR_LEAD_MINUTES,
+        )
+    except MetaScheduleWindowError:
         previous_schedule = requested_schedule
         requested_schedule = db.reserve_next_fb_queue_slot(
             item_id,
@@ -3288,6 +3345,81 @@ def repair_fb_queue_item(
         raise
 
 
+def sync_meta_calendar_preflight(
+    target_page_id: str,
+    *,
+    settings: dict[str, Any] | None = None,
+    recalculate_schedule: bool = True,
+) -> dict[str, Any]:
+    """Fail closed unless the actual Meta Calendar is read and persisted."""
+    from nexus_engine.services import fb_reels_browser_service
+    import concurrent.futures
+
+    queue_page_id = str(target_page_id or "").strip()
+    runtime_settings = settings or db.get_fb_crossposter_runtime_settings(queue_page_id)
+    meta_page_id = str(
+        runtime_settings.get("target_fb_page_id") or queue_page_id
+    ).strip()
+    profile_id = str(
+        runtime_settings.get("target_gpm_profile_id")
+        or runtime_settings.get("source_gpm_profile_id")
+        or ""
+    ).strip()
+    timezone_name = str(
+        runtime_settings.get("publication_timezone") or "Asia/Ho_Chi_Minh"
+    ).strip()
+    if not queue_page_id:
+        queue_page_id = meta_page_id
+    if not queue_page_id or not meta_page_id:
+        raise ValueError("Thiếu Fanpage ID để đồng bộ lịch thực tế từ Meta")
+    if not profile_id:
+        raise ValueError("Fanpage chưa được gán GPM Profile để đồng bộ Meta Calendar")
+
+    coroutine = fb_reels_browser_service.read_meta_calendar_occupancy_via_gpm(
+        profile_id=profile_id,
+        target_page_id=meta_page_id,
+        timezone_name=timezone_name,
+        max_horizon_days=META_MAX_SCHEDULE_AHEAD_DAYS,
+    )
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop and running_loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            snapshot = executor.submit(asyncio.run, coroutine).result(timeout=90)
+    else:
+        snapshot = asyncio.run(coroutine)
+    if not snapshot.get("verified"):
+        raise RuntimeError(
+            "Không xác minh được Meta Content Calendar; đã dừng trước khi cấp lịch"
+        )
+
+    slots = snapshot.get("slots") or []
+    saved_count = db.replace_fb_meta_calendar_occupancy(
+        queue_page_id,
+        slots,
+        source=str(snapshot.get("source") or "meta_calendar"),
+    )
+    recalculated_count = 0
+    if recalculate_schedule:
+        recalculated_count = db.recalculate_fb_queue_schedule(
+            int(runtime_settings.get("daily_quota") or 2),
+            runtime_settings.get("schedule_times") or ["11:30", "19:30"],
+            target_page_id=queue_page_id,
+            sort_order_mode=str(
+                runtime_settings.get("sort_order_mode") or "oldest_first"
+            ),
+            timezone_name=timezone_name,
+        )
+    return {
+        **snapshot,
+        "saved_count": saved_count,
+        "recalculated_count": recalculated_count,
+        "target_page_id": queue_page_id,
+    }
+
+
 def process_queue_item_jit(
     item_id: int,
     parent_task_id: str | None = None,
@@ -3295,6 +3427,7 @@ def process_queue_item_jit(
     force: bool = False,
     publish_now: bool = False,
     cancel_check: Callable[[], bool] | None = None,
+    calendar_preflight_done: bool = False,
 ) -> dict[str, Any]:
     """Execute Just-in-Time download, metadata prep, Facebook upload, and cleanup for one queue item."""
     item = db.get_fb_crossposter_queue_item(item_id)
@@ -3381,6 +3514,10 @@ def process_queue_item_jit(
         if not gpm_pid:
             raise ValueError(f"Chưa chọn GPM Profile ID trong Settings cho Fanpage {page_name} để đăng tải qua trình duyệt Playwright")
 
+    if not publish_now and not calendar_preflight_done:
+        sync_meta_calendar_preflight(target_page_id, settings=settings)
+        item = db.get_fb_crossposter_queue_item(item_id) or item
+
     if not parent_task_id and not sys_job_id:
         sys_job_id = f"fb-pub-{item_id}-{int(time.time() * 1000)}"
         try:
@@ -3418,12 +3555,21 @@ def process_queue_item_jit(
         db.update_fb_crossposter_queue_item(item_id, {"scheduled_publish_time": 0})
     else:
         scheduled_time = int(item.get("scheduled_publish_time") or 0)
-        now_ts = int(time.time())
-        max_horizon_seconds = 70 * 86400
-        if not scheduled_time or scheduled_time <= now_ts + 600 or scheduled_time > now_ts + max_horizon_seconds:
+        try:
+            validate_meta_schedule_epoch(scheduled_time)
+        except MetaScheduleWindowError:
             logger.info("Auto-allocating valid Meta schedule slot for video #%d (current: %s)", item_id, scheduled_time)
-            scheduled_time = db.reserve_next_fb_queue_slot(item_id, max_horizon_days=70)
+            scheduled_time = db.reserve_next_fb_queue_slot(item_id)
             item["scheduled_publish_time"] = scheduled_time
+        else:
+            if db.fb_meta_calendar_slot_is_occupied(target_page_id, scheduled_time):
+                logger.info(
+                    "Meta Calendar already occupies schedule slot %s for video #%d; reserving a new slot",
+                    scheduled_time,
+                    item_id,
+                )
+                scheduled_time = db.reserve_next_fb_queue_slot(item_id)
+                item["scheduled_publish_time"] = scheduled_time
 
     # Check if pre-rendered / cached media exists from a previous paused checkpoint
     need_vertical = bool(settings.get("convert_to_vertical"))
@@ -4134,6 +4280,7 @@ def _run_schedule_ahead_worker(
                     item["id"],
                     parent_task_id=task_id,
                     cancel_check=is_cancel_requested,
+                    calendar_preflight_done=True,
                 )
                 if result.get("status") not in {"meta_scheduled", "published"}:
                     raise RuntimeError(
@@ -4223,14 +4370,22 @@ def start_schedule_ahead_batch(
     existing_sys_job_id: str = "",
 ) -> dict[str, Any]:
     """Start background sequential batch upload to Meta Cloud for N days ahead."""
-    if days_ahead < 1 or days_ahead > 60:
-        raise ValueError("Số ngày đặt lịch trước phải từ 1 đến 60 ngày")
+    if days_ahead < 1 or days_ahead > META_MAX_SCHEDULE_AHEAD_DAYS:
+        raise ValueError(
+            f"Số ngày đặt lịch trước phải từ 1 đến {META_MAX_SCHEDULE_AHEAD_DAYS} ngày"
+        )
 
     settings = db.get_fb_crossposter_runtime_settings(target_page_id)
     if not settings.get("target_access_token"):
         raise ValueError("Chưa cấu hình Page Access Token cho Fanpage này. Vui lòng nhập Access Token, bấm [Kiểm tra] -> [Lưu Cấu Hình] trước khi đặt lịch.")
     if not settings.get("target_fb_page_id") and not target_page_id:
         raise ValueError("Chưa cấu hình Fanpage ID cho chiến dịch này.")
+
+    preflight = sync_meta_calendar_preflight(
+        target_page_id,
+        settings=settings,
+        recalculate_schedule=True,
+    )
 
     if existing_sys_job_id:
         sys_job_id = existing_sys_job_id
@@ -4262,6 +4417,12 @@ def start_schedule_ahead_batch(
             "cancel_requested": False,
             "error": "",
             "created_at": db.utc_now(),
+            "calendar_preflight": {
+                "verified": True,
+                "saved_count": int(preflight.get("saved_count") or 0),
+                "weeks_scanned": int(preflight.get("weeks_scanned") or 0),
+                "synced_at": str(preflight.get("synced_at") or ""),
+            },
         }
         _schedule_ahead_tasks[task_id] = task_record
 

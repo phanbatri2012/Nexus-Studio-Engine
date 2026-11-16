@@ -5,6 +5,7 @@ import MarketSelect from './MarketSelect.jsx'
 import { formatTime12, formatDateTimeAMPM, formatTimeZoneLabel, parseTime24, formatTime24 } from './publicationTime.js'
 import { useAppRouter } from './router.js'
 import {
+  META_MAX_SCHEDULE_AHEAD_DAYS,
   normalizeYoutubeChannel,
   resolveFacebookPageSelection,
   resolveYoutubeChannelSelection
@@ -1461,11 +1462,11 @@ export default function CrossPoster({ subPath = '', segments = [] } = {}) {
             <input
               type="number"
               min="1"
-              max="60"
+              max={META_MAX_SCHEDULE_AHEAD_DAYS}
               className="fb-days-input"
               value={daysAhead}
               disabled={preScheduleTask.status === 'running' || preScheduleTask.status === 'starting'}
-              onChange={(e) => setDaysAhead(Math.max(1, parseInt(e.target.value) || 1))}
+              onChange={(e) => setDaysAhead(Math.min(META_MAX_SCHEDULE_AHEAD_DAYS, Math.max(1, parseInt(e.target.value) || 1)))}
             />
             <span style={{ fontSize: '0.88rem', color: '#cbd5e1', fontWeight: '600' }}>ngày</span>
           </div>

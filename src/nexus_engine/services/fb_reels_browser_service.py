@@ -16,12 +16,14 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from nexus_engine.services.channel_scanner_service import channel_browser_session, cleanup_owned_page
+from nexus_engine.services.facebook_schedule_policy import validate_meta_schedule_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,12 @@ CALENDAR_URL = "https://business.facebook.com/latest/content_calendar"
 
 
 SCREENSHOTS_DIR = Path("data/logs/crossposter")
+
+META_UPLOAD_MIN_TIMEOUT_SECONDS = 6 * 60
+META_UPLOAD_MAX_TIMEOUT_SECONDS = 30 * 60
+META_UPLOAD_BASE_TIMEOUT_SECONDS = 2 * 60
+META_UPLOAD_ASSUMED_BYTES_PER_SECOND = 512 * 1024
+META_UPLOAD_POLL_INTERVAL_SECONDS = 1.5
 
 THUMBNAIL_SECTION_PATTERN = re.compile(r"^(Hình thu nhỏ|Ảnh bìa|Thumbnail|Cover)$", re.IGNORECASE)
 THUMBNAIL_UPLOAD_PATTERN = re.compile(
@@ -269,6 +277,266 @@ class FbBrowserAutomationError(RuntimeError):
         self.phase = phase
         self.screenshot_path = screenshot_path
         self.can_resume = can_resume
+
+
+def _meta_upload_timeout_seconds(file_size_bytes: int) -> float:
+    """Return a bounded upload deadline sized for a conservative proxy connection."""
+    estimated = META_UPLOAD_BASE_TIMEOUT_SECONDS + (
+        max(0, int(file_size_bytes)) / META_UPLOAD_ASSUMED_BYTES_PER_SECOND
+    )
+    return float(
+        min(
+            META_UPLOAD_MAX_TIMEOUT_SECONDS,
+            max(META_UPLOAD_MIN_TIMEOUT_SECONDS, estimated),
+        )
+    )
+
+
+def _resolve_meta_upload_snapshot(
+    snapshot: dict[str, Any] | None,
+    filename_hint: str,
+) -> dict[str, Any]:
+    """Resolve visible, media-scoped DOM evidence into one upload state."""
+    raw = dict(snapshot or {})
+    hint = str(filename_hint or "").strip().lower()[:18]
+    context_tokens = {
+        hint,
+        "file phương tiện",
+        "media file",
+        "thêm video",
+        "add video",
+        ".mp4",
+    }
+    context_tokens.discard("")
+
+    relevant_percentages: list[int] = []
+    for sample in raw.get("percentage_samples") or []:
+        if not isinstance(sample, dict):
+            continue
+        try:
+            percent = int(sample.get("percent"))
+        except (TypeError, ValueError):
+            continue
+        if percent < 0 or percent > 100:
+            continue
+        context = str(sample.get("context") or "").lower()
+        if any(token in context for token in context_tokens):
+            relevant_percentages.append(percent)
+
+    percent = max(relevant_percentages) if relevant_percentages else None
+    failure = str(raw.get("failure_marker") or "").strip()
+    completion_marker = str(raw.get("completion_marker") or "").strip()
+    next_enabled = bool(raw.get("next_enabled"))
+    complete = bool(
+        not failure
+        and (
+            completion_marker
+            or percent == 100
+            or (next_enabled and percent is None)
+        )
+    )
+    return {
+        "complete": complete,
+        "percent": percent,
+        "next_enabled": next_enabled,
+        "completion_marker": completion_marker,
+        "failure_marker": failure,
+    }
+
+
+async def _read_meta_upload_state(
+    page: Any,
+    filename_hint: str,
+) -> dict[str, Any]:
+    """Read upload evidence only from visible DOM text and progress attributes."""
+    snapshot = await page.evaluate(
+        r"""
+        filenameHint => {
+            const visible = (el) => {
+                if (!el || !(el instanceof Element)) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && Number(style.opacity || 1) !== 0
+                    && rect.width > 0
+                    && rect.height > 0;
+            };
+            const contextFor = (el) => {
+                const parts = [];
+                let current = el;
+                for (let depth = 0; current && depth < 6; depth += 1) {
+                    if (visible(current)) {
+                        const text = String(current.innerText || '').trim();
+                        if (text) parts.push(text.slice(0, 800));
+                    }
+                    current = current.parentElement;
+                }
+                return parts.join(' | ');
+            };
+            const samples = [];
+            const nodes = document.querySelectorAll(
+                '[role="progressbar"], [aria-valuenow], span, div'
+            );
+            for (const el of nodes) {
+                if (!visible(el)) continue;
+                const role = String(el.getAttribute('role') || '');
+                const ariaValue = String(el.getAttribute('aria-valuenow') || '').trim();
+                const ownText = String(el.textContent || '').trim();
+                let match = null;
+                if (/^\d{1,3}$/.test(ariaValue)) {
+                    match = ariaValue;
+                } else {
+                    const textMatch = ownText.match(/^(\d{1,3})%$/);
+                    if (textMatch) match = textMatch[1];
+                }
+                if (match !== null) {
+                    samples.push({
+                        percent: Number(match),
+                        role,
+                        context: contextFor(el),
+                    });
+                }
+            }
+
+            const bodyText = String(document.body && document.body.innerText || '');
+            const completionPhrases = [
+                'Video của bạn an toàn để đăng',
+                'Video của bạn an toàn',
+                'an toàn để đăng',
+                'Your video is ready to publish',
+                'Your video is ready',
+            ];
+            const failurePhrases = [
+                'Không thể tải video lên',
+                'Tải video lên không thành công',
+                'Upload failed',
+                'Could not upload video',
+            ];
+            return {
+                filename_hint: String(filenameHint || ''),
+                percentage_samples: samples,
+                completion_marker: completionPhrases.find((value) => bodyText.includes(value)) || '',
+                failure_marker: failurePhrases.find((value) => bodyText.includes(value)) || '',
+            };
+        }
+        """,
+        filename_hint,
+    )
+    snapshot = dict(snapshot or {})
+
+    next_button = page.locator(
+        'div[role="contentinfo"] button:has-text("Tiếp"), '
+        'div[role="contentinfo"] div[role="button"]:has-text("Tiếp"), '
+        'button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), '
+        'button:has-text("Next")'
+    ).last
+    next_enabled = False
+    try:
+        if await next_button.is_visible() and await next_button.is_enabled():
+            next_enabled = (
+                await next_button.get_attribute("aria-disabled") != "true"
+                and await next_button.get_attribute("tabindex") != "-1"
+                and await next_button.get_attribute("disabled") is None
+            )
+    except Exception:
+        next_enabled = False
+    snapshot["next_enabled"] = next_enabled
+    return _resolve_meta_upload_snapshot(snapshot, filename_hint)
+
+
+async def _wait_for_meta_upload(
+    page: Any,
+    filename_hint: str,
+    *,
+    timeout_seconds: float,
+    cancel_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[dict[str, Any], float, float], None] | None = None,
+    poll_interval_seconds: float = META_UPLOAD_POLL_INTERVAL_SECONDS,
+    state_reader: Callable[[Any, str], Any] | None = None,
+    sleep_func: Callable[[float], Any] = asyncio.sleep,
+) -> dict[str, Any]:
+    """Wait for a verified Meta upload result with a strict iteration bound."""
+    interval = max(0.1, float(poll_interval_seconds))
+    deadline_seconds = max(interval, float(timeout_seconds))
+    max_iterations = max(1, int(math.ceil(deadline_seconds / interval)))
+    reader = state_reader or _read_meta_upload_state
+    last_percent: int | None = None
+
+    for iteration in range(max_iterations):
+        if cancel_check and cancel_check():
+            raise FbBrowserAutomationError(
+                "Tác vụ đã được yêu cầu dừng trong khi video đang tải lên Meta",
+                phase="CP5_ASSET_UPLOADED",
+                can_resume=True,
+            )
+
+        state = await reader(page, filename_hint)
+        elapsed = iteration * interval
+        if state.get("failure_marker"):
+            raise FbBrowserAutomationError(
+                f"Meta báo upload video thất bại: {state['failure_marker']}",
+                phase="CP5_ASSET_UPLOADED",
+                can_resume=True,
+            )
+        if progress_callback and (
+            state.get("percent") != last_percent or iteration % 20 == 0
+        ):
+            progress_callback(state, elapsed, deadline_seconds)
+        last_percent = state.get("percent")
+        if state.get("complete"):
+            return state
+        if iteration + 1 < max_iterations:
+            await sleep_func(interval)
+
+    percent_label = (
+        f"{last_percent}%" if last_percent is not None else "không đọc được tiến độ"
+    )
+    raise FbBrowserAutomationError(
+        f"Video chưa upload xong lên Meta sau {int(deadline_seconds // 60)} phút ({percent_label})",
+        phase="CP5_ASSET_UPLOADED",
+        can_resume=True,
+    )
+
+
+async def _wait_for_enabled_button(
+    button: Any,
+    *,
+    button_label: str,
+    phase: str,
+    timeout_seconds: float,
+    cancel_check: Callable[[], bool] | None = None,
+    poll_interval_seconds: float = 1.0,
+    sleep_func: Callable[[float], Any] = asyncio.sleep,
+) -> None:
+    """Wait for one visible enabled button, or fail without clicking it."""
+    interval = max(0.1, float(poll_interval_seconds))
+    max_iterations = max(1, int(math.ceil(max(interval, timeout_seconds) / interval)))
+    for iteration in range(max_iterations):
+        if cancel_check and cancel_check():
+            raise FbBrowserAutomationError(
+                f"Tác vụ đã được yêu cầu dừng khi chờ nút '{button_label}'",
+                phase=phase,
+                can_resume=True,
+            )
+        try:
+            if await button.is_visible() and await button.is_enabled():
+                if (
+                    await button.get_attribute("aria-disabled") != "true"
+                    and await button.get_attribute("tabindex") != "-1"
+                    and await button.get_attribute("disabled") is None
+                ):
+                    return
+        except Exception:
+            pass
+        if iteration + 1 < max_iterations:
+            await sleep_func(interval)
+
+    raise FbBrowserAutomationError(
+        f"Nút '{button_label}' vẫn bị khóa sau {int(timeout_seconds)} giây",
+        phase=phase,
+        can_resume=True,
+    )
 
 
 def _timezone_offset_at(
@@ -886,6 +1154,213 @@ def _calendar_week_position(
     )
 
 
+def _calendar_cards_to_occupancy(
+    cards: list[dict[str, Any]],
+    *,
+    week_start: datetime.date,
+    timezone_name: str,
+    earliest_ts: int,
+    latest_ts: int,
+) -> list[dict[str, Any]]:
+    """Convert visible Meta week cards into bounded Facebook occupancy rows."""
+    publication_zone = ZoneInfo(str(timezone_name or "").strip())
+    occupancy: dict[int, dict[str, Any]] = {}
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        platforms = {
+            str(value or "").strip().lower()
+            for value in (card.get("platforms") or [])
+        }
+        if not any("facebook" in value for value in platforms):
+            continue
+        try:
+            column_index = int(card.get("column_index"))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= column_index <= 6:
+            continue
+        time_match = re.search(
+            r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)",
+            str(card.get("time") or ""),
+        )
+        if not time_match:
+            continue
+        scheduled_date = week_start + datetime.timedelta(days=column_index)
+        scheduled_datetime = datetime.datetime.combine(
+            scheduled_date,
+            datetime.time(int(time_match.group(1)), int(time_match.group(2))),
+            tzinfo=publication_zone,
+        )
+        scheduled_time = int(scheduled_datetime.timestamp())
+        if scheduled_time < int(earliest_ts) or scheduled_time > int(latest_ts):
+            continue
+        occupancy[scheduled_time] = {
+            "scheduled_publish_time": scheduled_time,
+            "title": str(card.get("title") or "").strip(),
+            "source": "meta_calendar",
+        }
+    return [occupancy[key] for key in sorted(occupancy)]
+
+
+async def _read_visible_calendar_cards(page: Any) -> list[dict[str, Any]]:
+    """Read a bounded number of visible Calendar cards from the current week."""
+    candidates = page.locator("[aria-label]")
+    candidate_count = min(int(await candidates.count()), 2000)
+    observed: list[dict[str, Any]] = []
+    for index in range(candidate_count):
+        card = candidates.nth(index)
+        try:
+            if not await card.is_visible():
+                continue
+            title = str(await card.get_attribute("aria-label") or "").strip()
+            if not title:
+                continue
+            card_text = str(await card.inner_text() or "").strip()
+            if not re.search(r"(?<!\d)([01]?\d|2[0-3]):[0-5]\d(?!\d)", card_text):
+                continue
+            platforms = await card.locator("img").evaluate_all(
+                "els => els.map(el => el.alt).filter(Boolean)"
+            )
+            column_index = await card.evaluate(
+                """el => {
+                    let node = el;
+                    for (let depth = 0; node && node.parentElement && depth < 12; depth += 1) {
+                        const parent = node.parentElement;
+                        const siblings = Array.from(parent.children).filter(child => {
+                            const rect = child.getBoundingClientRect();
+                            return rect.width > 100 && rect.height > 100;
+                        });
+                        if (siblings.length === 7) {
+                            const directChild = siblings.find(child => child === node || child.contains(node));
+                            if (directChild) return siblings.indexOf(directChild);
+                        }
+                        node = parent;
+                    }
+                    return -1;
+                }"""
+            )
+            observed.append(
+                {
+                    "title": title,
+                    "time": card_text,
+                    "platforms": platforms,
+                    "column_index": int(column_index),
+                }
+            )
+        except Exception:
+            continue
+    return observed
+
+
+async def read_meta_calendar_occupancy_via_gpm(
+    *,
+    profile_id: str,
+    target_page_id: str,
+    timezone_name: str,
+    max_horizon_days: int = 29,
+) -> dict[str, Any]:
+    """Read actual Facebook Calendar occupancy through the assigned GPM profile."""
+    clean_profile_id = str(profile_id or "").strip()
+    clean_page_id = str(target_page_id or "").strip()
+    if not clean_profile_id:
+        raise ValueError("Fanpage chưa được gán GPM Profile để đọc lịch Meta")
+    if not clean_page_id:
+        raise ValueError("Thiếu Fanpage ID để đọc lịch Meta")
+    try:
+        publication_zone = ZoneInfo(str(timezone_name or "").strip())
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"Timezone IANA không hợp lệ: {timezone_name}") from exc
+
+    horizon_days = max(1, min(int(max_horizon_days), 29))
+    now_local = datetime.datetime.now(publication_zone)
+    today = now_local.date()
+    today_column = (today.weekday() + 1) % 7
+    first_week_start = today - datetime.timedelta(days=today_column)
+    max_weeks = min(6, ((today_column + horizon_days) // 7) + 1)
+    earliest_ts = int(now_local.timestamp())
+    latest_local = datetime.datetime.combine(
+        today + datetime.timedelta(days=horizon_days),
+        datetime.time(23, 59, 59),
+        tzinfo=publication_zone,
+    )
+    latest_ts = int(latest_local.timestamp())
+    calendar_url = f"{CALENDAR_URL}/?asset_id={clean_page_id}"
+
+    async with channel_browser_session(
+        clean_profile_id,
+        target_url=calendar_url,
+        timeout_seconds=60.0,
+    ) as (context, _browser, _profile_meta):
+        page = await context.new_page()
+        try:
+            await page.goto(calendar_url, wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(3.0)
+            if "content_calendar" not in str(page.url or ""):
+                raise FbBrowserAutomationError(
+                    "Không mở được Meta Content Calendar trong GPM Profile",
+                    phase="CP3_CDP_READY",
+                    can_resume=True,
+                )
+
+            week_button = page.locator(
+                'button:has-text("Tuần"), [role="button"]:has-text("Tuần"), '
+                'button:has-text("Week"), [role="button"]:has-text("Week")'
+            ).first
+            if await week_button.is_visible():
+                await week_button.click()
+                await asyncio.sleep(0.8)
+            today_button = page.locator(
+                '[role="button"]:has-text("Hôm nay"), button:has-text("Hôm nay"), '
+                '[role="button"]:has-text("Today"), button:has-text("Today")'
+            ).first
+            if not await today_button.is_visible():
+                raise FbBrowserAutomationError(
+                    "Meta Content Calendar chưa tải xong hoặc phiên đăng nhập đã hết hạn",
+                    phase="CP3_CDP_READY",
+                    can_resume=True,
+                )
+            await today_button.click()
+            await asyncio.sleep(1.0)
+
+            occupancy: dict[int, dict[str, Any]] = {}
+            for week_offset in range(max_weeks):
+                if week_offset:
+                    next_button = page.locator(
+                        '[aria-label="Right"], [aria-label="Next"], '
+                        '[aria-label*="tiếp"], [role="button"]:has-text("Right"), '
+                        'button:has-text("Right")'
+                    ).first
+                    if not await next_button.is_visible():
+                        raise FbBrowserAutomationError(
+                            "Không chuyển được sang tuần tiếp theo trên Meta Calendar",
+                            phase="CP3_CDP_READY",
+                            can_resume=True,
+                        )
+                    await next_button.click()
+                    await asyncio.sleep(1.2)
+                cards = await _read_visible_calendar_cards(page)
+                week_start = first_week_start + datetime.timedelta(days=week_offset * 7)
+                for slot in _calendar_cards_to_occupancy(
+                    cards,
+                    week_start=week_start,
+                    timezone_name=timezone_name,
+                    earliest_ts=earliest_ts,
+                    latest_ts=latest_ts,
+                ):
+                    occupancy[int(slot["scheduled_publish_time"])] = slot
+
+            return {
+                "verified": True,
+                "source": "meta_calendar",
+                "slots": [occupancy[key] for key in sorted(occupancy)],
+                "weeks_scanned": max_weeks,
+                "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+        finally:
+            await cleanup_owned_page(context, page)
+
+
 async def _verify_calendar_schedule(
     page: Any,
     *,
@@ -1050,6 +1525,8 @@ async def schedule_reel_via_gpm(
         publication_zone = ZoneInfo(str(timezone_name or "").strip())
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise ValueError(f"Timezone IANA không hợp lệ: {timezone_name}") from exc
+    if not publish_now:
+        schedule_datetime = validate_meta_schedule_epoch(schedule_datetime)
     date_slash, date_iso, time_24h = _format_schedule_time(
         schedule_datetime,
         timezone_name,
@@ -1402,35 +1879,44 @@ async def schedule_reel_via_gpm(
             await _silence_composer_video(page)
 
             notify("CP5_ASSET_UPLOADED", "Đang chờ video upload lên Meta Business Suite (100%)...", 35)
+            upload_timeout = _meta_upload_timeout_seconds(v_path.stat().st_size)
 
-            # Wait for upload progress to reach 100% or button "Tiếp" enabled
-            upload_finished = False
-            for loop_i in range(240): # up to 6 minutes for video upload
-                await asyncio.sleep(1.5)
-                await _silence_composer_video(page)
-                # Check 100% text or "Video của bạn an toàn để đăng!"
-                page_text = await page.content()
-                if "100%" in page_text or "Video của bạn an toàn" in page_text or "an toàn để đăng" in page_text:
-                    upload_finished = True
-                    break
+            def report_upload_progress(
+                upload_state: dict[str, Any],
+                elapsed_seconds: float,
+                deadline_seconds: float,
+            ) -> None:
+                percent = upload_state.get("percent")
+                if percent is None:
+                    message = (
+                        "Đang chờ Meta bắt đầu nhận video "
+                        f"({int(elapsed_seconds)}s/{int(deadline_seconds)}s)..."
+                    )
+                    display_progress = 35
+                else:
+                    message = (
+                        "Đang upload video lên Meta Business Suite "
+                        f"({percent}%; {int(elapsed_seconds)}s/{int(deadline_seconds)}s)..."
+                    )
+                    display_progress = 20 + int(int(percent) * 0.25)
+                notify("CP5_ASSET_UPLOADED", message, display_progress)
 
-                # Update progress if percentage found
-                pct_match = re.search(r"\b(\d{1,3})%", page_text)
-                if pct_match:
-                    try:
-                        pct_num = int(pct_match.group(1))
-                        if 0 <= pct_num <= 100:
-                            notify("CP5_ASSET_UPLOADED", f"Đang upload video lên Meta Business Suite ({pct_num}%)...", 20 + int(pct_num * 0.25))
-                    except Exception:
-                        pass
-
-                # Or check if Next button is enabled and not disabled
-                next_btn = page.locator('button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), button:has-text("Next")').last
-                if await next_btn.is_visible() and await next_btn.is_enabled():
-                    # check if still has 10% / 20% / upload progress bar
-                    if "100%" in page_text or not re.search(r"\b\d{1,2}%\b", page_text):
-                        upload_finished = True
-                        break
+            try:
+                await _wait_for_meta_upload(
+                    page,
+                    v_path.name,
+                    timeout_seconds=upload_timeout,
+                    cancel_check=cancel_check,
+                    progress_callback=report_upload_progress,
+                )
+            except FbBrowserAutomationError as upload_exc:
+                screenshot_path = await _capture_error_screenshot(page)
+                raise FbBrowserAutomationError(
+                    str(upload_exc),
+                    phase="CP5_ASSET_UPLOADED",
+                    screenshot_path=screenshot_path,
+                    can_resume=True,
+                ) from upload_exc
 
             await _silence_composer_video(page)
             notify("CP6_METADATA_FILLED", "Video đã tải lên xong. Đang nhập mô tả, tùy chỉnh FB & IG...", 50)
@@ -1571,15 +2057,14 @@ async def schedule_reel_via_gpm(
                 'button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), button:has-text("Next")'
             ).last
 
-            # Wait for next button to be fully enabled
-            for w_i in range(60):
-                if await next_btn_1.is_visible():
-                    aria_dis = await next_btn_1.get_attribute("aria-disabled")
-                    tab_idx = await next_btn_1.get_attribute("tabindex")
-                    if aria_dis != "true" and tab_idx != "-1":
-                        break
-                await asyncio.sleep(2.0)
-
+            await _wait_for_enabled_button(
+                next_btn_1,
+                button_label="Tiếp",
+                phase="CP6_METADATA_FILLED",
+                timeout_seconds=180.0,
+                cancel_check=cancel_check,
+                poll_interval_seconds=2.0,
+            )
             await next_btn_1.click()
             await asyncio.sleep(2.5)
             await _dismiss_unwanted_modals(page)
@@ -1597,12 +2082,13 @@ async def schedule_reel_via_gpm(
                 'button:has-text("Tiếp"), div[role="button"]:has-text("Tiếp"), button:has-text("Next")'
             ).last
             if await next_btn_2.is_visible():
-                for w_i in range(30):
-                    aria_dis = await next_btn_2.get_attribute("aria-disabled")
-                    tab_idx = await next_btn_2.get_attribute("tabindex")
-                    if aria_dis != "true" and tab_idx != "-1":
-                        break
-                    await asyncio.sleep(1.0)
+                await _wait_for_enabled_button(
+                    next_btn_2,
+                    button_label="Tiếp",
+                    phase="CP7_SCHEDULE_SET",
+                    timeout_seconds=60.0,
+                    cancel_check=cancel_check,
+                )
                 await next_btn_2.click()
                 await asyncio.sleep(2.5)
             await _dismiss_unwanted_modals(page)
@@ -1765,23 +2251,13 @@ async def schedule_reel_via_gpm(
                 f'button:has-text("{action_btn_name}"), div[role="button"]:has-text("{action_btn_name}")'
             ).last
 
-            # Wait for final button to be enabled (up to 30s)
-            final_button_ready = False
-            for w_i in range(30):
-                if await final_btn.is_visible():
-                    aria_dis = await final_btn.get_attribute("aria-disabled")
-                    tab_idx = await final_btn.get_attribute("tabindex")
-                    if aria_dis != "true" and tab_idx != "-1":
-                        final_button_ready = True
-                        break
-                await asyncio.sleep(1.0)
-
-            if not final_button_ready:
-                raise FbBrowserAutomationError(
-                    f"Nút '{action_btn_name}' không sẵn sàng để gửi",
-                    phase="CP7_SCHEDULE_SET",
-                    can_resume=True,
-                )
+            await _wait_for_enabled_button(
+                final_btn,
+                button_label=action_btn_name,
+                phase="CP7_SCHEDULE_SET",
+                timeout_seconds=30.0,
+                cancel_check=cancel_check,
+            )
 
             try:
                 await final_btn.click(force=True, timeout=10000)
@@ -1870,14 +2346,11 @@ async def schedule_reel_via_gpm(
                     calendar_evidence = {"verified": False, "reason": str(cal_err)}
 
                 if not calendar_evidence.get("verified"):
-                    if submission_confirmed:
-                        logger.info("Meta Calendar verify chưa đọc được thẻ ngay, sử dụng xác nhận thành công từ modal.")
-                    else:
-                        raise FbBrowserAutomationError(
-                            "Đã gửi video nhưng không đọc lại được đúng lịch trên Meta Calendar",
-                            phase="CP8_SUBMITTED",
-                            can_resume=False,
-                        )
+                    raise FbBrowserAutomationError(
+                        "Đã gửi video nhưng không đọc lại được đúng lịch trên Meta Calendar; cần kiểm tra, không tự đăng lại",
+                        phase="CP8_SUBMITTED",
+                        can_resume=False,
+                    )
 
             actual_scheduled_timestamp = int(
                 calendar_evidence.get("actual_scheduled_timestamp") or 0
@@ -1933,6 +2406,8 @@ async def schedule_reel_via_gpm(
         except Exception as exc:
             logger.error("Lỗi trong quá trình tự động upload Reels Facebook: %s", exc, exc_info=True)
             if isinstance(exc, FbBrowserAutomationError):
+                if not exc.screenshot_path:
+                    exc.screenshot_path = await _capture_error_screenshot(page)
                 notify(exc.phase, f"Lỗi: {exc}", 0, screenshot=exc.screenshot_path)
                 raise
             ss_file = await _capture_error_screenshot(page)

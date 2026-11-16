@@ -2,6 +2,8 @@ function normalizedText(value) {
   return String(value || '').trim().toLocaleLowerCase('vi-VN')
 }
 
+export const META_MAX_SCHEDULE_AHEAD_DAYS = 29
+
 export function normalizeYoutubeChannel(channel) {
   return {
     ...channel,

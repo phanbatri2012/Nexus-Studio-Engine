@@ -2,10 +2,15 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  META_MAX_SCHEDULE_AHEAD_DAYS,
   normalizeYoutubeChannel,
   resolveFacebookPageSelection,
   resolveYoutubeChannelSelection
 } from './crossPosterCampaign.js'
+
+test('keeps Facebook pre-scheduling inside the Meta window', () => {
+  assert.equal(META_MAX_SCHEDULE_AHEAD_DAYS, 29)
+})
 
 test('normalizes the database title field for Cross-Poster selectors', () => {
   const channel = normalizeYoutubeChannel({ channel_id: 'UC-1', title: 'Kênh Một' })

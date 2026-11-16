@@ -7,7 +7,7 @@ import tempfile
 import urllib.parse
 from pathlib import Path
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from PIL import Image
 import imageio_ffmpeg
@@ -43,6 +43,12 @@ class FBCrossPosterUnitTests(unittest.TestCase):
     def setUp(self):
         # Clear queue before each test
         db.clear_fb_crossposter_queue(only_pending=False)
+        conn = db.sqlite3.connect(str(db.DB_PATH))
+        try:
+            conn.execute("DELETE FROM fb_meta_calendar_occupancy")
+            conn.commit()
+        finally:
+            conn.close()
 
     def test_sanitize_description(self):
         raw = """
@@ -840,6 +846,7 @@ class FBCrossPosterUnitTests(unittest.TestCase):
                 result = fb_crossposter_service.process_queue_item_jit(
                     77,
                     parent_task_id="batch",
+                    calendar_preflight_done=True,
                 )
 
         self.assertEqual(result["fb_post_id"], "fb77")
@@ -1864,12 +1871,12 @@ Câu chuyện về vị tướng quả cảm.
             patch.object(fb_crossposter_service, "_fetch_meta_page_posts_index", return_value=[]),
         ):
             res = fb_crossposter_service.reconcile_fb_queue_item(item_id)
-            self.assertEqual(res["status"], "meta_scheduled")
-            self.assertIn("Meta đã nhận lịch phát sóng", res["message"])
+            self.assertEqual(res["status"], "verifying")
+            self.assertIn("Chưa tìm thấy lịch thực tế", res["message"])
 
             batch_res = fb_crossposter_service.reconcile_fb_queue(page_id, limit=10)
             self.assertTrue(batch_res["success"])
-            self.assertEqual(batch_res["counts"]["meta_scheduled"], 1)
+            self.assertEqual(batch_res["counts"]["verifying"], 1)
             self.assertEqual(batch_res["counts"]["error"], 0)
 
     def test_reconcile_browser_submitted_published_match(self):
@@ -1969,10 +1976,10 @@ Câu chuyện về vị tướng quả cảm.
         ):
             batch_res = fb_crossposter_service.reconcile_fb_queue(page_id, limit=10)
             self.assertTrue(batch_res["success"])
-            self.assertEqual(batch_res["counts"]["meta_scheduled"], 1)
+            self.assertEqual(batch_res["counts"]["verifying"], 1)
             updated_item = db.get_fb_crossposter_queue_item(item_id)
-            self.assertEqual(updated_item["status"], "meta_scheduled")
-            self.assertEqual(updated_item["meta_state"], "scheduled")
+            self.assertEqual(updated_item["status"], "verifying")
+            self.assertEqual(updated_item["meta_state"], "verifying")
             self.assertEqual(updated_item["upload_video_id"], "vid_unpub_9876")
             self.assertEqual(updated_item["scheduled_publish_time"], future_sched)
 
@@ -1990,6 +1997,117 @@ Câu chuyện về vị tướng quả cảm.
         }
         status, fields, msg = fb_crossposter_service.inspect_facebook_publication(metadata, future_sched)
         self.assertEqual(status, "meta_scheduled")
+
+    def test_calendar_preflight_persists_verified_snapshot_before_recalculate(self):
+        settings = {
+            "target_fb_page_id": "page-123",
+            "target_gpm_profile_id": "profile-123",
+            "publication_timezone": "Asia/Ho_Chi_Minh",
+            "daily_quota": 2,
+            "schedule_times": ["11:00", "19:00"],
+            "sort_order_mode": "oldest_first",
+        }
+        snapshot = {
+            "verified": True,
+            "source": "meta_calendar",
+            "slots": [
+                {"scheduled_publish_time": 1_800_000_000, "title": "Remote post"},
+            ],
+            "weeks_scanned": 5,
+            "synced_at": "2026-11-16T00:00:00+00:00",
+        }
+
+        with (
+            patch(
+                "nexus_engine.services.fb_reels_browser_service.read_meta_calendar_occupancy_via_gpm",
+                new=AsyncMock(return_value=snapshot),
+            ) as read_calendar,
+            patch.object(db, "replace_fb_meta_calendar_occupancy", return_value=1) as replace,
+            patch.object(db, "recalculate_fb_queue_schedule", return_value=4) as recalculate,
+        ):
+            result = fb_crossposter_service.sync_meta_calendar_preflight(
+                "page-123",
+                settings=settings,
+            )
+
+        self.assertEqual(result["saved_count"], 1)
+        self.assertEqual(result["recalculated_count"], 4)
+        read_calendar.assert_awaited_once()
+        replace.assert_called_once_with(
+            "page-123",
+            snapshot["slots"],
+            source="meta_calendar",
+        )
+        recalculate.assert_called_once()
+
+    def test_calendar_preflight_failure_does_not_replace_snapshot_or_recalculate(self):
+        settings = {
+            "target_fb_page_id": "page-123",
+            "target_gpm_profile_id": "profile-123",
+            "publication_timezone": "Asia/Ho_Chi_Minh",
+        }
+        with (
+            patch(
+                "nexus_engine.services.fb_reels_browser_service.read_meta_calendar_occupancy_via_gpm",
+                new=AsyncMock(side_effect=RuntimeError("calendar unavailable")),
+            ),
+            patch.object(db, "replace_fb_meta_calendar_occupancy") as replace,
+            patch.object(db, "recalculate_fb_queue_schedule") as recalculate,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "calendar unavailable"):
+                fb_crossposter_service.sync_meta_calendar_preflight(
+                    "page-123",
+                    settings=settings,
+                )
+
+        replace.assert_not_called()
+        recalculate.assert_not_called()
+
+    def test_cp8_unverified_error_is_not_resumable(self):
+        error = RuntimeError("Không đọc lại được lịch Meta")
+        error.can_resume = False
+        with (
+            patch.object(db, "update_fb_checkpoint") as update_checkpoint,
+            patch.object(db, "update_system_job") as update_job,
+        ):
+            result = fb_crossposter_service.pause_fb_browser_checkpoint(
+                77,
+                error,
+                sys_job_id="job-77",
+                phase="CP8_SUBMITTED",
+            )
+
+        self.assertEqual(result["status"], "verifying")
+        self.assertFalse(result["can_resume"])
+        self.assertEqual(update_checkpoint.call_args.kwargs["status"], "verifying")
+        self.assertFalse(update_checkpoint.call_args.kwargs["can_resume"])
+        self.assertEqual(update_job.call_args.kwargs["status"], "paused")
+
+    def test_meta_post_index_uses_authorization_header_not_token_url(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"data": []}'
+        opener = MagicMock()
+        opener.open.return_value = response
+
+        with (
+            patch.object(fb_crossposter_service, "_get_proxy_for_gpm_profile", return_value=None),
+            patch.object(fb_crossposter_service, "_build_urllib_opener", return_value=opener),
+        ):
+            fb_crossposter_service._fetch_meta_page_posts_index(
+                "page-123",
+                "secret-token-value",
+            )
+
+        self.assertEqual(opener.open.call_count, 2)
+        for call in opener.open.call_args_list:
+            request = call.args[0]
+            self.assertNotIn("secret-token-value", request.full_url)
+            self.assertNotIn("access_token=", request.full_url)
+            self.assertEqual(
+                request.get_header("Authorization"),
+                "Bearer secret-token-value",
+            )
 
 
 if __name__ == "__main__":
