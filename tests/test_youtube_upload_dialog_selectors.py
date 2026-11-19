@@ -7,7 +7,9 @@ from nexus_engine.services.browser_youtube_uploader import (
     UPLOAD_CREATE_MENU_ITEM_SELECTORS,
     UPLOAD_MONETIZATION_TRIGGER_SELECTORS,
     AD_SUITABILITY_ROOT_SELECTORS,
+    AD_SUITABILITY_COMPLETED_STEP_SELECTORS,
     AD_SUITABILITY_NONE_SELECTORS,
+    AD_SUITABILITY_SAVED_SELECTORS,
     AD_SUITABILITY_SUBMIT_SELECTORS,
     BrowserUploadError,
 )
@@ -48,6 +50,14 @@ class TestYouTubeUploadDialogSelectors(unittest.TestCase):
         self.assertTrue(any("ytcp-self-certification" in s for s in AD_SUITABILITY_ROOT_SELECTORS))
         self.assertTrue(any("all-none-checkbox" in s for s in AD_SUITABILITY_NONE_SELECTORS))
         self.assertTrue(any("predictor" in s for s in AD_SUITABILITY_SUBMIT_SELECTORS))
+        self.assertTrue(any("đã bị khóa" in s for s in AD_SUITABILITY_SAVED_SELECTORS))
+        self.assertTrue(any("questionnaire has been locked" in s for s in AD_SUITABILITY_SAVED_SELECTORS))
+        self.assertTrue(
+            any(
+                "[test-id='CONTENT_RATINGS'][state='completed']" in s
+                for s in AD_SUITABILITY_COMPLETED_STEP_SELECTORS
+            )
+        )
 
 
 class TestYouTubeUploadDialogFlow(unittest.IsolatedAsyncioTestCase):

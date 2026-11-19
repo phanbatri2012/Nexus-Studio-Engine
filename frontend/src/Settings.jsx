@@ -125,7 +125,8 @@ const VIDEO_PROMPT_TAGS = [
   { tag: '{frame_directive}', label: '+ {frame_directive} (Ảnh gốc)' },
   { tag: '{action}', label: '+ {action} (Kịch bản)' },
   { tag: '{style}', label: '+ {style} (Phong cách video)' },
-  { tag: '{motion}', label: '+ {motion} (Chuyển động camera)' }
+  { tag: '{motion}', label: '+ {motion} (Chuyển động camera)' },
+  { tag: '{duration_seconds}', label: '+ {duration_seconds} (Thời lượng)' }
 ];
 
 const DEFAULT_IMAGE_GENERATION_SETTINGS = {
@@ -162,7 +163,7 @@ const DEFAULT_IMAGE_GENERATION_SETTINGS = {
   flow_image_max_in_flight: 2,
   video_style_prompt: 'Cinematic documentary film, 35mm motion picture composition, natural atmospheric lighting, realistic textures, balanced color grading, 4k cinematic video footage.',
   video_negative_prompt: 'still image, static photo, cartoon, anime, 3D CGI render, illustration, deformed hands, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.',
-  video_prompt_template: '{frame_directive} Scene action: {action}. Visual style: {style}. {motion} Clean video without any text, letters, watermark, or subtitles.',
+  video_prompt_template: '{frame_directive} Scene action: {action}. Visual style: {style}. {motion} Target duration: approximately {duration_seconds} seconds. Maintain continuous motion throughout the full duration. Clean video without any text, letters, watermark, or subtitles.',
   video_motion_prompt: 'Motion: smooth cinematic camera movement, natural realistic motion, 4k 24fps high-fidelity video.',
   scene_0_prompt_template: 'A cinematic movie still: {style}, opening scene hook. {reference} Story visual core: {thumbnail_concept}. 16:9 widescreen, photorealistic 8k, authentic documentary realism, clean framing without text.',
   scene_body_prompt_template: 'A still photograph: {style}, scene {scene_index}. {reference} Narrative scene: {action}. 16:9 widescreen still photograph, authentic documentary realism, natural lighting, clean visual without text.',
@@ -3342,10 +3343,10 @@ export default function Settings({
                       'image_generation_settings', 'video_prompt_template', event.target.value
                     )}
                     disabled={activeVersionLocked}
-                    placeholder="Ví dụ: {frame_directive} Scene action: {action}. Visual style: {style}. {motion} Clean video without any text, letters, watermark, or subtitles."
+                    placeholder="Ví dụ: {frame_directive} Scene action: {action}. Visual style: {style}. {motion} Target duration: approximately {duration_seconds} seconds."
                   />
                   <div className="help-text" style={{ marginTop: 4 }}>
-                    Công thức tổng hợp gửi cho Google Flow khi tạo video intro. Hỗ trợ các biến <code>{'{frame_directive}'}</code> (chỉ thị gắn ảnh gốc Scene 0), <code>{'{action}'}</code> (hành động cảnh), <code>{'{style}'}</code> (Video Style), <code>{'{motion}'}</code> (Motion directive).
+                    Công thức tổng hợp gửi cho Google Flow khi tạo video intro. Hỗ trợ các biến <code>{'{frame_directive}'}</code> (chỉ thị gắn ảnh gốc Scene 0), <code>{'{action}'}</code> (hành động cảnh), <code>{'{style}'}</code> (Video Style), <code>{'{motion}'}</code> (Motion directive), <code>{'{duration_seconds}'}</code> (thời lượng thực tế của scene). Template cũ thiếu biến thời lượng vẫn được backend tự bổ sung chỉ thị.
                   </div>
                 </div>
               </>
@@ -3366,6 +3367,13 @@ export default function Settings({
               const liveVidStyle = (currentImageGeneration.video_style_prompt || DEFAULT_IMAGE_GENERATION_SETTINGS.video_style_prompt).split('\n')[0].slice(0, 100);
               const liveMotion = currentImageGeneration.video_motion_prompt || DEFAULT_IMAGE_GENERATION_SETTINGS.video_motion_prompt;
               const liveVidTemplate = currentImageGeneration.video_prompt_template || DEFAULT_IMAGE_GENERATION_SETTINGS.video_prompt_template;
+              const liveDuration = Number(currentImageGeneration.intro_scene_target_seconds || 8.0);
+              const liveDurationLabel = Number.isFinite(liveDuration) && liveDuration > 0
+                ? String(liveDuration)
+                : '8';
+              const liveVidTemplateWithDuration = liveVidTemplate.includes('{duration_seconds}')
+                ? liveVidTemplate
+                : `${liveVidTemplate.trim()} Target duration: approximately ${liveDurationLabel} seconds. Maintain continuous motion throughout the full duration.`;
 
               const previewScene0 = (
                 currentImageGeneration.scene_0_prompt_template || DEFAULT_IMAGE_GENERATION_SETTINGS.scene_0_prompt_template
@@ -3384,11 +3392,12 @@ export default function Settings({
                 .replace('{action}', 'Hai người bạn lâu năm trò chuyện bên hiên nhà ấm cúng')
                 .replace('{scene_index}', '2');
 
-              const previewVideo = liveVidTemplate
+              const previewVideo = liveVidTemplateWithDuration
                 .replace('{frame_directive}', 'Generate exactly one 16:9 video, not a still image. Using the attached image as the starting frame, animate it into a cinematic video clip.')
                 .replace('{action}', 'Bác Ba ngồi trầm ngâm bên tách trà sớm')
                 .replace('{style}', liveVidStyle)
-                .replace('{motion}', liveMotion);
+                .replace('{motion}', liveMotion)
+                .replace('{duration_seconds}', liveDurationLabel);
 
               return (
                 <div style={{ background: 'rgba(0, 0, 0, 0.25)', border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: 8, padding: '10px 14px' }}>

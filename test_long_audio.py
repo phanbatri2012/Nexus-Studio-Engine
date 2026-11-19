@@ -33,6 +33,283 @@ class LongAudioTests(unittest.TestCase):
             tts_service.get_request_hash(long_text, "voice"),
         )
 
+    def test_dialogue_batch_primary_voice_uses_mc_role_not_first_turn(self):
+        mc_voice = {
+            "id": "mc-voice",
+            "name": "MC voice",
+            "provider_id": "omnivoice",
+            "provider_voice_id": "mc-profile",
+            "status": "active",
+            "revision": 1,
+            "casting_profile": {"usage_modes": ["multi_host"]},
+        }
+        segments = [
+            {
+                "index": 0,
+                "role": "KHACH_1",
+                "voice_id": "guest-voice",
+                "voice_name": "Guest voice",
+            },
+            {
+                "index": 1,
+                "role": "MC",
+                "voice_id": "mc-voice",
+                "voice_name": "MC voice",
+            },
+        ]
+
+        with patch.object(main.voice_config, "get_voice", return_value=mc_voice):
+            voice_id, voice_name, snapshot = main._resolve_batch_primary_voice(
+                segments,
+                "guest-voice",
+                "Guest voice",
+            )
+
+        self.assertEqual(voice_id, "mc-voice")
+        self.assertEqual(voice_name, "MC voice")
+        self.assertEqual(snapshot["voice_id"], "mc-voice")
+
+    def test_new_dialogue_batch_stores_mc_voice_when_guest_speaks_first(self):
+        mc_voice = {
+            "id": "mc-voice",
+            "name": "MC voice",
+            "provider_id": "omnivoice",
+            "provider_voice_id": "mc-profile",
+            "status": "active",
+            "revision": 1,
+            "casting_profile": {"usage_modes": ["multi_host"]},
+        }
+        guest_voice = {
+            "id": "guest-voice",
+            "name": "Guest voice",
+            "provider_id": "omnivoice",
+            "provider_voice_id": "guest-profile",
+            "status": "active",
+            "revision": 1,
+            "casting_profile": {"usage_modes": ["multi_guest"]},
+        }
+        dialogue_segments = [
+            {
+                "text": "Khách nói trước.",
+                "role": "KHACH_1",
+                "voice_id": "guest-voice",
+                "voice_name": "Guest voice",
+            },
+            {
+                "text": "MC nói sau.",
+                "role": "MC",
+                "voice_id": "mc-voice",
+                "voice_name": "MC voice",
+            },
+        ]
+        video = {
+            "id": 70,
+            "generated_script": "### [BODY]\n[KHACH_1]: Khách nói trước.\n[MC]: MC nói sau.",
+            "production_snapshot_json": "{}",
+            "voice_id": "mc-voice",
+            "voice_name": "MC voice",
+        }
+
+        def get_voice(voice_id, **_kwargs):
+            return {
+                "mc-voice": mc_voice,
+                "guest-voice": guest_voice,
+            }[voice_id]
+
+        with (
+            patch.object(main, "_require_audio_review_approval"),
+            patch.object(main.db, "get_video", return_value=video),
+            patch.object(main.db, "get_audio_task", return_value=None),
+            patch.object(main.voice_config, "get_voice", side_effect=get_voice),
+            patch.object(
+                main.voice_config,
+                "load_voice_config",
+                return_value={"voices": [mc_voice, guest_voice]},
+            ),
+            patch.object(main, "is_dialogue_script", return_value=True),
+            patch.object(main, "_resolve_radar_auto_cast", return_value={}),
+            patch.object(
+                main,
+                "build_dialogue_tts_segments",
+                return_value=dialogue_segments,
+            ),
+            patch.object(
+                main.tts,
+                "get_dialogue_request_hash",
+                return_value="dialogue-hash",
+            ),
+            patch.object(
+                main,
+                "_ensure_batch_audio_task",
+                return_value={"status": "processing"},
+            ) as ensure_batch,
+        ):
+            main._ensure_audio_task(70)
+
+        args = ensure_batch.call_args.args
+        self.assertEqual(args[4], "mc-voice")
+        self.assertEqual(args[5], "MC voice")
+        self.assertEqual(args[6]["voice_id"], "mc-voice")
+
+    def test_legacy_dialogue_batch_sync_uses_mc_segment_for_cast_validation(self):
+        mc_voice = {
+            "id": "mc-voice",
+            "name": "MC voice",
+            "provider_id": "omnivoice",
+            "provider_voice_id": "mc-profile",
+            "status": "active",
+            "revision": 1,
+            "casting_profile": {"usage_modes": ["multi_host"]},
+        }
+        guest_voice = {
+            "id": "guest-voice",
+            "name": "Guest voice",
+            "provider_id": "omnivoice",
+            "provider_voice_id": "guest-profile",
+            "status": "active",
+            "revision": 1,
+            "casting_profile": {"usage_modes": ["multi_guest"]},
+        }
+        guest_snapshot = main.voice_config.build_voice_snapshot(guest_voice)
+        segments = [
+            {
+                "index": 0,
+                "role": "KHACH_1",
+                "voice_id": "guest-voice",
+                "voice_name": "Guest voice",
+                "tts_provider_id": "omnivoice",
+                "task_id": "omnivoice:guest-job",
+                "status": "completed",
+                "audio_url": "omnivoice://guest-job",
+                "error": "",
+            },
+            {
+                "index": 1,
+                "role": "MC",
+                "voice_id": "mc-voice",
+                "voice_name": "MC voice",
+                "tts_provider_id": "omnivoice",
+                "task_id": "omnivoice:mc-job",
+                "status": "processing",
+                "audio_url": "",
+                "error": "",
+            },
+        ]
+        stored_task = {
+            "video_id": 70,
+            "request_hash": "dialogue-hash",
+            "task_id": "batch-dialogue-hash",
+            "status": "processing",
+            "audio_url": "",
+            "error": "",
+            "segments_json": json.dumps(segments),
+            "voice_id": "guest-voice",
+            "voice_name": "Guest voice",
+            "tts_provider_id": "omnivoice",
+            "voice_revision": 1,
+            "voice_snapshot_json": json.dumps(guest_snapshot),
+        }
+        rebuilt_segments = [
+            {
+                "text": "Khách nói trước.",
+                "role": "KHACH_1",
+                "voice_id": "guest-voice",
+                "voice_name": "Guest voice",
+            },
+            {
+                "text": "MC nói sau.",
+                "role": "MC",
+                "voice_id": "mc-voice",
+                "voice_name": "MC voice",
+            },
+        ]
+
+        def get_voice(voice_id, **_kwargs):
+            return {
+                "mc-voice": mc_voice,
+                "guest-voice": guest_voice,
+            }[voice_id]
+
+        def store_task(**kwargs):
+            return {
+                **kwargs,
+                "updated_at": "2026-11-19T00:00:00+00:00",
+            }
+
+        with (
+            patch.object(main.voice_config, "get_voice", side_effect=get_voice),
+            patch.object(
+                main.voice_config,
+                "load_voice_config",
+                return_value={"voices": [mc_voice, guest_voice]},
+            ),
+            patch.object(
+                main.tts,
+                "get_tts_task",
+                return_value={
+                    "status": "completed",
+                    "result": {"audio_url": "omnivoice://mc-job"},
+                },
+            ),
+            patch.object(
+                main.db,
+                "get_video",
+                return_value={
+                    "id": 70,
+                    "generated_script": "dialogue-script",
+                    "production_snapshot_json": '{"content_mode":"dialogue"}',
+                },
+            ),
+            patch.object(main, "get_clean_script_for_tts", return_value="dialogue-script"),
+            patch.object(main, "apply_tts_filters", side_effect=lambda value: value),
+            patch.object(main, "is_dialogue_script", return_value=True),
+            patch.object(
+                main,
+                "_resolve_radar_auto_cast",
+                return_value={
+                    "MC": {"voice_id": "mc-voice"},
+                    "KHACH_1": {"voice_id": "guest-voice"},
+                },
+            ) as resolve_cast,
+            patch.object(
+                main,
+                "build_dialogue_tts_segments",
+                return_value=rebuilt_segments,
+            ),
+            patch.object(
+                main.tts,
+                "get_dialogue_request_hash",
+                return_value="dialogue-hash",
+            ),
+            patch.object(
+                main.tts,
+                "get_generation_request_hash",
+                return_value="mono-hash",
+            ),
+            patch.object(
+                main.audio_utils,
+                "merge_audio_segments_to_mp3",
+                return_value=120.0,
+            ),
+            patch.object(main.audio_utils, "validate_spoken_duration"),
+            patch.object(main.db, "update_audio_duration"),
+            patch.object(main.db, "upsert_audio_task", side_effect=store_task),
+            patch.object(main, "_save_audio_url"),
+            patch.object(main, "_trigger_video_render_if_enabled"),
+        ):
+            result = main._sync_batch_audio_task(stored_task, segments)
+
+        self.assertEqual(
+            resolve_cast.call_args.kwargs["mc_voice_id"],
+            "mc-voice",
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["voice_id"], "mc-voice")
+        self.assertEqual(
+            json.loads(result["voice_snapshot_json"])["voice_id"],
+            "mc-voice",
+        )
+
     def test_batch_submission_is_persisted_and_reused(self):
         chunks = ["Đoạn thứ nhất.", "Đoạn thứ hai."]
         stored_versions = []

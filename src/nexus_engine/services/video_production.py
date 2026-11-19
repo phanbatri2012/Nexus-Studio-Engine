@@ -50,11 +50,13 @@ TARGET_WIDTH = 1920
 TARGET_HEIGHT = 1080
 TARGET_FPS = 30
 VIDEO_EXTENSION_POLICY_VERSION = "smart_extend_v1"
+VIDEO_PROMPT_POLICY_VERSION = "duration_v1"
 VIDEO_DURATION_EPSILON_SECONDS = 0.12
 VIDEO_HOLD_ONLY_MAX_SECONDS = 0.4
 VIDEO_MAX_DURATION_FACTOR = 1.10
 VIDEO_MAX_HOLD_AFTER_SLOWDOWN_SECONDS = 1.0
 VIDEO_RENDER_PAD_SECONDS = 0.1
+MAX_SCENE_VIDEO_GENERATION_ATTEMPTS = 2
 SCENE_IMAGE_WIDTH = 1024
 SCENE_IMAGE_HEIGHT = 576
 PERCEPTUAL_HASH_IMAGE_SIZE = 32
@@ -194,6 +196,9 @@ def _empty_intro_video_summary(*, enabled: bool) -> dict:
         "generated_count": 0,
         "fallback_count": 0,
         "fallback_scenes": [],
+        "duration_retry_count": 0,
+        "short_clip_count": 0,
+        "short_clip_scenes": [],
     }
 
 
@@ -440,6 +445,120 @@ def _validated_image_artifact(
         return None
     _backfill_image_validation(artifact, validation)
     return validation
+
+
+def _legacy_scene_hash_candidates(
+    video_id: int,
+    scene: dict,
+    artifact: dict,
+    profile: dict | None,
+    negative_prompt: str,
+    reference_hash: str,
+) -> set[str]:
+    legacy_scenes = [dict(scene)]
+    metadata = artifact.get("metadata") if isinstance(artifact.get("metadata"), dict) else {}
+    if "duration" in metadata:
+        scene_with_original_duration = dict(scene)
+        scene_with_original_duration["duration"] = metadata.get("duration")
+        if scene_with_original_duration != legacy_scenes[0]:
+            legacy_scenes.append(scene_with_original_duration)
+    return {
+        _legacy_scene_hash(
+            video_id,
+            legacy_scene,
+            profile,
+            negative_prompt,
+            reference_hash,
+        )
+        for legacy_scene in legacy_scenes
+    }
+
+
+def _resolve_reusable_scene_image_artifact(
+    *,
+    video_id: int,
+    scene: dict,
+    profile: dict | None,
+    negative_prompt: str,
+    reference_hash: str,
+    preferred_artifact: dict | None = None,
+    counters: dict[str, int] | None = None,
+) -> tuple[dict, ValidatedImageArtifact] | None:
+    """Find and promote a valid current or legacy scene image cache entry."""
+    artifact_type = f"scene:{scene['index']}"
+    current_hash = _scene_hash(
+        video_id,
+        scene,
+        profile,
+        negative_prompt,
+        reference_hash,
+    )
+    candidates: list[dict] = []
+    if isinstance(preferred_artifact, dict):
+        candidates.append(preferred_artifact)
+
+    seen_ids = {
+        int(candidate.get("id") or 0)
+        for candidate in candidates
+        if int(candidate.get("id") or 0) > 0
+    }
+    for candidate in reversed(db.list_video_artifacts(video_id, artifact_type)):
+        candidate_id = int(candidate.get("id") or 0)
+        if candidate_id > 0 and candidate_id in seen_ids:
+            continue
+        candidates.append(candidate)
+        if candidate_id > 0:
+            seen_ids.add(candidate_id)
+
+    for candidate in candidates:
+        if str(candidate.get("status") or "") != "completed":
+            continue
+        actual_hash = str(candidate.get("content_hash") or "")
+        if actual_hash != current_hash and actual_hash not in _legacy_scene_hash_candidates(
+            video_id,
+            scene,
+            candidate,
+            profile,
+            negative_prompt,
+            reference_hash,
+        ):
+            continue
+        validation = _validated_image_artifact(
+            candidate,
+            expected_content_hash=actual_hash,
+            counters=counters,
+        )
+        if validation is None:
+            continue
+        if actual_hash == current_hash:
+            return candidate, validation
+
+        metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+        promoted = db.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type=artifact_type,
+            path=str(validation.path),
+            content_hash=current_hash,
+            status="completed",
+            mime_type=str(candidate.get("mime_type") or "image/png"),
+            size_bytes=validation.size_bytes,
+            duration_seconds=candidate.get("duration_seconds"),
+            width=validation.width,
+            height=validation.height,
+            codecs=candidate.get("codecs") if isinstance(candidate.get("codecs"), dict) else {},
+            metadata={
+                **metadata,
+                "image_validation_v1": _image_validation_metadata(validation),
+            },
+        )
+        logger.info(
+            "Promoted legacy scene image cache video=%s scene=%s artifact=%s",
+            video_id,
+            scene.get("index"),
+            candidate.get("id"),
+        )
+        return promoted, validation
+    return None
 
 
 def _cached_reference_hash(
@@ -895,6 +1014,34 @@ def _scene_hash(
     reference_hash: str = "",
 ) -> str:
     profile_dict = profile if isinstance(profile, dict) else {}
+    image_scene = (
+        {key: value for key, value in scene.items() if key != "duration"}
+        if isinstance(scene, dict)
+        else scene
+    )
+    payload = json.dumps(
+        {
+            "video_id": video_id,
+            "scene": image_scene,
+            "profile_id": profile_dict.get("id", ""),
+            "negative_prompt": negative_prompt,
+            "reference_hash": reference_hash,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    return _sha256_bytes(payload)
+
+
+def _legacy_scene_hash(
+    video_id: int,
+    scene: dict,
+    profile: dict | None = None,
+    negative_prompt: str = "",
+    reference_hash: str = "",
+) -> str:
+    """Return the pre-duration-policy image hash for cache compatibility."""
+    profile_dict = profile if isinstance(profile, dict) else {}
     payload = json.dumps(
         {
             "video_id": video_id,
@@ -902,6 +1049,75 @@ def _scene_hash(
             "profile_id": profile_dict.get("id", ""),
             "negative_prompt": negative_prompt,
             "reference_hash": reference_hash,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    return _sha256_bytes(payload)
+
+
+def _scene_video_target_duration(scene: dict, settings: dict | None = None) -> float:
+    settings_dict = settings if isinstance(settings, dict) else {}
+    for raw_value in (
+        scene.get("duration") if isinstance(scene, dict) else None,
+        settings_dict.get("intro_scene_target_seconds"),
+        8.0,
+    ):
+        try:
+            duration = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(duration) and duration > 0:
+            return duration
+    return 8.0
+
+
+def _scene_video_hash(
+    video_id: int,
+    scene: dict,
+    profile: dict | None,
+    settings: dict | None,
+    negative_prompt: str,
+    start_frame_hash: str,
+    end_frame_hash: str,
+) -> str:
+    profile_dict = profile if isinstance(profile, dict) else {}
+    settings_dict = settings if isinstance(settings, dict) else {}
+    payload = json.dumps(
+        {
+            "policy_version": VIDEO_PROMPT_POLICY_VERSION,
+            "video_id": video_id,
+            "scene": scene,
+            "profile_id": profile_dict.get("id", ""),
+            "target_duration_seconds": round(
+                _scene_video_target_duration(scene, settings_dict), 3
+            ),
+            "negative_prompt": negative_prompt,
+            "start_frame_hash": start_frame_hash,
+            "end_frame_hash": end_frame_hash,
+            "video_model": str(
+                settings_dict.get("video_model") or "omni_1_1_flash"
+            ),
+            "video_aspect_ratio": str(
+                settings_dict.get("video_aspect_ratio") or "16:9"
+            ),
+            "video_output_count": int(
+                settings_dict.get("video_output_count") or 1
+            ),
+            "style_prompt": str(
+                settings_dict.get("style_prompt")
+                or profile_dict.get("style_prompt")
+                or ""
+            ),
+            "video_style_prompt": str(
+                settings_dict.get("video_style_prompt") or ""
+            ),
+            "video_prompt_template": str(
+                settings_dict.get("video_prompt_template") or ""
+            ),
+            "video_motion_prompt": str(
+                settings_dict.get("video_motion_prompt") or ""
+            ),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -1198,6 +1414,7 @@ def _format_scene_video_prompt(
     video_prompt_template: str = "",
     video_motion_prompt: str = "",
     video_title: str = "",
+    duration_seconds: float | None = None,
     has_start_frame: bool = True,
     has_end_frame: bool = False,
 ) -> str:
@@ -1217,6 +1434,16 @@ def _format_scene_video_prompt(
         )
     else:
         frame_directive = "Generate exactly one 16:9 high-quality cinematic video clip, not a still image."
+
+    target_duration = _scene_video_target_duration(
+        {"duration": duration_seconds},
+        None,
+    )
+    duration_label = f"{target_duration:.3f}".rstrip("0").rstrip(".")
+    duration_directive = (
+        f"Target duration: approximately {duration_label} seconds. "
+        "Maintain continuous motion throughout the full duration."
+    )
 
     # 2. Extract and sanitize action context (completely topic-agnostic)
     raw_action = scene_action or raw_prompt
@@ -1254,16 +1481,23 @@ def _format_scene_video_prompt(
 
     if video_prompt_template and video_prompt_template.strip():
         custom_video = video_prompt_template.strip()
+        has_duration_placeholder = "{duration_seconds}" in custom_video
         custom_video = (
             custom_video
             .replace("{frame_directive}", frame_directive)
             .replace("{action}", action_clean)
             .replace("{style}", style_clean)
             .replace("{motion}", motion_directive)
+            .replace("{duration_seconds}", duration_label)
         )
+        if not has_duration_placeholder:
+            custom_video = f"{custom_video} {duration_directive}"
         full_video_prompt = re.sub(r"\s+", " ", custom_video).strip()
     else:
-        full_video_prompt = f"{frame_directive} {action_directive} {style_directive} {motion_directive} {anti_text_directive}"
+        full_video_prompt = (
+            f"{frame_directive} {action_directive} {style_directive} "
+            f"{motion_directive} {duration_directive} {anti_text_directive}"
+        )
     full_video_prompt = re.sub(r"\s+", " ", full_video_prompt).strip()
     return full_video_prompt
 
@@ -1439,12 +1673,30 @@ async def _generate_scene_image_async(
         if artifact_snapshot is not None
         else db.get_latest_video_artifact(video_id, artifact_type)
     )
+    reusable = (
+        _resolve_reusable_scene_image_artifact(
+            video_id=video_id,
+            scene=scene,
+            profile=profile,
+            negative_prompt=negative_prompt,
+            reference_hash=reference_hash,
+            preferred_artifact=existing,
+            counters=validation_counters,
+        )
+        if not force_new_project
+        else None
+    )
+    if reusable is not None:
+        existing, validated = reusable
+        if artifact_snapshot is not None:
+            artifact_snapshot[artifact_type] = existing
+    else:
+        validated = None
     existing_metadata = existing.get("metadata", {}) if existing else {}
-
     cache_matches_plan = bool(
         existing and existing.get("content_hash") == content_hash
     )
-    if existing and not cache_matches_plan:
+    if existing and reusable is None and not cache_matches_plan:
         logger.info(
             "Ignoring stale scene cache for video=%s scene=%s: expected=%s actual=%s",
             video_id,
@@ -1454,45 +1706,40 @@ async def _generate_scene_image_async(
         )
     if (
         not force_new_project
-        and cache_matches_plan
-        and existing.get("status") == "completed"
+        and reusable is not None
+        and existing is not None
+        and validated is not None
     ):
-        validated = _validated_image_artifact(
-            existing,
-            expected_content_hash=content_hash,
-            counters=validation_counters,
+        artifact_path = validated.path
+        art_hash = validated.sha256
+        art_fingerprint = validated.fingerprint
+        is_exact_duplicate = bool(
+            existing_hashes is not None and art_hash in existing_hashes
         )
-        if validated is not None:
-            artifact_path = validated.path
-            art_hash = validated.sha256
-            art_fingerprint = validated.fingerprint
-            is_exact_duplicate = bool(
-                existing_hashes is not None and art_hash in existing_hashes
+        is_visual_duplicate = _matches_existing_perceptual_fingerprint(
+            art_fingerprint,
+            existing_perceptual_hashes,
+        )
+        if is_exact_duplicate or is_visual_duplicate:
+            logger.warning(
+                "Cached artifact %s for scene %s duplicates an earlier scene (%s). Purging cache and regenerating.",
+                existing.get("id"),
+                scene.get("index"),
+                "exact" if is_exact_duplicate else "perceptual",
             )
-            is_visual_duplicate = _matches_existing_perceptual_fingerprint(
-                art_fingerprint,
-                existing_perceptual_hashes,
-            )
-            if is_exact_duplicate or is_visual_duplicate:
-                logger.warning(
-                    "Cached artifact %s for scene %s duplicates an earlier scene (%s). Purging cache and regenerating.",
-                    existing.get("id"),
-                    scene.get("index"),
-                    "exact" if is_exact_duplicate else "perceptual",
+            if existing.get("id"):
+                db.delete_video_artifact(existing["id"])
+            try:
+                artifact_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            if worker is not None and hasattr(worker, "register_video_frame_metadata"):
+                worker.register_video_frame_metadata(
+                    artifact_path,
+                    existing.get("metadata") or {},
                 )
-                if existing.get("id"):
-                    db.delete_video_artifact(existing["id"])
-                try:
-                    artifact_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            else:
-                if worker is not None and hasattr(worker, "register_video_frame_metadata"):
-                    worker.register_video_frame_metadata(
-                        artifact_path,
-                        existing.get("metadata") or {},
-                    )
-                return validated if return_validation else artifact_path
+            return validated if return_validation else artifact_path
 
     target = SCENES_DIR / f"{video_id}_{scene['index']}_{content_hash[:8]}.png"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -2295,8 +2542,15 @@ async def _generate_scene_video_async(
         else ""
     )
     
-    content_hash = _scene_hash(
-        video_id, scene, profile, negative_prompt, f"{start_hash}:{end_hash}"
+    target_duration_seconds = _scene_video_target_duration(scene, settings)
+    content_hash = _scene_video_hash(
+        video_id,
+        scene,
+        profile,
+        settings,
+        negative_prompt,
+        start_hash,
+        end_hash,
     )
     artifact_type = f"scene_video:{scene['index']}"
     existing = (
@@ -2305,6 +2559,11 @@ async def _generate_scene_video_async(
         else db.get_latest_video_artifact(video_id, artifact_type)
     )
     existing_metadata = existing.get("metadata", {}) if existing else {}
+    safe_existing_metadata = {
+        key: value
+        for key, value in existing_metadata.items()
+        if key not in {"prompt", "action", "transcript"}
+    }
     receipt = existing_metadata.get("flow_receipt")
     receipt = receipt if isinstance(receipt, dict) else {}
     recoverable_reason_codes = {
@@ -2445,6 +2704,16 @@ async def _generate_scene_video_async(
         )
 
     previous_attempt = int(existing_metadata.get("generation_attempt") or 0)
+    try:
+        duration_retry_count = max(
+            0,
+            min(
+                MAX_SCENE_VIDEO_GENERATION_ATTEMPTS - 1,
+                int(existing_metadata.get("duration_retry_count") or 0),
+            ),
+        )
+    except (TypeError, ValueError):
+        duration_retry_count = 0
     generation_attempt = (
         previous_attempt if is_reconciliation_checkpoint else previous_attempt + 1
     )
@@ -2455,10 +2724,12 @@ async def _generate_scene_video_async(
         else secrets.token_hex(10)
     )
     checkpoint_metadata = {
-        **existing_metadata,
-        **scene,
+        **safe_existing_metadata,
+        "scene_index": max(0, int(scene.get("index") or 0)),
         "seed": fixed_seed,
         "generation_attempt": generation_attempt,
+        "target_duration_seconds": round(target_duration_seconds, 3),
+        "duration_retry_count": duration_retry_count,
         "start_hash": start_hash,
         "end_hash": end_hash,
         "start_frame": start_frame_path.name if start_frame_path else "",
@@ -2485,6 +2756,117 @@ async def _generate_scene_video_async(
 
     flow_timing: dict[str, object] = {}
     clip_probe: dict[str, object] = {}
+    best_candidate_path: Path | None = None
+    best_candidate_probe: dict[str, object] = {}
+    best_candidate_hash = ""
+
+    def candidate_path_for_attempt(attempt: int) -> Path:
+        return target.with_name(f"{target.name}.attempt-{max(1, int(attempt))}.part")
+
+    def trusted_candidate_path(raw_path: object) -> Path | None:
+        raw_value = str(raw_path or "").strip()
+        if not raw_value:
+            return None
+        candidate = Path(raw_value)
+        try:
+            if candidate.parent.resolve() != target.parent.resolve():
+                return None
+        except OSError:
+            return None
+        if not (
+            candidate.name.startswith(f"{target.name}.attempt-")
+            and candidate.name.endswith(".part")
+        ):
+            return None
+        return candidate
+
+    stored_candidate = trusted_candidate_path(
+        existing_metadata.get("duration_candidate_path")
+    )
+    if stored_candidate and stored_candidate.is_file() and stored_candidate.stat().st_size > 1000:
+        try:
+            stored_probe = probe_scene_video(stored_candidate)
+            if float(stored_probe.get("duration_seconds") or 0.0) > 0.5:
+                best_candidate_path = stored_candidate
+                best_candidate_probe = stored_probe
+                best_candidate_hash = _sha256_file(stored_candidate)
+        except Exception as exc:
+            logger.warning(
+                "Ignoring invalid duration candidate for video=%s scene=%s: %s",
+                video_id,
+                scene.get("index"),
+                security_logging.redact_sensitive(exc),
+            )
+
+    def complete_with_candidate(
+        candidate_path: Path,
+        candidate_probe: dict[str, object],
+        *,
+        resolution: str,
+    ) -> Path:
+        source_duration = float(candidate_probe.get("duration_seconds") or 0.0)
+        shortfall = max(0.0, target_duration_seconds - source_duration)
+        duration_met = shortfall <= VIDEO_HOLD_ONLY_MAX_SECONDS + 1e-6
+        candidate_path.replace(target)
+        for stale_candidate in target.parent.glob(f"{target.name}.attempt-*.part"):
+            if stale_candidate != target:
+                stale_candidate.unlink(missing_ok=True)
+        completed_metadata = {
+            **checkpoint_metadata,
+            "generation_attempt": generation_attempt,
+            "duration_retry_count": duration_retry_count,
+            "duration_quality": {
+                "target_seconds": round(target_duration_seconds, 3),
+                "source_seconds": round(source_duration, 3),
+                "shortfall_seconds": round(shortfall, 3),
+                "retry_count": duration_retry_count,
+                "requirement_met": duration_met,
+            },
+            "flow_timing": flow_timing,
+        }
+        for stale_error_key in (
+            "error",
+            "failure_stage",
+            "reason_code",
+            "fallback_reason_code",
+            "queued_since",
+            "next_retry_at",
+            "reconciliation_poll_count",
+            "terminal",
+            "duration_candidate_path",
+            "duration_candidate_seconds",
+            "duration_candidate_sha256",
+            "duration_retry_pending",
+        ):
+            completed_metadata.pop(stale_error_key, None)
+        db.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type=artifact_type,
+            path=str(target),
+            content_hash=content_hash,
+            status="completed",
+            mime_type="video/mp4",
+            size_bytes=target.stat().st_size,
+            duration_seconds=source_duration,
+            width=int(candidate_probe.get("width") or 0),
+            height=int(candidate_probe.get("height") or 0),
+            codecs={"video": str(candidate_probe.get("video_codec") or "")},
+            metadata=completed_metadata,
+        )
+        progress(
+            f"Đã tải video {display_video_number}/{display_video_count}",
+            "downloading_flow_video",
+        )
+        _log_scene_generation(
+            video_id=video_id,
+            scene_index=int(scene.get("index", 0)),
+            media_type="video",
+            state="completed",
+            attempt=generation_attempt,
+            started_at=started_at,
+            detail=resolution,
+        )
+        return target
     try:
         if not start_frame_path or not start_frame_path.is_file():
             raise FlowFrameAttachmentError(
@@ -2494,123 +2876,247 @@ async def _generate_scene_video_async(
             raise FlowFrameAttachmentError(
                 f"Thiếu end frame cho video scene {scene['index']}; cần đủ cặp ảnh gối đầu."
             )
-
-        _log_scene_generation(
-            video_id=video_id,
-            scene_index=int(scene.get("index", 0)),
-            media_type="video",
-            state="submitted",
-            attempt=generation_attempt,
-            started_at=started_at,
-        )
-        if _flow_mock_enabled():
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            mock_duration = float(scene.get("duration", 8.0))
-            subprocess.run(
-                [
-                    ffmpeg_exe, "-hide_banner", "-y",
-                    "-loop", "1", "-i", str(start_frame_path),
-                    "-t", f"{mock_duration:.3f}",
-                    "-vf", f"scale={TARGET_WIDTH}:{TARGET_HEIGHT},fps={TARGET_FPS}",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                    str(target),
-                ],
-                capture_output=True,
-                check=True,
-            )
-        else:
-            if worker is None:
-                raise VideoProductionError("Google Flow worker chưa được khởi tạo.")
-            video_rec = db.get_video(video_id) or {}
-            video_title = str(video_rec.get("title") or video_rec.get("generated_title") or "")
-            scene_action = str(scene.get("action") or scene.get("transcript") or "")
-            style_str = str(settings.get("style_prompt") or (profile or {}).get("style_prompt") or "")
-            video_prompt = _format_scene_video_prompt(
-                scene.get("prompt", ""),
-                scene_action=scene_action,
-                style_prompt=style_str,
-                video_style_prompt=str(settings.get("video_style_prompt") or ""),
-                video_prompt_template=str(settings.get("video_prompt_template") or ""),
-                video_motion_prompt=str(settings.get("video_motion_prompt") or ""),
-                video_title=video_title,
-                has_start_frame=bool(start_frame_path and start_frame_path.is_file()),
-                has_end_frame=bool(end_frame_path and end_frame_path.is_file()),
-            )
-            ref_ids = []
-            if scene.get("primary_reference_id"):
-                ref_ids.append(str(scene["primary_reference_id"]))
-
-            existing_flow_timing = existing_metadata.get("flow_timing")
-            if not isinstance(existing_flow_timing, dict):
-                existing_flow_timing = {}
-            baseline_error_count = existing_flow_timing.get(
-                "video_error_count_before_submit"
-            )
-            baseline_tile_count = existing_flow_timing.get(
-                "video_tile_count_before_submit"
-            )
-            try:
-                baseline_error_count = (
-                    max(0, int(baseline_error_count))
-                    if baseline_error_count is not None
-                    else None
-                )
-            except (TypeError, ValueError):
-                baseline_error_count = None
-            try:
-                baseline_tile_count = (
-                    max(0, int(baseline_tile_count))
-                    if baseline_tile_count is not None
-                    else None
-                )
-            except (TypeError, ValueError):
-                baseline_tile_count = None
-            video_url = await worker.generate_scene_video(
-                prompt=video_prompt,
-                avoid_prompt=negative_prompt,
-                start_frame_path=start_frame_path,
-                end_frame_path=end_frame_path,
-                reference_ids=ref_ids,
-                video_settings={
-                    "video_model": str(settings.get("video_model") or "omni_1_1_flash"),
-                    "video_aspect_ratio": str(settings.get("video_aspect_ratio") or "16:9"),
-                    "video_output_count": int(settings.get("video_output_count") or 1),
-                },
-                scene_index=int(scene.get("index", 0)),
-                reconcile_only=is_reconciliation_checkpoint,
-                video_error_count_before_submit=baseline_error_count,
-                video_tile_count_before_submit=baseline_tile_count,
-                request_key=request_key,
-                submit_only=submit_only,
-                request_attempt=generation_attempt,
-                deadline_seconds=max_wait_seconds,
-            )
-            await worker.download_video(video_url, str(target))
-            timing_snapshot = worker.get_last_video_timing()
-            flow_timing = {
-                **existing_flow_timing,
-                **(timing_snapshot if isinstance(timing_snapshot, dict) else {}),
-            }
-
-        if not target.exists() or target.stat().st_size < 1000:
-            raise RuntimeError(f"Video tạo từ Google Flow Veo không hợp lệ hoặc quá nhỏ: {target}")
-        clip_probe = probe_scene_video(target)
-        clip_hash = _sha256_file(target)
-        if existing_video_hashes is not None and clip_hash in existing_video_hashes:
-            raise SceneVideoDuplicateError(
-                f"Clip scene {scene.get('index')} trùng SHA-256 với clip intro đã nhận trước đó."
-            )
-    except FlowVideoPending as exc:
         if pending_expired:
-            logger.info(
-                "Scene %s video wait expired after %.0f seconds; falling back to base image.",
-                scene.get("index"),
-                max_wait_seconds,
+            raise FlowVideoPending(
+                f"Video scene {scene.get('index')} đã quá thời hạn đối soát.",
+                reason_code="flow_video_wait_pending",
+                receipt=receipt,
             )
-            raise FlowVideoWaitExpired(
-                f"Google Flow không cung cấp video tải xuống cho scene {scene.get('index')} "
-                f"trước khi hết thời hạn đối soát {max_wait_seconds:.0f} giây."
+
+        remaining_attempt_slots = max(
+            1,
+            MAX_SCENE_VIDEO_GENERATION_ATTEMPTS - duration_retry_count,
+        )
+        for _duration_attempt_slot in range(remaining_attempt_slots):
+            cancel_check()
+            attempt_candidate = candidate_path_for_attempt(generation_attempt)
+            attempt_candidate.unlink(missing_ok=True)
+            _log_scene_generation(
+                video_id=video_id,
+                scene_index=int(scene.get("index", 0)),
+                media_type="video",
+                state="submitted",
+                attempt=generation_attempt,
+                started_at=started_at,
+                detail=("duration_retry" if duration_retry_count else "initial"),
             )
+            if _flow_mock_enabled():
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                subprocess.run(
+                    [
+                        ffmpeg_exe, "-hide_banner", "-y",
+                        "-loop", "1", "-i", str(start_frame_path),
+                        "-t", f"{target_duration_seconds:.3f}",
+                        "-vf", f"scale={TARGET_WIDTH}:{TARGET_HEIGHT},fps={TARGET_FPS}",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-f", "mp4", str(attempt_candidate),
+                    ],
+                    capture_output=True,
+                    check=True,
+                )
+            else:
+                if worker is None:
+                    raise VideoProductionError("Google Flow worker chưa được khởi tạo.")
+                video_rec = db.get_video(video_id) or {}
+                video_title = str(
+                    video_rec.get("title") or video_rec.get("generated_title") or ""
+                )
+                scene_action = str(
+                    scene.get("action") or scene.get("transcript") or ""
+                )
+                style_str = str(
+                    settings.get("style_prompt")
+                    or (profile or {}).get("style_prompt")
+                    or ""
+                )
+                video_prompt = _format_scene_video_prompt(
+                    scene.get("prompt", ""),
+                    scene_action=scene_action,
+                    style_prompt=style_str,
+                    video_style_prompt=str(settings.get("video_style_prompt") or ""),
+                    video_prompt_template=str(settings.get("video_prompt_template") or ""),
+                    video_motion_prompt=str(settings.get("video_motion_prompt") or ""),
+                    video_title=video_title,
+                    duration_seconds=target_duration_seconds,
+                    has_start_frame=True,
+                    has_end_frame=True,
+                )
+                if duration_retry_count and best_candidate_probe:
+                    previous_duration = float(
+                        best_candidate_probe.get("duration_seconds") or 0.0
+                    )
+                    previous_duration_label = (
+                        f"{previous_duration:.3f}".rstrip("0").rstrip(".")
+                    )
+                    target_duration_label = (
+                        f"{target_duration_seconds:.3f}".rstrip("0").rstrip(".")
+                    )
+                    video_prompt = (
+                        f"{video_prompt} The previous result was only "
+                        f"{previous_duration_label} seconds; this retry must cover the full "
+                        f"{target_duration_label}-second target with continuous motion."
+                    )
+                ref_ids = []
+                if scene.get("primary_reference_id"):
+                    ref_ids.append(str(scene["primary_reference_id"]))
+
+                existing_flow_timing = existing_metadata.get("flow_timing")
+                if not isinstance(existing_flow_timing, dict):
+                    existing_flow_timing = {}
+                baseline_error_count = existing_flow_timing.get(
+                    "video_error_count_before_submit"
+                )
+                baseline_tile_count = existing_flow_timing.get(
+                    "video_tile_count_before_submit"
+                )
+                try:
+                    baseline_error_count = (
+                        max(0, int(baseline_error_count))
+                        if baseline_error_count is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    baseline_error_count = None
+                try:
+                    baseline_tile_count = (
+                        max(0, int(baseline_tile_count))
+                        if baseline_tile_count is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    baseline_tile_count = None
+                video_url = await worker.generate_scene_video(
+                    prompt=video_prompt,
+                    avoid_prompt=negative_prompt,
+                    start_frame_path=start_frame_path,
+                    end_frame_path=end_frame_path,
+                    reference_ids=ref_ids,
+                    video_settings={
+                        "video_model": str(
+                            settings.get("video_model") or "omni_1_1_flash"
+                        ),
+                        "video_aspect_ratio": str(
+                            settings.get("video_aspect_ratio") or "16:9"
+                        ),
+                        "video_output_count": int(
+                            settings.get("video_output_count") or 1
+                        ),
+                    },
+                    scene_index=int(scene.get("index", 0)),
+                    reconcile_only=is_reconciliation_checkpoint,
+                    video_error_count_before_submit=baseline_error_count,
+                    video_tile_count_before_submit=baseline_tile_count,
+                    request_key=request_key,
+                    submit_only=submit_only,
+                    request_attempt=generation_attempt,
+                    deadline_seconds=max_wait_seconds,
+                )
+                await worker.download_video(video_url, str(attempt_candidate))
+                timing_snapshot = worker.get_last_video_timing()
+                flow_timing = {
+                    **existing_flow_timing,
+                    **(timing_snapshot if isinstance(timing_snapshot, dict) else {}),
+                }
+
+            if not attempt_candidate.is_file() or attempt_candidate.stat().st_size < 1000:
+                raise RuntimeError(
+                    f"Video tạo từ Google Flow Veo không hợp lệ hoặc quá nhỏ: {attempt_candidate}"
+                )
+            clip_probe = probe_scene_video(attempt_candidate)
+            clip_hash = _sha256_file(attempt_candidate)
+            if existing_video_hashes is not None and clip_hash in existing_video_hashes:
+                raise SceneVideoDuplicateError(
+                    f"Clip scene {scene.get('index')} trùng SHA-256 với clip intro đã nhận trước đó."
+                )
+
+            candidate_duration = float(clip_probe.get("duration_seconds") or 0.0)
+            best_duration = float(
+                best_candidate_probe.get("duration_seconds") or 0.0
+            )
+            if best_candidate_path is None or candidate_duration > best_duration:
+                if best_candidate_path and best_candidate_path != attempt_candidate:
+                    best_candidate_path.unlink(missing_ok=True)
+                best_candidate_path = attempt_candidate
+                best_candidate_probe = clip_probe
+                best_candidate_hash = clip_hash
+            else:
+                attempt_candidate.unlink(missing_ok=True)
+
+            best_duration = float(
+                best_candidate_probe.get("duration_seconds") or 0.0
+            )
+            shortfall = max(0.0, target_duration_seconds - best_duration)
+            should_retry_duration = (
+                shortfall > VIDEO_HOLD_ONLY_MAX_SECONDS + 1e-6
+                and duration_retry_count
+                < MAX_SCENE_VIDEO_GENERATION_ATTEMPTS - 1
+            )
+            if not should_retry_duration:
+                resolution = (
+                    "retry_succeeded"
+                    if duration_retry_count
+                    and shortfall <= VIDEO_HOLD_ONLY_MAX_SECONDS
+                    else "retry_best_effort"
+                    if duration_retry_count
+                    else "accepted"
+                )
+                return complete_with_candidate(
+                    best_candidate_path,
+                    best_candidate_probe,
+                    resolution=resolution,
+                )
+
+            duration_retry_count += 1
+            generation_attempt += 1
+            request_key = secrets.token_hex(10)
+            receipt = {}
+            is_reconciliation_checkpoint = False
+            pending_expired = False
+            checkpoint_metadata = {
+                **checkpoint_metadata,
+                "generation_attempt": generation_attempt,
+                "duration_retry_count": duration_retry_count,
+                "duration_retry_pending": True,
+                "duration_candidate_path": str(best_candidate_path),
+                "duration_candidate_seconds": round(best_duration, 3),
+                "duration_candidate_sha256": best_candidate_hash,
+            }
+            for retry_stale_key in (
+                "flow_receipt",
+                "queued_since",
+                "next_retry_at",
+                "reconciliation_poll_count",
+                "error",
+                "failure_stage",
+                "reason_code",
+                "fallback_reason_code",
+                "terminal",
+            ):
+                checkpoint_metadata.pop(retry_stale_key, None)
+            existing_metadata = checkpoint_metadata
+            progress(
+                f"Video intro {display_video_number}/{display_video_count} chỉ dài "
+                f"{best_duration:.1f}/{target_duration_seconds:.1f} giây; đang thử lại một lần",
+                f"retrying_flow_video_duration {display_video_number}/{display_video_count}",
+            )
+            db.upsert_video_artifact(
+                video_id=video_id,
+                artifact_type=artifact_type,
+                path=str(target),
+                content_hash=content_hash,
+                status="processing",
+                mime_type="video/mp4",
+                metadata=checkpoint_metadata,
+            )
+
+        if best_candidate_path and best_candidate_probe:
+            return complete_with_candidate(
+                best_candidate_path,
+                best_candidate_probe,
+                resolution="retry_best_effort",
+            )
+        raise VideoProductionError("Không nhận được ứng viên video intro hợp lệ.")
+    except FlowVideoPending as exc:
         if worker is not None and hasattr(worker, "get_last_video_timing"):
             timing_snapshot = worker.get_last_video_timing()
             previous_timing = existing_metadata.get("flow_timing")
@@ -2618,6 +3124,53 @@ async def _generate_scene_video_async(
                 **(previous_timing if isinstance(previous_timing, dict) else {}),
                 **(timing_snapshot if isinstance(timing_snapshot, dict) else {}),
             }
+        if pending_expired:
+            if (
+                duration_retry_count
+                and best_candidate_path
+                and best_candidate_path.is_file()
+                and best_candidate_probe
+            ):
+                cancel_check()
+                logger.warning(
+                    "Duration retry expired for video=%s scene=%s; keeping best %.3fs candidate for %.3fs target.",
+                    video_id,
+                    scene.get("index"),
+                    float(best_candidate_probe.get("duration_seconds") or 0.0),
+                    target_duration_seconds,
+                )
+                return complete_with_candidate(
+                    best_candidate_path,
+                    best_candidate_probe,
+                    resolution="retry_wait_expired_best_effort",
+                )
+            logger.info(
+                "Scene %s video wait expired after %.0f seconds; falling back to base image.",
+                scene.get("index"),
+                max_wait_seconds,
+            )
+            wait_error = FlowVideoWaitExpired(
+                f"Google Flow không cung cấp video tải xuống cho scene {scene.get('index')} "
+                f"trước khi hết thời hạn đối soát {max_wait_seconds:.0f} giây."
+            )
+            db.upsert_video_artifact(
+                video_id=video_id,
+                artifact_type=artifact_type,
+                path=str(target),
+                content_hash=content_hash,
+                status="failed",
+                mime_type="video/mp4",
+                metadata={
+                    **checkpoint_metadata,
+                    "error": security_logging.redact_sensitive(wait_error),
+                    "failure_stage": "reconciliation",
+                    "reason_code": "flow_video_wait_expired",
+                    "fallback_reason_code": "flow_video_wait_expired",
+                    "terminal": True,
+                    "flow_timing": flow_timing,
+                },
+            )
+            raise wait_error
         pending_receipt = dict(exc.receipt or {})
         if not pending_receipt and worker is not None and hasattr(
             worker, "get_last_generation_receipt"
@@ -2695,12 +3248,36 @@ async def _generate_scene_video_async(
         if worker is not None and hasattr(worker, "get_last_video_timing"):
             timing_snapshot = worker.get_last_video_timing()
             flow_timing = timing_snapshot if isinstance(timing_snapshot, dict) else {}
+        if (
+            duration_retry_count
+            and best_candidate_path
+            and best_candidate_path.is_file()
+            and best_candidate_probe
+        ):
+            cancel_check()
+            logger.warning(
+                "Duration retry failed for video=%s scene=%s; keeping best %.3fs candidate for %.3fs target: %s",
+                video_id,
+                scene.get("index"),
+                float(best_candidate_probe.get("duration_seconds") or 0.0),
+                target_duration_seconds,
+                security_logging.redact_sensitive(exc),
+            )
+            return complete_with_candidate(
+                best_candidate_path,
+                best_candidate_probe,
+                resolution="retry_failed_best_effort",
+            )
         failure_details = _video_failure_details(exc)
         failure_stage = failure_details["failure_stage"]
         reason_code = failure_details["reason_code"]
         safe_error = security_logging.redact_sensitive(exc)
         try:
             target.unlink(missing_ok=True)
+            for stale_candidate in target.parent.glob(
+                f"{target.name}.attempt-*.part"
+            ):
+                stale_candidate.unlink(missing_ok=True)
         except Exception:
             pass
         db.upsert_video_artifact(
@@ -2730,49 +3307,6 @@ async def _generate_scene_video_async(
             detail=f"{failure_stage}:{reason_code}",
         )
         raise
-
-    progress(
-        f"Đã tải video {display_video_number}/{display_video_count}",
-        "downloading_flow_video",
-    )
-    completed_metadata = {
-        **checkpoint_metadata,
-        "flow_timing": flow_timing,
-    }
-    for stale_error_key in (
-        "error",
-        "failure_stage",
-        "reason_code",
-        "fallback_reason_code",
-        "queued_since",
-        "next_retry_at",
-        "reconciliation_poll_count",
-        "terminal",
-    ):
-        completed_metadata.pop(stale_error_key, None)
-    db.upsert_video_artifact(
-        video_id=video_id,
-        artifact_type=artifact_type,
-        path=str(target),
-        content_hash=content_hash,
-        status="completed",
-        mime_type="video/mp4",
-        size_bytes=target.stat().st_size,
-        duration_seconds=float(clip_probe.get("duration_seconds") or 0.0),
-        width=int(clip_probe.get("width") or 0),
-        height=int(clip_probe.get("height") or 0),
-        codecs={"video": str(clip_probe.get("video_codec") or "")},
-        metadata=completed_metadata,
-    )
-    _log_scene_generation(
-        video_id=video_id,
-        scene_index=int(scene.get("index", 0)),
-        media_type="video",
-        state="completed",
-        attempt=generation_attempt,
-        started_at=started_at,
-    )
-    return target
 
 
 def _generate_scene_video(
@@ -3119,6 +3653,64 @@ def generate_scene_media(
             flow_video_credit_exhausted = False
             summary = _empty_intro_video_summary(enabled=enable_intro_video)
             summary["requested_count"] = len(requested_positions)
+            duration_retry_by_scene: dict[int, int] = {}
+
+            def record_duration_quality(
+                scene_index: int,
+                artifact: dict | None,
+            ) -> None:
+                if not isinstance(artifact, dict):
+                    return
+                metadata = artifact.get("metadata")
+                if not isinstance(metadata, dict):
+                    return
+                quality = metadata.get("duration_quality")
+                if not isinstance(quality, dict):
+                    return
+                try:
+                    target_seconds = float(quality.get("target_seconds"))
+                    source_seconds = float(quality.get("source_seconds"))
+                    retry_count = max(0, int(quality.get("retry_count") or 0))
+                except (TypeError, ValueError):
+                    return
+                if not (
+                    math.isfinite(target_seconds)
+                    and target_seconds > 0
+                    and math.isfinite(source_seconds)
+                    and source_seconds > 0
+                ):
+                    return
+                existing_items = summary["short_clip_scenes"]
+                existing_item = next(
+                    (
+                        item
+                        for item in existing_items
+                        if int(item.get("scene_index", -1)) == int(scene_index)
+                    ),
+                    None,
+                )
+                if existing_item is not None:
+                    existing_items.remove(existing_item)
+                normalized_scene_index = max(0, int(scene_index))
+                previous_retry_count = duration_retry_by_scene.get(
+                    normalized_scene_index,
+                    0,
+                )
+                summary["duration_retry_count"] += (
+                    retry_count - previous_retry_count
+                )
+                duration_retry_by_scene[normalized_scene_index] = retry_count
+                shortfall = max(0.0, target_seconds - source_seconds)
+                if shortfall > VIDEO_HOLD_ONLY_MAX_SECONDS + 1e-6:
+                    existing_items.append(
+                        {
+                            "scene_index": normalized_scene_index,
+                            "target_seconds": round(target_seconds, 3),
+                            "source_seconds": round(source_seconds, 3),
+                            "retry_count": retry_count,
+                        }
+                    )
+                summary["short_clip_count"] = len(existing_items)
 
             for position, scene in enumerate(scenes):
                 reference_id = str(scene.get("primary_reference_id") or "").strip()
@@ -3146,23 +3738,30 @@ def generate_scene_media(
                     reference_path,
                     reference_hash_cache,
                 )
-                expected_content_hash = _scene_hash(
-                    video_id,
-                    scene,
-                    profile or {},
-                    str(settings.get("avoid_prompt") or settings.get("negative_prompt") or ""),
-                    reference_hash,
-                )
-                current_artifact = artifact_snapshot.get(f"scene:{scene_index}")
-                validation = (
-                    _validated_image_artifact(
-                        current_artifact,
-                        expected_content_hash=expected_content_hash,
+                artifact_type = f"scene:{scene_index}"
+                current_artifact = artifact_snapshot.get(artifact_type)
+                reusable = (
+                    _resolve_reusable_scene_image_artifact(
+                        video_id=video_id,
+                        scene=scene,
+                        profile=profile or {},
+                        negative_prompt=str(
+                            settings.get("avoid_prompt")
+                            or settings.get("negative_prompt")
+                            or ""
+                        ),
+                        reference_hash=reference_hash,
+                        preferred_artifact=current_artifact,
                         counters=validation_counters,
                     )
-                    if current_artifact
+                    if not force_new_project
                     else None
                 )
+                if reusable is not None:
+                    current_artifact, validation = reusable
+                    artifact_snapshot[artifact_type] = current_artifact
+                else:
+                    validation = None
                 if validation is None:
                     continue
                 if validation.sha256 in image_hashes or _matches_existing_perceptual_fingerprint(
@@ -3578,18 +4177,53 @@ def generate_scene_media(
                 artifact_type = f"scene_video:{scene_index}"
                 current_artifact = artifact_snapshot.get(artifact_type)
                 current_status = str((current_artifact or {}).get("status") or "")
+                start_video_hash = (
+                    validated_images[index].sha256
+                    if validated_images[index]
+                    else _sha256_file(start_frame)
+                )
+                end_video_hash = (
+                    validated_images[index + 1].sha256
+                    if index + 1 < len(validated_images)
+                    and validated_images[index + 1]
+                    else _sha256_file(end_frame)
+                    if end_frame and end_frame.is_file()
+                    else ""
+                )
+                video_negative_prompt = str(
+                    settings.get("video_negative_prompt")
+                    or settings.get("avoid_prompt")
+                    or settings.get("negative_prompt")
+                    or ""
+                ).strip()
+                expected_video_content_hash = _scene_video_hash(
+                    video_id,
+                    scene,
+                    profile or {},
+                    settings,
+                    video_negative_prompt,
+                    start_video_hash,
+                    end_video_hash,
+                )
 
                 # Preflight validation: reuse valid existing scene video on disk
                 existing_video_path = None
-                if current_artifact and current_artifact.get("path"):
+                if (
+                    current_artifact
+                    and current_artifact.get("content_hash")
+                    == expected_video_content_hash
+                    and current_artifact.get("path")
+                ):
                     art_p = Path(current_artifact["path"])
                     if art_p.is_file() and art_p.stat().st_size > 1000:
                         existing_video_path = art_p
                 if not existing_video_path:
-                    for cand in SCENES_DIR.glob(f"{video_id}_{scene_index}_video_*.mp4"):
-                        if cand.is_file() and cand.stat().st_size > 1000:
-                            existing_video_path = cand
-                            break
+                    cached_target = SCENES_DIR / (
+                        f"{video_id}_{scene_index}_video_"
+                        f"{expected_video_content_hash[:8]}.mp4"
+                    )
+                    if cached_target.is_file() and cached_target.stat().st_size > 1000:
+                        existing_video_path = cached_target
 
                 if existing_video_path and not force_new_project:
                     try:
@@ -3604,6 +4238,37 @@ def generate_scene_media(
                                     expected_hash = str(
                                         (current_artifact or {}).get("content_hash") or cand_hash
                                     )
+                                    recovered_target = _scene_video_target_duration(
+                                        scene,
+                                        settings,
+                                    )
+                                    recovered_source = float(
+                                        probe_info.get("duration_seconds") or 0.0
+                                    )
+                                    recovered_shortfall = max(
+                                        0.0,
+                                        recovered_target - recovered_source,
+                                    )
+                                    try:
+                                        recovered_retry_count = max(
+                                            0,
+                                            int(
+                                                (
+                                                    (current_artifact or {}).get("metadata")
+                                                    or {}
+                                                ).get("duration_retry_count")
+                                                or 0
+                                            ),
+                                        )
+                                    except (TypeError, ValueError):
+                                        recovered_retry_count = 0
+                                    recovered_metadata = {
+                                        key: value
+                                        for key, value in (
+                                            (current_artifact or {}).get("metadata") or {}
+                                        ).items()
+                                        if key not in {"prompt", "action", "transcript"}
+                                    }
                                     artifact_snapshot[artifact_type] = db.upsert_video_artifact(
                                         video_id=video_id,
                                         artifact_type=artifact_type,
@@ -3617,11 +4282,26 @@ def generate_scene_media(
                                         height=int(probe_info.get("height", 720)),
                                         codecs={"video_codec": str(probe_info.get("video_codec", "h264"))},
                                         metadata={
-                                            **((current_artifact or {}).get("metadata") or {}),
-                                            **scene,
+                                            **recovered_metadata,
+                                            "scene_index": max(0, scene_index),
+                                            "target_duration_seconds": round(recovered_target, 3),
+                                            "duration_retry_count": recovered_retry_count,
+                                            "duration_quality": {
+                                                "target_seconds": round(recovered_target, 3),
+                                                "source_seconds": round(recovered_source, 3),
+                                                "shortfall_seconds": round(recovered_shortfall, 3),
+                                                "retry_count": recovered_retry_count,
+                                                "requirement_met": recovered_shortfall
+                                                <= VIDEO_HOLD_ONLY_MAX_SECONDS + 1e-6,
+                                            },
                                             "completed_at": db.utc_now(),
                                         },
                                     )
+                                record_duration_quality(
+                                    scene_index,
+                                    artifact_snapshot.get(artifact_type)
+                                    or current_artifact,
+                                )
                                 logger.info(
                                     "flow_generation media=video scene=%s reused_existing_valid_video path=%s",
                                     scene_index,
@@ -3644,7 +4324,7 @@ def generate_scene_media(
                 ):
                     pending_videos.append({"scene_index": scene_index})
                     continue
-                while True:
+                for _model_attempt in range(len(FLOW_VIDEO_FALLBACK_CHAIN) + 1):
                     cancel_check()
                     settings["video_model"] = active_video_model
                     try:
@@ -3665,18 +4345,14 @@ def generate_scene_media(
                             video_number=video_ordinal[index],
                             video_count=len(requested_positions),
                             artifact_snapshot=artifact_snapshot,
-                            start_frame_hash=(validated_images[index].sha256 if validated_images[index] else ""),
-                            end_frame_hash=(
-                                validated_images[index + 1].sha256
-                                if index + 1 < len(validated_images)
-                                and validated_images[index + 1]
-                                else ""
-                            ),
+                            start_frame_hash=start_video_hash,
+                            end_frame_hash=end_video_hash,
                         )
-                        refresh_artifact(artifact_type)
+                        completed_artifact = refresh_artifact(artifact_type)
                         video_paths[index] = video_path
                         video_hashes.add(_sha256_file(video_path))
                         summary["generated_count"] += 1
+                        record_duration_quality(scene_index, completed_artifact)
                         break
                     except Exception as exc:
                         if isinstance(exc, FlowVideoPending):
@@ -3793,9 +4469,35 @@ def generate_scene_media(
                         )
             summary["fallback_count"] = len(summary["fallback_scenes"])
             MAX_RECONCILE_POLLS = 15
+            def has_duration_retry_candidate(item: dict) -> bool:
+                scene_index = int(item.get("scene_index") or 0)
+                artifact = artifact_snapshot.get(f"scene_video:{scene_index}") or {}
+                metadata = artifact.get("metadata")
+                if not isinstance(metadata, dict):
+                    return False
+                if not metadata.get("duration_retry_pending"):
+                    return False
+                raw_candidate = str(metadata.get("duration_candidate_path") or "").strip()
+                target_path = Path(str(artifact.get("path") or ""))
+                if not raw_candidate or not target_path.name:
+                    return False
+                candidate = Path(raw_candidate)
+                try:
+                    if candidate.parent.resolve() != target_path.parent.resolve():
+                        return False
+                    if not (
+                        candidate.name.startswith(f"{target_path.name}.attempt-")
+                        and candidate.name.endswith(".part")
+                    ):
+                        return False
+                    return candidate.is_file() and candidate.stat().st_size > 1000
+                except OSError:
+                    return False
+
             expired_poll_videos = [
                 item for item in list(pending_videos)
                 if int(item.get("reconciliation_poll_count") or 0) >= MAX_RECONCILE_POLLS
+                and not has_duration_retry_candidate(item)
             ]
             if expired_poll_videos:
                 logger.info(
@@ -5490,6 +6192,15 @@ def _normalize_intro_video_summary(value: dict | None) -> dict:
         except (TypeError, ValueError):
             return 0
 
+    def positive_float(raw_value: object) -> float | None:
+        try:
+            normalized = float(raw_value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(normalized) or normalized <= 0:
+            return None
+        return round(normalized, 3)
+
     fallback_scenes = []
     for item in source.get("fallback_scenes") or []:
         if not isinstance(item, dict):
@@ -5514,12 +6225,33 @@ def _normalize_intro_video_summary(value: dict | None) -> dict:
     requested_count = nonnegative_int(source.get("requested_count"))
     generated_count = nonnegative_int(source.get("generated_count"))
     fallback_count = len(fallback_scenes)
+    short_clip_scenes = []
+    for item in source.get("short_clip_scenes") or []:
+        if not isinstance(item, dict):
+            continue
+        target_seconds = positive_float(item.get("target_seconds"))
+        source_seconds = positive_float(item.get("source_seconds"))
+        if target_seconds is None or source_seconds is None:
+            continue
+        short_clip_scenes.append(
+            {
+                "scene_index": nonnegative_int(item.get("scene_index")),
+                "target_seconds": target_seconds,
+                "source_seconds": source_seconds,
+                "retry_count": nonnegative_int(item.get("retry_count")),
+            }
+        )
     return {
         "enabled": bool(source.get("enabled", False)),
         "requested_count": requested_count,
         "generated_count": min(generated_count, requested_count),
         "fallback_count": fallback_count,
         "fallback_scenes": fallback_scenes,
+        "duration_retry_count": nonnegative_int(
+            source.get("duration_retry_count")
+        ),
+        "short_clip_count": len(short_clip_scenes),
+        "short_clip_scenes": short_clip_scenes,
     }
 
 

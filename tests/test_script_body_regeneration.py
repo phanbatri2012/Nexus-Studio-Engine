@@ -228,6 +228,120 @@ def test_narration_section_tolerance_does_not_hide_content_errors():
     }
 
 
+@pytest.mark.parametrize("resume_from_body_checkpoint", [False, True])
+def test_monologue_body_repair_consumes_initial_pending_prompt(
+    monkeypatch,
+    resume_from_body_checkpoint,
+):
+    class FakePage:
+        url = "https://chatgpt.com/c/body-repair-test"
+
+    transcript = " ".join(["nguon"] * 120)
+    draft = " ".join(["ban-nhap"] * 20)
+    repaired = " ".join(["ban-sua"] * 20)
+    responses = iter([repaired] if resume_from_body_checkpoint else [draft, repaired])
+    audit_reports = iter(
+        [
+            {"errors": [{"code": "needs_repair", "message": "Cần sửa."}]},
+            {"errors": []},
+        ]
+    )
+    state = {
+        "chat_url": FakePage.url,
+        "outline_parts": ["Dàn ý nguồn duy nhất"],
+        "expected_body_parts": 1,
+        "intro": " ".join(["mo-dau"] * 20),
+        "body_parts": [],
+        "outro": " ".join(["ket-thuc"] * 20),
+    }
+    pipeline = {
+        "title": False,
+        "slug": False,
+        "description": False,
+        "hashtags": False,
+        "tags": False,
+        "pinned_comment": False,
+        "quiz": False,
+        "metadata": False,
+        "chapters": False,
+        "visual_research": False,
+        "thumbnail_with_text": False,
+        "thumbnail_without_text": False,
+    }
+    prompts = {
+        "body": "BODY {part}",
+        "_narration_rules": chatgpt_worker.DEFAULT_NARRATION_RULES,
+    }
+    body_prompt = (
+        prompts["body"].replace("{part}", state["outline_parts"][0])
+        + "\n\nGIỚI HẠN DUNG LƯỢNG CỦA LƯỢT NÀY: Viết từ 15 "
+        "đến tối đa 30 từ. Không được vượt mức tối đa bằng câu đệm."
+        + "\n\n"
+        + chatgpt_worker.DEFAULT_NARRATION_RULES["body"]
+        + chatgpt_worker.STRICT_NO_FILLER
+        + chatgpt_worker.NARRATIVE_ONLY_INSTRUCTION
+    )
+    if resume_from_body_checkpoint:
+        state["current_step"] = "body repair 1/1"
+        state["pending_prompt"] = {
+            "step": "body 1/1",
+            "fingerprint": chatgpt_worker.get_prompt_fingerprint(body_prompt),
+            "status": "submitted",
+        }
+    submitted_steps = []
+    recovered_prompts = []
+
+    def fake_send_prompt(_page, _prompt, **kwargs):
+        on_prompt_submitted = kwargs.get("on_prompt_submitted")
+        if on_prompt_submitted:
+            on_prompt_submitted()
+        submitted_steps.append(state["pending_prompt"]["step"])
+        return next(responses)
+
+    def fake_recover_prompt(_page, prompt, **_kwargs):
+        recovered_prompts.append(prompt)
+        return draft
+
+    monkeypatch.setattr(chatgpt_worker, "send_prompt", fake_send_prompt)
+    monkeypatch.setattr(
+        chatgpt_worker,
+        "recover_pending_prompt_response",
+        fake_recover_prompt,
+    )
+    monkeypatch.setattr(chatgpt_worker, "persist_generation_state", lambda _state: None)
+    monkeypatch.setattr(
+        body_regen,
+        "allocate_outline_part_word_budgets",
+        lambda _transcript, _parts: [(15, 30)],
+    )
+    monkeypatch.setattr(
+        body_regen,
+        "audit_body_candidate",
+        lambda _candidate, _transcript: next(audit_reports),
+    )
+
+    result = chatgpt_worker._run_monologue_pre_audio_pipeline(
+        FakePage(),
+        transcript,
+        state,
+        prompts,
+        pipeline,
+        "https://chatgpt.com/g/g-p-test/project",
+        False,
+    )
+
+    expected_submitted_steps = (
+        ["body repair 1/1"]
+        if resume_from_body_checkpoint
+        else ["body 1/1", "body repair 1/1"]
+    )
+    assert submitted_steps == expected_submitted_steps
+    assert recovered_prompts == ([body_prompt] if resume_from_body_checkpoint else [])
+    assert state["body_parts"] == [repaired]
+    assert "pending_prompt" not in state
+    assert result["complete_for_audio"] is True
+
+
 def test_narration_regeneration_uses_version_prompts_and_section_rules(
     tmp_path,
     monkeypatch,

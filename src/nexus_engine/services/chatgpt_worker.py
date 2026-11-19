@@ -5357,6 +5357,12 @@ BẢN NHÁP CẦN SỬA:
 <DRAFT>{res}</DRAFT>
 
 Chỉ dùng dữ kiện trong SOURCE. Xóa dữ kiện tự bổ sung, câu lặp, câu đệm và mọi ngôn ngữ nói về kịch bản, dàn ý, prompt hay quá trình biên tập. Viết thành một khối văn xuôi từ {minimum_words} đến tối đa {maximum_words} từ. Chỉ trả về lời dẫn đã sửa."""
+            # The BODY response has been consumed as the repair draft. Clear its
+            # in-memory marker before submitting the distinct repair prompt. Do
+            # not persist this gap: if submission never completes, the on-disk
+            # BODY marker remains recoverable; repair submission checkpoints the
+            # new marker atomically through its callback.
+            clear_pending_generation_prompt(state, body_step, prompt4)
             state["current_step"] = repair_step
             res = dedup_consecutive_paragraphs(
                 sanitize_narrative_response(

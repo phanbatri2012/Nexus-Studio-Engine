@@ -186,7 +186,7 @@ DEFAULT_IMAGE_GENERATION_SETTINGS = {
     "flow_image_max_in_flight": 2,
     "video_style_prompt": "Cinematic documentary film, 35mm motion picture composition, natural atmospheric lighting, realistic textures, balanced color grading, 4k cinematic video footage.",
     "video_negative_prompt": "still image, static photo, cartoon, anime, 3D CGI render, illustration, deformed hands, distorted anatomy, text, watermark, signature, logo, blurry, low resolution.",
-    "video_prompt_template": "{frame_directive} Scene action: {action}. Visual style: {style}. {motion} Clean video without any text, letters, watermark, or subtitles.",
+    "video_prompt_template": "{frame_directive} Scene action: {action}. Visual style: {style}. {motion} Target duration: approximately {duration_seconds} seconds. Maintain continuous motion throughout the full duration. Clean video without any text, letters, watermark, or subtitles.",
     "video_motion_prompt": "Motion: smooth cinematic camera movement, natural realistic motion, 4k 24fps high-fidelity video.",
     "scene_0_prompt_template": "A cinematic movie still: {style}, opening scene hook. {reference} Story visual core: {thumbnail_concept}. 16:9 widescreen, photorealistic 8k, authentic documentary realism, clean framing without text.",
     "scene_body_prompt_template": "A still photograph: {style}, scene {scene_index}. {reference} Narrative scene: {action}. 16:9 widescreen still photograph, authentic documentary realism, natural lighting, clean visual without text.",

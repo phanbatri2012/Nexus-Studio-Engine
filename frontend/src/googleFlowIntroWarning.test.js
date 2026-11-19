@@ -21,3 +21,13 @@ test('Job Center distinguishes Flow reconciliation from generic recovery', () =>
   assert.match(jobCenterSource, /job\.reconcile_poll_count \|\| 0/)
   assert.match(jobCenterSource, /job\.type !== 'flow_media_generation'/)
 })
+
+test('Job Center shows a non-blocking warning for intro clips still short after retry', () => {
+  assert.match(jobCenterSource, /intro_video_summary\?\.short_clip_count/)
+  assert.match(jobCenterSource, /data-testid="intro-video-duration-warning"/)
+  assert.match(jobCenterSource, /clip intro vẫn ngắn sau khi thử lại/)
+  assert.match(jobCenterSource, /sẽ được kéo dài khi render/)
+  assert.match(jobCenterSource, /short_clip_scenes\.map/)
+  assert.match(jobCenterSource, /scene\.source_seconds/)
+  assert.match(jobCenterSource, /scene\.target_seconds/)
+})

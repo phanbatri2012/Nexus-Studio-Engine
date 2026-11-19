@@ -107,6 +107,9 @@ class TestIntroVideoSummary(unittest.TestCase):
                 "generated_count": 2,
                 "fallback_count": 0,
                 "fallback_scenes": [],
+                "duration_retry_count": 0,
+                "short_clip_count": 0,
+                "short_clip_scenes": [],
             },
         )
 
@@ -182,6 +185,49 @@ class TestIntroVideoSummary(unittest.TestCase):
 
 
 class TestFlowMediaManifest(unittest.TestCase):
+    def test_intro_summary_normalization_keeps_only_safe_numeric_duration_fields(self):
+        normalized = video_production._normalize_intro_video_summary(
+            {
+                "enabled": True,
+                "requested_count": 2,
+                "generated_count": 2,
+                "duration_retry_count": "1",
+                "short_clip_count": 99,
+                "short_clip_scenes": [
+                    {
+                        "scene_index": "0",
+                        "target_seconds": "8.0",
+                        "source_seconds": "5.25",
+                        "retry_count": "1",
+                        "prompt": "secret prompt",
+                        "error": "secret error",
+                    },
+                    {
+                        "scene_index": 1,
+                        "target_seconds": "not-a-number",
+                        "source_seconds": 4.0,
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(normalized["duration_retry_count"], 1)
+        self.assertEqual(normalized["short_clip_count"], 1)
+        self.assertEqual(
+            normalized["short_clip_scenes"],
+            [
+                {
+                    "scene_index": 0,
+                    "target_seconds": 8.0,
+                    "source_seconds": 5.25,
+                    "retry_count": 1,
+                }
+            ],
+        )
+        serialized = json.dumps(normalized)
+        self.assertNotIn("secret prompt", serialized)
+        self.assertNotIn("secret error", serialized)
+
     def test_diagnostic_dom_redacts_prompt_and_sensitive_attributes(self):
         sanitized = _redact_diagnostic_dom(
             '<div>secret creative prompt</div>'
@@ -365,6 +411,17 @@ class TestFlowMediaManifest(unittest.TestCase):
                     "requested_count": 1,
                     "generated_count": 0,
                     "fallback_count": 1,
+                    "duration_retry_count": 1,
+                    "short_clip_count": 1,
+                    "short_clip_scenes": [
+                        {
+                            "scene_index": 0,
+                            "target_seconds": 8.0,
+                            "source_seconds": 5.5,
+                            "retry_count": 1,
+                            "prompt": "secret retry prompt",
+                        }
+                    ],
                     "raw_exception": "secret traceback",
                     "fallback_scenes": [
                         {
@@ -381,6 +438,18 @@ class TestFlowMediaManifest(unittest.TestCase):
         serialized = json.dumps(item["intro_video_summary"])
         self.assertNotIn("secret traceback", serialized)
         self.assertNotIn("secret prompt", serialized)
+        self.assertNotIn("secret retry prompt", serialized)
+        self.assertEqual(
+            item["intro_video_summary"]["short_clip_scenes"],
+            [
+                {
+                    "scene_index": 0,
+                    "target_seconds": 8.0,
+                    "source_seconds": 5.5,
+                    "retry_count": 1,
+                }
+            ],
+        )
         self.assertEqual(
             set(item["intro_video_summary"]),
             {
@@ -389,6 +458,9 @@ class TestFlowMediaManifest(unittest.TestCase):
                 "generated_count",
                 "fallback_count",
                 "fallback_scenes",
+                "duration_retry_count",
+                "short_clip_count",
+                "short_clip_scenes",
             },
         )
 

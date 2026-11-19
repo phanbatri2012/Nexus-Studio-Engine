@@ -3831,8 +3831,20 @@ def _sync_audio_task_unlocked(video_id: int) -> dict:
 
 def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
     video_id = stored_task["video_id"]
-    task_voice_id = stored_task.get("voice_id") or AUDIO_VOICE_ID
-    task_voice_name = stored_task.get("voice_name", "")
+    stored_voice_snapshot = _voice_snapshot_from_record(stored_task)
+    task_voice_id, task_voice_name, task_voice_snapshot = (
+        _resolve_batch_primary_voice(
+            segments,
+            stored_task.get("voice_id") or AUDIO_VOICE_ID,
+            stored_task.get("voice_name", ""),
+            stored_voice_snapshot,
+        )
+    )
+    task_voice_fields = _stored_voice_persistence_fields(stored_task)
+    if task_voice_snapshot:
+        task_voice_fields = _voice_persistence_fields(
+            _voice_from_snapshot(task_voice_snapshot)
+        )
     sync_errors = []
     for segment in segments:
         if segment.get("status") not in {"pending", "processing", "queued"}:
@@ -3937,10 +3949,17 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
             raw_script = video.get("generated_script", "")
             script_for_tts = get_clean_script_for_tts(raw_script)
             filtered_script = apply_tts_filters(script_for_tts)
+            prod_snapshot = {}
+            try:
+                prod_snapshot = json.loads(
+                    video.get("production_snapshot_json") or "{}"
+                )
+            except (TypeError, json.JSONDecodeError):
+                pass
             mono_hash = tts.get_generation_request_hash(
                 filtered_script,
                 task_voice_id,
-                _voice_snapshot_from_record(stored_task),
+                task_voice_snapshot,
             )
             is_dialogue = (
                 is_dialogue_script(raw_script)
@@ -3949,11 +3968,6 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
             )
 
             if is_dialogue:
-                prod_snapshot = {}
-                try:
-                    prod_snapshot = json.loads(video.get("production_snapshot_json") or "{}")
-                except Exception:
-                    pass
                 available_voices = voice_config.load_voice_config().get("voices", [])
                 cast_overrides = _resolve_radar_auto_cast(
                     video=video,
@@ -4024,7 +4038,7 @@ def _sync_batch_audio_task(stored_task: dict, segments: list[dict]) -> dict:
         segments_json=json.dumps(segments, ensure_ascii=False),
         voice_id=task_voice_id,
         voice_name=task_voice_name,
-        **_stored_voice_persistence_fields(stored_task),
+        **task_voice_fields,
     )
     if status == "completed":
         _save_audio_url(
@@ -4124,6 +4138,44 @@ def _segment_from_remote(
             remote_task.get("error") or remote_task.get("detail_error") or ""
         ),
     }
+
+
+def _resolve_batch_primary_voice(
+    segments: list[dict],
+    fallback_voice_id: str,
+    fallback_voice_name: str = "",
+    fallback_voice_snapshot: dict | None = None,
+) -> tuple[str, str, dict | None]:
+    """Resolve batch-level metadata from the MC segment, not turn order."""
+    mc_segment = next(
+        (
+            segment
+            for segment in segments
+            if str(segment.get("role") or segment.get("role_key") or "")
+            .strip()
+            .upper()
+            == "MC"
+            and str(segment.get("voice_id") or "").strip()
+        ),
+        None,
+    )
+    if not mc_segment:
+        return fallback_voice_id, fallback_voice_name, fallback_voice_snapshot
+
+    voice_id = str(mc_segment.get("voice_id") or "").strip()
+    voice_name = str(mc_segment.get("voice_name") or "").strip()
+    if voice_id == fallback_voice_id and fallback_voice_snapshot:
+        return voice_id, voice_name or fallback_voice_name, fallback_voice_snapshot
+
+    try:
+        voice = voice_config.get_voice(voice_id, include_inactive=True)
+    except ValueError:
+        return voice_id, voice_name or fallback_voice_name, None
+    return (
+        voice_id,
+        voice_name or str(voice.get("name") or fallback_voice_name),
+        voice_config.build_voice_snapshot(voice),
+    )
 
 
 def _get_tts_provider_display_name(provider_id: str | None = None) -> str:
@@ -4635,15 +4687,14 @@ def _ensure_audio_task(
             batch_voice_name = voice_name
             batch_voice_snapshot = voice_snapshot
             if is_dialogue and dialogue_segments:
-                primary_seg = dialogue_segments[0]
-                if primary_seg.get("voice_id") and primary_seg["voice_id"] != voice_id:
-                    try:
-                        p_voice = voice_config.get_voice(primary_seg["voice_id"])
-                        batch_voice_id = p_voice["id"]
-                        batch_voice_name = p_voice.get("name", "")
-                        batch_voice_snapshot = voice_config.build_voice_snapshot(p_voice)
-                    except Exception:
-                        pass
+                batch_voice_id, batch_voice_name, batch_voice_snapshot = (
+                    _resolve_batch_primary_voice(
+                        dialogue_segments,
+                        voice_id,
+                        voice_name,
+                        voice_snapshot,
+                    )
+                )
             return _ensure_batch_audio_task(
                 video_id,
                 request_hash,
@@ -11655,6 +11706,15 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
             except (TypeError, ValueError):
                 return 0
 
+        def summary_float(value: object) -> float | None:
+            try:
+                normalized = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(normalized) or normalized <= 0:
+                return None
+            return round(normalized, 3)
+
         fallback_scenes = []
         for scene in raw_intro_summary.get("fallback_scenes") or []:
             if not isinstance(scene, dict):
@@ -11672,12 +11732,33 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
                     "reason_code": reason_code,
                 }
             )
+        short_clip_scenes = []
+        for scene in raw_intro_summary.get("short_clip_scenes") or []:
+            if not isinstance(scene, dict):
+                continue
+            target_seconds = summary_float(scene.get("target_seconds"))
+            source_seconds = summary_float(scene.get("source_seconds"))
+            if target_seconds is None or source_seconds is None:
+                continue
+            short_clip_scenes.append(
+                {
+                    "scene_index": summary_int(scene.get("scene_index")),
+                    "target_seconds": target_seconds,
+                    "source_seconds": source_seconds,
+                    "retry_count": summary_int(scene.get("retry_count")),
+                }
+            )
         intro_video_summary = {
             "enabled": bool(raw_intro_summary.get("enabled", False)),
             "requested_count": summary_int(raw_intro_summary.get("requested_count")),
             "generated_count": summary_int(raw_intro_summary.get("generated_count")),
             "fallback_count": len(fallback_scenes),
             "fallback_scenes": fallback_scenes,
+            "duration_retry_count": summary_int(
+                raw_intro_summary.get("duration_retry_count")
+            ),
+            "short_clip_count": len(short_clip_scenes),
+            "short_clip_scenes": short_clip_scenes,
         }
     return {
         "id": job["id"],
@@ -11894,6 +11975,14 @@ def _populate_system_job_payload_result(item: dict, payload: dict, result: dict)
                 return max(0, int(val or 0))
             except (TypeError, ValueError):
                 return 0
+        def _summary_float(val: object) -> float | None:
+            try:
+                normalized = float(val)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(normalized) or normalized <= 0:
+                return None
+            return round(normalized, 3)
         fallback_scenes = []
         for scene in raw_intro.get("fallback_scenes") or []:
             if not isinstance(scene, dict):
@@ -11909,12 +11998,31 @@ def _populate_system_job_payload_result(item: dict, payload: dict, result: dict)
                 "failure_stage": failure_stage,
                 "reason_code": reason_code,
             })
+        short_clip_scenes = []
+        for scene in raw_intro.get("short_clip_scenes") or []:
+            if not isinstance(scene, dict):
+                continue
+            target_seconds = _summary_float(scene.get("target_seconds"))
+            source_seconds = _summary_float(scene.get("source_seconds"))
+            if target_seconds is None or source_seconds is None:
+                continue
+            short_clip_scenes.append({
+                "scene_index": _summary_int(scene.get("scene_index")),
+                "target_seconds": target_seconds,
+                "source_seconds": source_seconds,
+                "retry_count": _summary_int(scene.get("retry_count")),
+            })
         item["intro_video_summary"] = {
             "enabled": bool(raw_intro.get("enabled", False)),
             "requested_count": _summary_int(raw_intro.get("requested_count")),
             "generated_count": _summary_int(raw_intro.get("generated_count")),
             "fallback_count": len(fallback_scenes),
             "fallback_scenes": fallback_scenes,
+            "duration_retry_count": _summary_int(
+                raw_intro.get("duration_retry_count")
+            ),
+            "short_clip_count": len(short_clip_scenes),
+            "short_clip_scenes": short_clip_scenes,
         }
     if not item.get("publish_stage") and (result.get("publish_stage") or result.get("stage")):
         item["publish_stage"] = str(result.get("publish_stage") or result.get("stage") or "")

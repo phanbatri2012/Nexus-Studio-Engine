@@ -40,6 +40,78 @@ class VideoProductionServiceTests(unittest.TestCase):
         except Exception:
             pass
 
+    def _run_duration_video_case(
+        self,
+        durations,
+        *,
+        generation_side_effect=None,
+    ):
+        durations = list(durations)
+        case_number = int(getattr(self, "_duration_case_number", 0)) + 1
+        self._duration_case_number = case_number
+        video_id = database.save_video(
+            f"https://youtube.com/watch?v=duration-case-{case_number}",
+            f"Duration case {case_number}",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / f"duration-{case_number}-start.png"
+        end_frame = Path(self.temporary_directory.name) / f"duration-{case_number}-end.png"
+        Image.new("RGB", (1376, 768), color=(20, 40, 60)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(60, 40, 20)).save(end_frame)
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            side_effect=(
+                generation_side_effect
+                if generation_side_effect is not None
+                else [f"https://flow/video/{case_number}/{index}" for index in range(len(durations))]
+            )
+        )
+        download_count = 0
+
+        async def save_video(_url, save_path):
+            nonlocal download_count
+            download_count += 1
+            Path(save_path).write_bytes(bytes([64 + download_count]) * 2048)
+
+        worker.download_video = AsyncMock(side_effect=save_video)
+        worker.get_last_video_timing.return_value = {}
+        probes = [
+            {
+                "duration_seconds": duration,
+                "width": 1920,
+                "height": 1080,
+                "video_codec": "h264",
+            }
+            for duration in durations
+        ]
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+            patch.object(video_production, "probe_scene_video", side_effect=probes),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_video_async(
+                    video_id=video_id,
+                    scene={
+                        "index": 0,
+                        "prompt": "A continuous cinematic action",
+                        "duration": 8.0,
+                        "is_video": True,
+                    },
+                    scene_count=1,
+                    start_frame_path=start_frame,
+                    end_frame_path=end_frame,
+                    profile={},
+                    settings={},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                )
+            )
+        artifact = database.get_latest_video_artifact(video_id, "scene_video:0")
+        return result, artifact, worker
+
     def test_latest_video_artifact_snapshot_returns_only_newest_per_type(self):
         video_id = database.save_video(
             "https://youtube.com/watch?v=artifact-snapshot",
@@ -1376,6 +1448,471 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertIn("second attached image", prompt)
         self.assertIn("not a still image", prompt)
 
+    def test_video_prompt_duration_supports_default_custom_and_legacy_templates(self):
+        from nexus_engine.services import chatgpt_projects
+
+        self.assertIn(
+            "{duration_seconds}",
+            chatgpt_projects.DEFAULT_IMAGE_GENERATION_SETTINGS[
+                "video_prompt_template"
+            ],
+        )
+        default_prompt = video_production._format_scene_video_prompt(
+            "scene",
+            duration_seconds=6.75,
+        )
+        self.assertIn("approximately 6.75 seconds", default_prompt)
+        self.assertEqual(default_prompt.count("Target duration:"), 1)
+
+        custom_prompt = video_production._format_scene_video_prompt(
+            "scene",
+            duration_seconds=6.75,
+            video_prompt_template=(
+                "{frame_directive} Target duration: approximately "
+                "{duration_seconds} seconds. Maintain continuous motion throughout "
+                "the full duration."
+            ),
+        )
+        self.assertIn("approximately 6.75 seconds", custom_prompt)
+        self.assertEqual(custom_prompt.count("Target duration:"), 1)
+
+        legacy_prompt = video_production._format_scene_video_prompt(
+            "scene",
+            duration_seconds=6.75,
+            video_prompt_template="{frame_directive} Animate {action} smoothly.",
+        )
+        self.assertIn("approximately 6.75 seconds", legacy_prompt)
+        self.assertEqual(legacy_prompt.count("Target duration:"), 1)
+
+        self.assertEqual(
+            video_production._scene_video_target_duration(
+                {"duration": "not-a-number"},
+                {"intro_scene_target_seconds": 9.25},
+            ),
+            9.25,
+        )
+        self.assertEqual(
+            video_production._scene_video_target_duration(
+                {"duration": float("nan")},
+                {"intro_scene_target_seconds": 0},
+            ),
+            8.0,
+        )
+
+    def test_video_hash_changes_without_invalidating_image_hash(self):
+        scene = {
+            "index": 0,
+            "prompt": "A camera crosses a workshop",
+            "duration": 8.0,
+        }
+        settings = {
+            "video_model": "omni_1_1_flash",
+            "video_prompt_template": "{frame_directive} {duration_seconds}",
+        }
+        image_hash = video_production._scene_hash(12, scene, {}, "avoid", "reference")
+        video_hash = video_production._scene_video_hash(
+            12, scene, {}, settings, "avoid", "start", "end"
+        )
+
+        longer_scene = {**scene, "duration": 9.0}
+        self.assertEqual(
+            image_hash,
+            video_production._scene_hash(
+                12, longer_scene, {}, "avoid", "reference"
+            ),
+        )
+        self.assertNotEqual(
+            video_hash,
+            video_production._scene_video_hash(
+                12, longer_scene, {}, settings, "avoid", "start", "end"
+            ),
+        )
+        self.assertNotEqual(
+            video_hash,
+            video_production._scene_video_hash(
+                12,
+                scene,
+                {},
+                {**settings, "video_model": "veo_3_1"},
+                "avoid",
+                "start",
+                "end",
+            ),
+        )
+        self.assertNotEqual(
+            video_hash,
+            video_production._scene_video_hash(
+                12,
+                scene,
+                {},
+                {**settings, "video_prompt_template": "changed {duration_seconds}"},
+                "avoid",
+                "start",
+                "end",
+            ),
+        )
+
+    def test_scene_image_promotes_legacy_hash_across_duration_change(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=legacy-duration-cache",
+            "Legacy duration cache",
+            "Transcript",
+            "Script",
+        )
+        old_scene = {
+            "index": 0,
+            "prompt": "A documentary camera crosses a busy workshop",
+            "duration": 6.4,
+        }
+        current_scene = {**old_scene, "duration": 8.0}
+        image_path = Path(self.temporary_directory.name) / "legacy-duration.png"
+        Image.new("RGB", (1376, 768), color=(25, 60, 95)).save(image_path)
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(image_path),
+            content_hash=video_production._legacy_scene_hash(
+                video_id,
+                old_scene,
+                {},
+                "",
+                "",
+            ),
+            status="completed",
+            mime_type="image/png",
+            metadata=old_scene,
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock()
+
+        result = asyncio.run(
+            video_production._generate_scene_image_async(
+                video_id=video_id,
+                scene=current_scene,
+                scene_count=1,
+                profile={},
+                settings={},
+                reference_path=None,
+                reference_id="",
+                progress=lambda *_args: None,
+                cancel_check=lambda: None,
+                worker=worker,
+            )
+        )
+
+        self.assertEqual(result, image_path)
+        worker.generate_scene.assert_not_awaited()
+        promoted = database.get_latest_video_artifact(video_id, "scene:0")
+        self.assertEqual(
+            promoted["content_hash"],
+            video_production._scene_hash(video_id, current_scene, {}, "", ""),
+        )
+        self.assertEqual(Path(promoted["path"]), image_path)
+
+    def test_scene_image_uses_older_completed_cache_when_latest_is_queued(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=legacy-history-cache",
+            "Legacy history cache",
+            "Transcript",
+            "Script",
+        )
+        scene = {
+            "index": 0,
+            "prompt": "A documentary camera observes a printing workshop",
+            "duration": 7.2,
+        }
+        image_path = Path(self.temporary_directory.name) / "legacy-history.png"
+        Image.new("RGB", (1376, 768), color=(80, 45, 20)).save(image_path)
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(image_path),
+            content_hash=video_production._legacy_scene_hash(
+                video_id,
+                scene,
+                {},
+                "",
+                "",
+            ),
+            status="completed",
+            mime_type="image/png",
+            metadata=scene,
+        )
+        current_hash = video_production._scene_hash(video_id, scene, {}, "", "")
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(Path(self.temporary_directory.name) / "unfinished.png"),
+            content_hash=current_hash,
+            status="queued",
+            mime_type="image/png",
+            metadata={"generation_attempt": 1},
+        )
+        worker = MagicMock()
+        worker.generate_scene = AsyncMock()
+
+        result = asyncio.run(
+            video_production._generate_scene_image_async(
+                video_id=video_id,
+                scene=scene,
+                scene_count=1,
+                profile={},
+                settings={},
+                reference_path=None,
+                reference_id="",
+                progress=lambda *_args: None,
+                cancel_check=lambda: None,
+                worker=worker,
+            )
+        )
+
+        self.assertEqual(result, image_path)
+        worker.generate_scene.assert_not_awaited()
+        promoted = database.get_latest_video_artifact(video_id, "scene:0")
+        self.assertEqual(promoted["status"], "completed")
+        self.assertEqual(promoted["content_hash"], current_hash)
+        self.assertEqual(Path(promoted["path"]), image_path)
+
+    def test_legacy_scene_cache_rejects_changed_negative_or_reference(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=legacy-cache-inputs",
+            "Legacy cache inputs",
+            "Transcript",
+            "Script",
+        )
+        scene = {"index": 0, "prompt": "A historic printing press", "duration": 6.0}
+        image_path = Path(self.temporary_directory.name) / "legacy-inputs.png"
+        Image.new("RGB", (1376, 768), color=(45, 50, 55)).save(image_path)
+        artifact = database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(image_path),
+            content_hash=video_production._legacy_scene_hash(
+                video_id,
+                scene,
+                {},
+                "old negative",
+                "old reference",
+            ),
+            status="completed",
+            mime_type="image/png",
+            metadata=scene,
+        )
+
+        for negative_prompt, reference_hash in (
+            ("new negative", "old reference"),
+            ("old negative", "new reference"),
+        ):
+            with self.subTest(
+                negative_prompt=negative_prompt,
+                reference_hash=reference_hash,
+            ):
+                self.assertIsNone(
+                    video_production._resolve_reusable_scene_image_artifact(
+                        video_id=video_id,
+                        scene=scene,
+                        profile={},
+                        negative_prompt=negative_prompt,
+                        reference_hash=reference_hash,
+                        preferred_artifact=artifact,
+                    )
+                )
+
+    def test_scene_video_duration_retry_policy_keeps_best_candidate(self):
+        cases = (
+            ([8.0], 1, 0, 8.0, True),
+            ([7.6], 1, 0, 7.6, True),
+            ([5.0, 8.0], 2, 1, 8.0, True),
+            ([6.0, 5.0], 2, 1, 6.0, False),
+        )
+        for durations, expected_calls, retry_count, source_seconds, met in cases:
+            with self.subTest(durations=durations):
+                result, artifact, worker = self._run_duration_video_case(durations)
+                quality = artifact["metadata"]["duration_quality"]
+                self.assertTrue(result.is_file())
+                self.assertEqual(worker.generate_scene_video.await_count, expected_calls)
+                self.assertEqual(quality["retry_count"], retry_count)
+                self.assertEqual(quality["source_seconds"], source_seconds)
+                self.assertEqual(quality["requirement_met"], met)
+                self.assertNotIn("prompt", artifact["metadata"])
+                self.assertNotIn("action", artifact["metadata"])
+                self.assertNotIn("transcript", artifact["metadata"])
+                if retry_count:
+                    first_call, retry_call = worker.generate_scene_video.await_args_list
+                    self.assertNotEqual(
+                        first_call.kwargs["request_key"],
+                        retry_call.kwargs["request_key"],
+                    )
+                    self.assertIn(
+                        f"previous result was only {durations[0]:g} seconds",
+                        retry_call.kwargs["prompt"],
+                    )
+                    self.assertIn(
+                        "8-second target",
+                        retry_call.kwargs["prompt"],
+                    )
+                self.assertFalse(
+                    list(result.parent.glob(f"{result.name}.attempt-*.part"))
+                )
+
+    def test_scene_video_retry_failure_preserves_first_candidate(self):
+        result, artifact, worker = self._run_duration_video_case(
+            [5.0],
+            generation_side_effect=[
+                "https://flow/video/initial",
+                RuntimeError("retry failed"),
+            ],
+        )
+        quality = artifact["metadata"]["duration_quality"]
+        self.assertTrue(result.is_file())
+        self.assertEqual(worker.generate_scene_video.await_count, 2)
+        self.assertEqual(artifact["status"], "completed")
+        self.assertEqual(quality["source_seconds"], 5.0)
+        self.assertEqual(quality["retry_count"], 1)
+        self.assertFalse(quality["requirement_met"])
+
+    def test_scene_video_duration_retry_resumes_from_pending_checkpoint(self):
+        from nexus_engine.services.google_flow_worker import FlowVideoPending
+
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=duration-retry-pending",
+            "Duration retry pending",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "pending-duration-start.png"
+        end_frame = Path(self.temporary_directory.name) / "pending-duration-end.png"
+        Image.new("RGB", (1376, 768), color=(20, 40, 60)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(60, 40, 20)).save(end_frame)
+        scene = {
+            "index": 0,
+            "prompt": "A continuous cinematic action",
+            "duration": 8.0,
+            "is_video": True,
+        }
+        receipt = {
+            "request_key": "duration-retry-request",
+            "submitted_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "deadline_at": (
+                dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10)
+            ).isoformat(),
+        }
+        first_worker = MagicMock()
+        first_worker.generate_scene_video = AsyncMock(
+            side_effect=[
+                "https://flow/video/initial",
+                FlowVideoPending("retry pending", receipt=receipt),
+            ]
+        )
+
+        async def save_initial(_url, save_path):
+            Path(save_path).write_bytes(b"a" * 2048)
+
+        first_worker.download_video = AsyncMock(side_effect=save_initial)
+        first_worker.get_last_video_timing.return_value = {}
+        common_patches = (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        )
+        with (
+            common_patches[0],
+            common_patches[1],
+            patch.object(
+                video_production,
+                "probe_scene_video",
+                return_value={
+                    "duration_seconds": 5.0,
+                    "width": 1920,
+                    "height": 1080,
+                    "video_codec": "h264",
+                },
+            ),
+        ):
+            with self.assertRaises(FlowVideoPending):
+                asyncio.run(
+                    video_production._generate_scene_video_async(
+                        video_id=video_id,
+                        scene=scene,
+                        scene_count=1,
+                        start_frame_path=start_frame,
+                        end_frame_path=end_frame,
+                        profile={},
+                        settings={},
+                        progress=lambda message, stage: None,
+                        cancel_check=lambda: None,
+                        worker=first_worker,
+                    )
+                )
+
+        pending = database.get_latest_video_artifact(video_id, "scene_video:0")
+        candidate_path = Path(pending["metadata"]["duration_candidate_path"])
+        self.assertEqual(pending["status"], "queued")
+        self.assertTrue(candidate_path.is_file())
+        self.assertEqual(pending["metadata"]["duration_retry_count"], 1)
+
+        second_worker = MagicMock()
+        second_worker.generate_scene_video = AsyncMock(
+            return_value="https://flow/video/reconciled"
+        )
+
+        async def save_reconciled(_url, save_path):
+            Path(save_path).write_bytes(b"b" * 2048)
+
+        second_worker.download_video = AsyncMock(side_effect=save_reconciled)
+        second_worker.get_last_video_timing.return_value = {}
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+            patch.object(
+                video_production,
+                "probe_scene_video",
+                side_effect=[
+                    {
+                        "duration_seconds": 5.0,
+                        "width": 1920,
+                        "height": 1080,
+                        "video_codec": "h264",
+                    },
+                    {
+                        "duration_seconds": 8.0,
+                        "width": 1920,
+                        "height": 1080,
+                        "video_codec": "h264",
+                    },
+                ],
+            ),
+        ):
+            result = asyncio.run(
+                video_production._generate_scene_video_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    start_frame_path=start_frame,
+                    end_frame_path=end_frame,
+                    profile={},
+                    settings={},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=second_worker,
+                )
+            )
+
+        completed = database.get_latest_video_artifact(video_id, "scene_video:0")
+        self.assertTrue(result.is_file())
+        self.assertTrue(
+            second_worker.generate_scene_video.await_args.kwargs["reconcile_only"]
+        )
+        self.assertEqual(
+            second_worker.generate_scene_video.await_args.kwargs["request_key"],
+            "duration-retry-request",
+        )
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["metadata"]["duration_retry_count"], 1)
+        self.assertEqual(
+            completed["metadata"]["duration_quality"]["source_seconds"],
+            8.0,
+        )
+
     def test_scene_media_uses_one_snapshot_and_reuses_validated_images(self):
         video_id = database.save_video(
             "https://youtube.com/watch?v=scene-snapshot-cache",
@@ -2067,12 +2604,14 @@ class VideoProductionServiceTests(unittest.TestCase):
         first_video.write_bytes(b"v" * 2048)
         start_hash = video_production._sha256_file(image_paths[0])
         end_hash = video_production._sha256_file(image_paths[1])
-        first_hash = video_production._scene_hash(
+        first_hash = video_production._scene_video_hash(
             video_id,
             scenes[0],
             {},
+            {"enable_intro_video": True},
             "",
-            f"{start_hash}:{end_hash}",
+            start_hash,
+            end_hash,
         )
         database.upsert_video_artifact(
             video_id=video_id,
@@ -2967,12 +3506,14 @@ class VideoProductionServiceTests(unittest.TestCase):
         scene = {"index": 0, "prompt": "scene", "is_video": True}
         start_hash = video_production._sha256_file(start_frame)
         end_hash = video_production._sha256_file(end_frame)
-        content_hash = video_production._scene_hash(
+        content_hash = video_production._scene_video_hash(
             video_id,
             scene,
             {},
+            {"intro_video_max_wait_seconds": 60},
             "",
-            f"{start_hash}:{end_hash}",
+            start_hash,
+            end_hash,
         )
         database.upsert_video_artifact(
             video_id=video_id,
@@ -3083,15 +3624,14 @@ class VideoProductionServiceTests(unittest.TestCase):
         Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
         Image.new("RGB", (1376, 768), color=(50, 40, 30)).save(end_frame)
         scene = {"index": 0, "prompt": "terminal scene", "is_video": True}
-        content_hash = video_production._scene_hash(
+        content_hash = video_production._scene_video_hash(
             video_id,
             scene,
             {},
+            {},
             "",
-            (
-                f"{video_production._sha256_file(start_frame)}:"
-                f"{video_production._sha256_file(end_frame)}"
-            ),
+            video_production._sha256_file(start_frame),
+            video_production._sha256_file(end_frame),
         )
         database.upsert_video_artifact(
             video_id=video_id,
@@ -3411,12 +3951,14 @@ class VideoProductionServiceTests(unittest.TestCase):
         worker.generate_scene_video.assert_awaited_once()
         start_hash = video_production._sha256_file(start_frame)
         end_hash = video_production._sha256_file(end_frame)
-        expected_hash = video_production._scene_hash(
+        expected_hash = video_production._scene_video_hash(
             video_id,
             scene,
             {},
+            {},
             "",
-            f"{start_hash}:{end_hash}",
+            start_hash,
+            end_hash,
         )
         self.assertEqual(
             database.get_latest_video_artifact(video_id, "scene_video:0")[

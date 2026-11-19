@@ -854,7 +854,7 @@ class ChatGptServiceTests(unittest.TestCase):
         self.assertEqual(state["chat_url"], page.url)
         persist_state.assert_called_once_with(state)
 
-    def test_external_app_permission_dialog_is_accepted_without_app_specific_logic(self):
+    def test_external_app_permission_dialog_accepts_allow_and_skips_deny(self):
         page = Mock()
         dialog = Mock()
         deny_button = Mock()
@@ -862,18 +862,29 @@ class ChatGptServiceTests(unittest.TestCase):
         dialogs = Mock()
         buttons = Mock()
 
+        dialogs.count.return_value = 1
+        dialogs.nth.return_value = dialog
+        dialog.is_visible.return_value = True
+        dialog.inner_text.return_value = (
+            "Search outside this project. ChatGPT will use connected apps "
+            "to help answer your request."
+        )
+        dialog.locator.return_value = buttons
         buttons.count.return_value = 2
         buttons.nth.side_effect = lambda idx: [deny_button, allow_button][idx]
         deny_button.is_visible.return_value = True
         allow_button.is_visible.return_value = True
         deny_button.inner_text.return_value = "Deny"
         allow_button.inner_text.return_value = "Allow"
-        page.locator.return_value = buttons
+        page.locator.return_value = dialogs
 
         dismissed = chatgpt_worker.accept_external_app_permission_dialog(page)
 
         self.assertTrue(dismissed)
-        page.locator.assert_called_once_with("button")
+        page.locator.assert_called_once_with(
+            chatgpt_worker.EXTERNAL_APP_PERMISSION_DIALOG_SELECTOR
+        )
+        dialog.locator.assert_called_once_with("button")
         allow_button.click.assert_called_once_with(
             timeout=chatgpt_worker.EXTERNAL_APP_PERMISSION_CLICK_TIMEOUT_MS
         )
@@ -882,20 +893,26 @@ class ChatGptServiceTests(unittest.TestCase):
     def test_unrelated_dialog_is_not_dismissed(self):
         page = Mock()
         dialog = Mock()
-        deny_button = Mock()
+        allow_button = Mock()
         dialogs = Mock()
-
         buttons = Mock()
+
+        dialogs.count.return_value = 1
+        dialogs.nth.return_value = dialog
+        dialog.is_visible.return_value = True
+        dialog.inner_text.return_value = "Delete this conversation?"
+        dialog.locator.return_value = buttons
         buttons.count.return_value = 1
-        buttons.nth.return_value = deny_button
-        deny_button.is_visible.return_value = True
-        deny_button.inner_text.return_value = "Deny"
-        page.locator.return_value = buttons
+        buttons.nth.return_value = allow_button
+        allow_button.is_visible.return_value = True
+        allow_button.inner_text.return_value = "Allow"
+        page.locator.return_value = dialogs
 
         dismissed = chatgpt_worker.accept_external_app_permission_dialog(page)
 
         self.assertFalse(dismissed)
-        deny_button.click.assert_not_called()
+        dialog.locator.assert_not_called()
+        allow_button.click.assert_not_called()
 
     def test_response_wait_clears_external_app_permission_dialog(self):
         page = Mock()

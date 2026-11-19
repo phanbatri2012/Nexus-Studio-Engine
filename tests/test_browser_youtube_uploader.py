@@ -20,14 +20,20 @@ from nexus_engine.services.browser_youtube_uploader import (
     BrowserUploadError,
     BrowserUploadNeedsReview,
     _fill_single_element,
+    _find_visible_upload_details_dialog,
+    _open_existing_draft_upload_dialog,
+    _save_video_on_edit_page,
     _read_control_value,
     _text_value_matches,
     _complete_ad_suitability,
+    _open_caption_upload_picker,
     _set_checkbox,
     _wait_for_ad_suitability,
     _wait_for_ad_suitability_saved,
+    AD_SUITABILITY_COMPLETED_STEP_SELECTORS,
     AD_SUITABILITY_NONE_SELECTORS,
     AD_SUITABILITY_ROOT_SELECTORS,
+    AD_SUITABILITY_SAVED_SELECTORS,
     AD_SUITABILITY_SUBMIT_SELECTORS,
     UPLOAD_TITLE_EDITOR_SELECTORS,
     UPLOAD_DESCRIPTION_EDITOR_SELECTORS,
@@ -35,6 +41,82 @@ from nexus_engine.services.browser_youtube_uploader import (
 
 
 class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
+    async def test_visible_video_details_without_title_editor_is_not_an_edit_container(self):
+        details = MagicMock()
+        details.is_visible = AsyncMock(return_value=True)
+        details.query_selector = AsyncMock(return_value=None)
+        page = MagicMock()
+        page.query_selector_all = AsyncMock(return_value=[details])
+
+        result = await _find_visible_upload_details_dialog(page)
+
+        self.assertIsNone(result)
+
+    async def test_visible_video_details_with_title_editor_is_an_edit_container(self):
+        editor = MagicMock()
+        editor.is_visible = AsyncMock(return_value=True)
+        details = MagicMock()
+        details.is_visible = AsyncMock(return_value=True)
+        details.query_selector = AsyncMock(return_value=editor)
+        page = MagicMock()
+        page.query_selector_all = AsyncMock(return_value=[details])
+
+        result = await _find_visible_upload_details_dialog(page)
+
+        self.assertIs(result, details)
+
+    async def test_open_existing_draft_activates_details_from_visible_wizard(self):
+        details_container = MagicMock()
+        details_step = MagicMock()
+        details_step.is_visible = AsyncMock(return_value=True)
+        details_step.click = AsyncMock()
+        wizard_root = MagicMock()
+        wizard_root.is_visible = AsyncMock(return_value=True)
+        wizard_root.query_selector = AsyncMock(return_value=details_step)
+        page = MagicMock()
+
+        async def roots(selector):
+            return [wizard_root] if selector == "ytcp-uploads-dialog" else []
+
+        page.query_selector_all = AsyncMock(side_effect=roots)
+        with patch(
+            "nexus_engine.services.browser_youtube_uploader._find_visible_upload_details_dialog",
+            new=AsyncMock(side_effect=[None, details_container]),
+        ), patch(
+            "nexus_engine.services.browser_youtube_uploader._safe_click",
+            new=AsyncMock(),
+        ) as safe_click:
+            opened = await _open_existing_draft_upload_dialog(page, timeout_ms=100)
+
+        self.assertTrue(opened)
+        details_step.click.assert_awaited_once()
+        safe_click.assert_not_awaited()
+
+    async def test_save_video_on_edit_page_rejects_unverified_schedule_fields(self):
+        page = MagicMock()
+        visibility = MagicMock()
+        visibility.click = AsyncMock()
+        page.query_selector = AsyncMock(return_value=visibility)
+        page.evaluate = AsyncMock()
+
+        with patch(
+            "nexus_engine.services.browser_youtube_uploader._set_datepicker_value",
+            new=AsyncMock(return_value=(False, "")),
+        ), patch(
+            "nexus_engine.services.browser_youtube_uploader._set_timepicker_value",
+            new=AsyncMock(return_value=(True, "18:30")),
+        ):
+            with self.assertRaises(BrowserUploadNeedsReview):
+                await _save_video_on_edit_page(
+                    page,
+                    schedule_at="2026-11-20T11:30:00+00:00",
+                    publication_timezone="Asia/Ho_Chi_Minh",
+                    settings={"upload_captions": False},
+                    cancel_check=lambda: None,
+                    persist_checkpoint=MagicMock(),
+                    progress=MagicMock(),
+                )
+
     def test_format_date_for_picker_vietnamese(self):
         d = dt.date(2026, 10, 3)
         formatted = _format_date_for_picker(d, is_vietnamese=True)
@@ -162,6 +244,18 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("ytpp-self-certification-predictor" in selector for selector in AD_SUITABILITY_SUBMIT_SELECTORS)
         )
+        self.assertTrue(
+            any("đã bị khóa" in selector for selector in AD_SUITABILITY_SAVED_SELECTORS)
+        )
+        self.assertTrue(
+            any("questionnaire has been locked" in selector for selector in AD_SUITABILITY_SAVED_SELECTORS)
+        )
+        self.assertTrue(
+            any(
+                "[test-id='CONTENT_RATINGS'][state='completed']" in selector
+                for selector in AD_SUITABILITY_COMPLETED_STEP_SELECTORS
+            )
+        )
 
     async def test_wait_for_ad_suitability_accepts_delayed_new_dom(self):
         page = MagicMock()
@@ -257,6 +351,31 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(saved)
 
+    async def test_wait_for_ad_suitability_saved_accepts_delayed_locked_notice(self):
+        page = MagicMock()
+        saved_checks = 0
+
+        async def has_saved_evidence(_page, selectors):
+            nonlocal saved_checks
+            self.assertIs(selectors, AD_SUITABILITY_SAVED_SELECTORS)
+            saved_checks += 1
+            return saved_checks >= 2
+
+        with patch(
+            "nexus_engine.services.browser_youtube_uploader._has_visible_element",
+            side_effect=has_saved_evidence,
+        ), patch(
+            "nexus_engine.services.browser_youtube_uploader._visible_upload_dialog_elements",
+            new=AsyncMock(return_value=[]),
+        ), patch(
+            "nexus_engine.services.browser_youtube_uploader.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            saved = await _wait_for_ad_suitability_saved(page, timeout_seconds=1.0)
+
+        self.assertTrue(saved)
+        sleep_mock.assert_awaited_once_with(0.3)
+
     async def test_complete_ad_suitability_new_dom_emits_verified_without_upload(self):
         page = MagicMock()
         page.set_input_files = AsyncMock()
@@ -303,7 +422,41 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
         )
         page.set_input_files.assert_not_awaited()
 
-    async def test_complete_ad_suitability_missing_or_locked_controls_fail_closed(self):
+    async def test_complete_ad_suitability_accepts_completed_existing_step(self):
+        page = MagicMock()
+        progress = MagicMock()
+        checkpoint = MagicMock()
+
+        async def has_visible(_page, selectors):
+            return selectors == list(AD_SUITABILITY_COMPLETED_STEP_SELECTORS)
+
+        with patch(
+            "nexus_engine.services.browser_youtube_uploader._wait_for_ad_suitability",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "nexus_engine.services.browser_youtube_uploader._has_visible_element",
+            side_effect=has_visible,
+        ):
+            await _complete_ad_suitability(
+                page,
+                progress=progress,
+                persist_checkpoint=checkpoint,
+            )
+
+        progress.assert_called_once_with(
+            "Tự đánh giá quảng cáo đã hoàn tất trên YouTube Studio.",
+            "self_certification",
+            70,
+        )
+        checkpoint.assert_called_once_with(
+            "suitability_verified",
+            {
+                "stage": "suitability_verified",
+                "ad_suitability_state": "completed_existing",
+            },
+        )
+
+    async def test_complete_ad_suitability_missing_controls_fail_closed(self):
         page = MagicMock()
         page.set_input_files = AsyncMock()
         progress = MagicMock()
@@ -314,7 +467,7 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=None),
         ), patch(
             "nexus_engine.services.browser_youtube_uploader._has_visible_element",
-            new=AsyncMock(return_value=True),
+            new=AsyncMock(return_value=False),
         ):
             with self.assertRaises(BrowserUploadNeedsReview):
                 await _complete_ad_suitability(
@@ -378,6 +531,44 @@ class TestBrowserYouTubeUploader(unittest.IsolatedAsyncioTestCase):
                 )
 
         checkpoint.assert_not_called()
+
+    async def test_open_caption_upload_picker_uses_new_editor_menu_fallback(self):
+        page = MagicMock()
+        safe_click = AsyncMock(side_effect=[False, True, True])
+
+        with patch(
+            "nexus_engine.services.browser_youtube_uploader._safe_click",
+            safe_click,
+        ), patch(
+            "nexus_engine.services.browser_youtube_uploader.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            opened = await _open_caption_upload_picker(page)
+
+        self.assertTrue(opened)
+        self.assertEqual(safe_click.await_count, 3)
+        self.assertIn("#more-actions-menu", safe_click.await_args_list[1].args[1][0])
+        self.assertTrue(
+            any("Tải tệp lên" in selector for selector in safe_click.await_args_list[2].args[1])
+        )
+        self.assertEqual(sleep_mock.await_count, 2)
+
+    async def test_open_caption_upload_picker_keeps_direct_button_path(self):
+        page = MagicMock()
+        safe_click = AsyncMock(return_value=True)
+
+        with patch(
+            "nexus_engine.services.browser_youtube_uploader._safe_click",
+            safe_click,
+        ), patch(
+            "nexus_engine.services.browser_youtube_uploader.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            opened = await _open_caption_upload_picker(page)
+
+        self.assertTrue(opened)
+        safe_click.assert_awaited_once()
+        sleep_mock.assert_not_awaited()
 
     async def test_read_control_value_input(self):
         mock_el = AsyncMock()

@@ -239,6 +239,10 @@ AD_SUITABILITY_STEP_SELECTORS = (
     "ytcp-uploads-dialog [test-id='CONTENT_RATINGS'][aria-selected='true']",
     "ytcp-video-upload-dialog [test-id='CONTENT_RATINGS'][aria-selected='true']",
 )
+AD_SUITABILITY_COMPLETED_STEP_SELECTORS = (
+    "ytcp-uploads-dialog [test-id='CONTENT_RATINGS'][state='completed']",
+    "ytcp-video-upload-dialog [test-id='CONTENT_RATINGS'][state='completed']",
+)
 AD_SUITABILITY_NONE_SELECTORS = [
     "ytcp-checkbox-lit.all-none-checkbox",
     "ytpp-self-certification-questionnaire ytcp-checkbox-lit.all-none-checkbox",
@@ -269,6 +273,21 @@ AD_SUITABILITY_SUBMIT_SELECTORS = [
     "ytcp-button:has-text('Gửi thông tin đánh giá')",
     "ytcp-button:has-text('Submit rating')",
     "#submit-questionnaire-button button",
+]
+AD_SUITABILITY_SAVED_SELECTORS = [
+    "tp-yt-paper-toast:has-text('Đã lưu thông tin đánh giá')",
+    "tp-yt-paper-toast:has-text('Rating saved')",
+    "ytcp-toast:has-text('Đã lưu thông tin đánh giá')",
+    "ytcp-toast:has-text('Rating saved')",
+    "ytcp-uploads-dialog:has-text('Bảng câu hỏi về mức độ phù hợp với quảng cáo đã bị khóa')",
+    "ytcp-video-upload-dialog:has-text('Bảng câu hỏi về mức độ phù hợp với quảng cáo đã bị khóa')",
+    "ytpp-self-certification-questionnaire:has-text('Bảng câu hỏi về mức độ phù hợp với quảng cáo đã bị khóa')",
+    "ytcp-uploads-dialog:has-text('questionnaire has been locked')",
+    "ytcp-video-upload-dialog:has-text('questionnaire has been locked')",
+    "ytpp-self-certification-questionnaire:has-text('questionnaire has been locked')",
+    "ytcp-uploads-dialog:has-text('questionnaire is locked')",
+    "ytcp-video-upload-dialog:has-text('questionnaire is locked')",
+    "ytpp-self-certification-questionnaire:has-text('questionnaire is locked')",
 ]
 
 
@@ -445,9 +464,6 @@ async def _find_visible_upload_details_dialog(page):
                 editor = await dialog.query_selector(selector)
                 if editor is not None and await editor.is_visible():
                     return dialog
-            tag = await dialog.evaluate("el => (el.tagName || '').toLowerCase()")
-            if tag in ("ytcp-uploads-dialog", "ytcp-video-upload-dialog", "ytcp-video-metadata-editor", "ytcp-video-details", "ytcp-entity-page"):
-                return dialog
         except Exception:
             continue
     return None
@@ -611,7 +627,31 @@ async def _dismiss_active_confirmation_dialogs(page, timeout_seconds: float = 6.
 
 async def _open_existing_draft_upload_dialog(page, timeout_ms: int = 10000) -> bool:
     """Open the saved draft wizard without triggering a new video upload."""
-    if await _find_visible_upload_details_dialog(page) is not None:
+    async def activate_details_step() -> bool:
+        if await _find_visible_upload_details_dialog(page) is not None:
+            return True
+        visible_wizard = False
+        for root_selector in ("ytcp-uploads-dialog", "ytcp-video-upload-dialog"):
+            for root in await page.query_selector_all(root_selector):
+                try:
+                    if not await root.is_visible():
+                        continue
+                    visible_wizard = True
+                    details_step = await root.query_selector("[test-id='DETAILS']")
+                    if details_step is not None and await details_step.is_visible():
+                        await details_step.click()
+                except Exception:
+                    continue
+        if not visible_wizard:
+            return False
+        deadline = time.monotonic() + max(0.1, timeout_ms / 1000)
+        while time.monotonic() < deadline:
+            if await _find_visible_upload_details_dialog(page) is not None:
+                return True
+            await asyncio.sleep(0.25)
+        return False
+
+    if await activate_details_step():
         return True
     edit_draft_selectors = [
         "ytcp-button#resume-upload-button",
@@ -641,7 +681,7 @@ async def _open_existing_draft_upload_dialog(page, timeout_ms: int = 10000) -> b
     if edit_draft_clicked:
         deadline = time.monotonic() + max(0.1, timeout_ms / 1000)
         while time.monotonic() < deadline:
-            if await _find_visible_upload_details_dialog(page) is not None:
+            if await activate_details_step():
                 logger.info("Đã mở thành công Upload Wizard cho bản nháp đã lưu.")
                 return True
             await asyncio.sleep(0.25)
@@ -964,18 +1004,17 @@ async def _wait_for_ad_suitability(
 async def _wait_for_ad_suitability_saved(
     page,
     *,
-    timeout_seconds: float = 4.0,
+    timeout_seconds: float = DEFAULT_STEP_TIMEOUT_SECONDS,
 ) -> bool:
-    """Confirm Studio acknowledged the submitted questionnaire."""
+    """Confirm Studio acknowledged the submitted questionnaire.
+
+    Studio may keep the wizard in a bounded ``Đang lưu...`` state before it
+    replaces the questionnaire with a locked/submitted notice.  That notice is
+    authoritative even when the short-lived save toast is missed.
+    """
     deadline = time.monotonic() + max(0.1, timeout_seconds)
-    toast_selectors = [
-        "tp-yt-paper-toast:has-text('Đã lưu thông tin đánh giá')",
-        "tp-yt-paper-toast:has-text('Rating saved')",
-        "ytcp-toast:has-text('Đã lưu thông tin đánh giá')",
-        "ytcp-toast:has-text('Rating saved')",
-    ]
     while time.monotonic() < deadline:
-        if await _has_visible_element(page, toast_selectors):
+        if await _has_visible_element(page, AD_SUITABILITY_SAVED_SELECTORS):
             return True
         for selector in AD_SUITABILITY_SUBMIT_SELECTORS:
             for submit_btn in await _visible_upload_dialog_elements(page, selector):
@@ -1002,6 +1041,21 @@ async def _complete_ad_suitability(
         timeout_seconds=timeout_seconds,
     )
     if ad_suitability is None:
+        if await _has_visible_element(
+            page,
+            list(AD_SUITABILITY_COMPLETED_STEP_SELECTORS),
+        ):
+            progress(
+                "Tự đánh giá quảng cáo đã hoàn tất trên YouTube Studio.",
+                "self_certification",
+                70,
+            )
+            _emit_checkpoint(
+                persist_checkpoint,
+                "suitability_verified",
+                ad_suitability_state="completed_existing",
+            )
+            return
         active_step = await _has_visible_element(page, list(AD_SUITABILITY_STEP_SELECTORS))
         logger.warning(
             "ad_suitability_not_found content_ratings_step_active=%s",
@@ -2971,6 +3025,49 @@ async def _import_end_screen_from_video(page, source_video_id: str) -> str:
     return f"browser:{clean_video_id}"
 
 
+async def _open_caption_upload_picker(page) -> bool:
+    """Open Studio's caption file picker across direct-button and editor-menu UIs."""
+    if await _safe_click(
+        page,
+        [
+            "ytcp-button:has-text('Tải tệp lên')",
+            "ytcp-button:has-text('Upload file')",
+            "button:has-text('Tải tệp lên')",
+            "button:has-text('Upload file')",
+            "#upload-file-button",
+            "ytcp-button#upload-file-button",
+        ],
+        timeout_ms=4000,
+    ):
+        return True
+
+    if not await _safe_click(
+        page,
+        [
+            "ytve-captions-editor-modal #more-actions-menu",
+            "tp-yt-paper-dialog ytve-captions-editor-options-panel #more-actions-menu",
+            "tp-yt-paper-dialog #more-actions-menu",
+            "ytcp-icon-button#more-actions-menu",
+        ],
+        timeout_ms=4000,
+    ):
+        return False
+    await asyncio.sleep(0.5)
+    opened = await _safe_click(
+        page,
+        [
+            "tp-yt-paper-item:has-text('Tải tệp lên')",
+            "tp-yt-paper-item:has-text('Upload file')",
+            "[role='menuitem']:has-text('Tải tệp lên')",
+            "[role='menuitem']:has-text('Upload file')",
+        ],
+        timeout_ms=4000,
+    )
+    if opened:
+        await asyncio.sleep(0.5)
+    return opened
+
+
 async def _upload_caption_from_elements(
     page,
     caption_path: Path,
@@ -2996,18 +3093,7 @@ async def _upload_caption_from_elements(
         timeout_ms=5000,
     )
     await asyncio.sleep(1.0)
-    upload_button_clicked = await _safe_click(
-        page,
-        [
-            "ytcp-button:has-text('Tải tệp lên')",
-            "ytcp-button:has-text('Upload file')",
-            "button:has-text('Tải tệp lên')",
-            "button:has-text('Upload file')",
-            "#upload-file-button",
-            "ytcp-button#upload-file-button",
-        ],
-        timeout_ms=4000,
-    )
+    upload_button_clicked = await _open_caption_upload_picker(page)
     if upload_button_clicked:
         await asyncio.sleep(0.5)
         timing_dialog = await page.query_selector(
@@ -3304,10 +3390,11 @@ async def _save_video_on_edit_page(
         # Set Date & Time
         date_ok, date_value = await _set_datepicker_value(page, local_dt.date())
         time_ok, time_value = await _set_timepicker_value(page, local_dt.time())
-        if not date_ok:
-            logger.warning("Không khớp hoàn toàn ngày đặt lịch trên edit page: %s", date_value)
-        if not time_ok:
-            logger.warning("Không khớp hoàn toàn giờ đặt lịch trên edit page: %s", time_value)
+        if not date_ok or not time_ok:
+            raise BrowserUploadNeedsReview(
+                "Trang chỉnh sửa YouTube không xác nhận đúng ngày/giờ đặt lịch; "
+                f"date={date_value!r}, time={time_value!r}."
+            )
     else:
         # Private
         await page.evaluate('''() => {
@@ -3371,6 +3458,10 @@ async def _save_video_on_edit_page(
     }''')
     if saved:
         logger.info("Đã bấm Lưu thay đổi trên trang chỉnh sửa.")
+    elif schedule_at:
+        raise BrowserUploadNeedsReview(
+            "Không tìm thấy nút Lưu khả dụng sau khi đặt lịch trên trang chỉnh sửa."
+        )
     await asyncio.sleep(2.0)
 
     # Handle any confirmation modal if saving while checks are running
@@ -3394,7 +3485,22 @@ async def _save_video_on_edit_page(
         await asyncio.sleep(1.0)
 
     if not save_confirmed:
-        logger.warning("Không nhận diện được toast xác nhận lưu, nhưng các trường đã được điền đầy đủ.")
+        raise BrowserUploadNeedsReview(
+            "YouTube Studio chưa xác nhận đã lưu thay đổi trên trang chỉnh sửa."
+        )
+    if schedule_at:
+        local_dt = _parse_schedule_at(schedule_at, publication_timezone)
+        body_text = str(await page.locator("body").inner_text() or "")
+        page_markup = str(await page.content() or "")
+        is_scheduled, schedule_matches = _detect_schedule_verification(
+            body_text,
+            page_markup,
+            local_dt,
+        )
+        if not is_scheduled or not schedule_matches:
+            raise BrowserUploadNeedsReview(
+                "Trang chỉnh sửa YouTube chưa xác minh lịch phát đúng ngày/giờ."
+            )
     return {"saved": True, "caption_locator": caption_locator}
 
 

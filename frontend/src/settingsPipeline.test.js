@@ -42,6 +42,15 @@ test('Settings configures scene image generation and YouTube publishing only for
   assert.match(settingsSource, /Luôn khai báo nội dung tổng hợp bằng AI/);
 });
 
+test('Settings exposes scene duration in the video prompt editor and live preview', () => {
+  assert.match(settingsSource, /tag: '\{duration_seconds\}'/);
+  assert.match(settingsSource, /Target duration: approximately \{duration_seconds\} seconds/);
+  assert.match(settingsSource, /intro_scene_target_seconds \|\| 8\.0/);
+  assert.match(settingsSource, /liveVidTemplate\.includes\('\{duration_seconds\}'\)/);
+  assert.match(settingsSource, /liveVidTemplateWithDuration/);
+  assert.match(settingsSource, /\.replace\('\{duration_seconds\}', liveDurationLabel\)/);
+});
+
 test('Settings saves a stable default YouTube channel for every prompt version', () => {
   assert.match(settingsSource, /\/default-youtube-channel`/);
   assert.match(settingsSource, /default_youtube_channel_id/);
