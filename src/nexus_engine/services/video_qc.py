@@ -11,7 +11,12 @@ import imageio_ffmpeg
 from PIL import Image
 
 from nexus_engine.dialogue_parser import is_dialogue_script
-from nexus_engine.services import video_production, youtube_publish_workflow, youtube_publisher
+from nexus_engine.services import (
+    subtitle_layout,
+    video_production,
+    youtube_publish_workflow,
+    youtube_publisher,
+)
 
 
 QC_STAGE_ORDER = (
@@ -97,20 +102,16 @@ def _decode_and_detect(path: Path, duration: float) -> dict:
     }
 
 
-def _validate_caption(path: Path) -> dict:
-    if not path.is_file() or path.suffix.casefold() != ".srt" or path.stat().st_size <= 0:
-        raise RuntimeError("Caption SRT không tồn tại hoặc rỗng.")
-    content = path.read_text(encoding="utf-8-sig", errors="replace")
-    if not re.search(r"\d{2}:\d{2}:\d{2}[,.]\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}[,.]\d{3}", content):
-        raise RuntimeError("Caption SRT không có timestamp hợp lệ.")
-    spoken_lines = [
-        line.strip()
-        for line in content.splitlines()
-        if line.strip() and not line.strip().isdigit() and "-->" not in line
-    ]
-    if not spoken_lines:
-        raise RuntimeError("Caption SRT không có nội dung thoại.")
-    return {"path": str(path), "lines": len(spoken_lines)}
+def _validate_caption(path: Path, source_segments: list[dict] | None = None) -> dict:
+    try:
+        result = subtitle_layout.validate_srt(path)
+        if source_segments:
+            subtitle_layout.validate_content_preserved(
+                source_segments, subtitle_layout.parse_srt(path)
+            )
+        return result
+    except subtitle_layout.SubtitleLayoutError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def run_video_quality_checks(
@@ -262,17 +263,36 @@ def run_video_quality_checks(
     captions_required = bool(publishing_settings.get("upload_captions", True))
     caption_ok = not captions_required
     caption_metadata = {}
+    caption_error = ""
     if captions_required:
         try:
+            caption_artifact_metadata = (caption_artifact or {}).get("metadata") or {}
+            source_audio_hash = str(
+                caption_artifact_metadata.get("source_audio_sha256") or ""
+            )
+            source_segments = (
+                video_production._load_caption_timeline(
+                    int(video.get("id") or 0), source_audio_hash
+                )
+                if source_audio_hash
+                else []
+            )
             caption_metadata = _validate_caption(
-                Path(str((caption_artifact or {}).get("path") or ""))
+                Path(str((caption_artifact or {}).get("path") or "")),
+                source_segments,
             )
             caption_ok = True
-        except Exception:
+        except Exception as exc:
             caption_ok = False
+            caption_error = str(exc)
+            caption_metadata = {"error": caption_error}
     checks["captions"] = _result(
         caption_ok,
-        "Caption hợp lệ" if caption_ok else "Caption thiếu hoặc không hợp lệ",
+        (
+            "Caption hợp lệ"
+            if caption_ok
+            else f"Caption thiếu hoặc không hợp lệ: {caption_error}"
+        ),
         required=captions_required,
         **caption_metadata,
     )

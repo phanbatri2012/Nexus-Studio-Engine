@@ -425,6 +425,38 @@ class YouTubeCommentDatabaseTests(unittest.TestCase):
         jobs = database.list_system_jobs(limit=None, job_type="comment_publish")
         self.assertEqual(len(jobs), 139)
 
+    def test_reconcile_orphaned_drafting_comments_resets_unowned_comments(self):
+        publication = database.save_video_publication(
+            video_id=self.video_id,
+            youtube_channel_id=self.channel["id"],
+            youtube_video_id="orphan-vid-1",
+            published_url="https://www.youtube.com/watch?v=orphan-vid-1",
+        )
+        database.upsert_youtube_comment(
+            publication["id"],
+            {"comment_id": "c-orphan", "text": "Bình luận kẹt drafting"},
+        )
+        database.upsert_youtube_comment(
+            publication["id"],
+            {"comment_id": "c-owned", "text": "Bình luận đang có job"},
+        )
+        database.update_youtube_comment("c-orphan", status="drafting")
+        database.update_youtube_comment("c-owned", status="drafting")
+        database.create_system_job(
+            job_id="comment_draft-owned-1",
+            job_type="comment_draft",
+            title="Draft owned comment",
+            payload={"comment_ids": ["c-owned"]},
+            status="queued",
+            video_id=self.video_id,
+        )
+
+        reset_count = main._reconcile_orphaned_drafting_comments()
+
+        self.assertEqual(reset_count, 1)
+        self.assertEqual(database.get_youtube_comments(["c-orphan"])[0]["status"], "new")
+        self.assertEqual(database.get_youtube_comments(["c-owned"])[0]["status"], "drafting")
+
 
 class YouTubeCommentHelperTests(unittest.TestCase):
     def test_comment_prompt_accepts_question_mark_without_following_space(self):

@@ -262,3 +262,11 @@ def test_audio_review_allows_emphasis_question_marks():
     assert "corrupted_unicode" not in error_codes
 
 
+
+
+def test_clean_text_strips_escape_tags():
+    raw_title = "<escape>Đại Tá Gặp Lại Người Yêu Cũ Sau 26 Năm</escape>"
+    assert clean_text(raw_title) == "Đại Tá Gặp Lại Người Yêu Cũ Sau 26 Năm"
+
+    raw_json = "<escape>{\"speakers\": [{\"speaker_key\": \"MC\"}]}</escape>"
+    assert clean_text(raw_json) == '{\"speakers\": [{\"speaker_key\": \"MC\"}]}'

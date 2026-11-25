@@ -820,6 +820,115 @@ class TestCompetitorRadarStartupContract(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def _generic_casting_snapshot():
+        return {
+            "automation": {
+                "source": "competitor_radar",
+                "competitor_source_video_id": 5,
+                "target_youtube_channel_id": 7,
+                "voice_policy": {"guest_voice_pool": "pool-a"},
+            }
+        }
+
+    def test_cached_nonretryable_source_voice_failure_does_not_rerun_analyzer(self):
+        source_row = {
+            "voice_profile_status": "error",
+            "voice_profile_version": main.source_voice_analyzer.ANALYZER_REVISION,
+            "voice_profile": {
+                "status": "error",
+                "failure_code": "model_inference_failed",
+                "retryable": False,
+                "failure_count": 1,
+                "error_id": "cached123",
+            },
+        }
+        voices = [
+            self._casting_voice("mc", usage="multi_host"),
+            self._casting_voice("guest"),
+        ]
+        with patch.object(
+            main.db, "list_video_cast_assignments", return_value=[]
+        ), patch.object(
+            main.db, "get_competitor_source_video", return_value=source_row
+        ), patch.object(
+            main.source_voice_analyzer, "analyze_source_voice"
+        ) as analyze, self.assertRaises(
+            main.auto_casting.AutoCastingAttentionRequired
+        ) as error:
+            main._resolve_radar_auto_cast(
+                video={"id": 42, "prompt_version": "prompt-v2"},
+                production_snapshot=self._generic_casting_snapshot(),
+                script="[MC]: Chào.\n[KHACH_1]: Xin chào.",
+                mc_voice_id="mc",
+                available_voices=voices,
+            )
+        analyze.assert_not_called()
+        self.assertEqual(error.exception.attention_code, "source_voice_analysis_failed")
+        self.assertEqual(error.exception.error_id, "cached123")
+
+    def test_expired_transient_source_voice_failure_retries_once_then_stops(self):
+        source_row = {
+            "url": "https://www.youtube.com/watch?v=abcdefghijk",
+            "duration_seconds": 600,
+            "voice_profile_status": "error",
+            "voice_profile_version": main.source_voice_analyzer.ANALYZER_REVISION,
+            "voice_profile": {
+                "status": "error",
+                "failure_code": "source_media_timeout",
+                "retryable": True,
+                "failure_count": 1,
+                "retry_after": "2000-01-01T00:00:00+00:00",
+                "error_id": "old123",
+            },
+        }
+        voices = [
+            self._casting_voice("mc", usage="multi_host"),
+            self._casting_voice("guest"),
+        ]
+        transient = main.source_voice_analyzer.SourceVoiceDownloadError(
+            "timeout",
+            failure_code="source_media_timeout",
+            retryable=True,
+        )
+        with patch.object(
+            main.db, "list_video_cast_assignments", return_value=[]
+        ), patch.object(
+            main.db, "get_competitor_source_video", return_value=source_row
+        ), patch.object(
+            main.db,
+            "get_youtube_channel",
+            return_value={"gpm_proxy_info": "http://127.0.0.1:8080"},
+        ), patch.object(
+            main.source_voice_analyzer,
+            "analyze_source_voice",
+            side_effect=transient,
+        ) as analyze, patch.object(
+            main.security_logging, "report_exception", return_value="fresh123"
+        ), patch.object(
+            main.db, "update_competitor_source_voice_profile"
+        ) as update_profile, self.assertRaises(
+            main.auto_casting.AutoCastingAttentionRequired
+        ) as error:
+            main._resolve_radar_auto_cast(
+                video={"id": 42, "prompt_version": "prompt-v2"},
+                production_snapshot=self._generic_casting_snapshot(),
+                script="[MC]: Chào.\n[KHACH_1]: Xin chào.",
+                mc_voice_id="mc",
+                available_voices=voices,
+            )
+        analyze.assert_called_once()
+        profile = update_profile.call_args.kwargs["profile"]
+        self.assertEqual(profile["failure_count"], 2)
+        self.assertEqual(profile["retry_after"], "")
+        self.assertEqual(profile["error_id"], "fresh123")
+        self.assertEqual(
+            update_profile.call_args.kwargs["version"],
+            main.source_voice_analyzer.ANALYZER_REVISION,
+        )
+        self.assertEqual(error.exception.attention_code, "source_voice_analysis_failed")
+        self.assertEqual(error.exception.error_id, "fresh123")
+
     def test_casting_approval_rejects_wrong_pool_inactive_and_duplicate_voice(self):
         manifest = [
             {"speaker_key": "MC", "speaker_name": "MC", "role": "mc", "gender": "male", "age_group": "adult", "language": "vi", "styles": [], "confidence": 1},

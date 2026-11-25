@@ -63,6 +63,26 @@ def test_normalize_handles_string_and_invalid_inputs():
     assert normalized["scene_duration_max_seconds"] == 35  # fallback to default 35
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [(4, 8.0), (8, 8.0), (9.5, 9.5), (10, 10.0), (14.72, 10.0)],
+)
+def test_normalize_clamps_legacy_intro_video_target(raw_value, expected):
+    normalized = normalize_image_generation_settings(
+        {"intro_scene_target_seconds": raw_value}
+    )
+    assert normalized["intro_scene_target_seconds"] == expected
+
+
+@pytest.mark.parametrize("raw_value", [7.99, 10.01])
+def test_api_model_rejects_intro_video_target_outside_flow_range(raw_value):
+    from pydantic import ValidationError
+    from nexus_engine.main import PromptImageGenerationData
+
+    with pytest.raises(ValidationError):
+        PromptImageGenerationData(intro_scene_target_seconds=raw_value)
+
+
 def test_validate_accepts_duration_settings():
     """Verify validate_image_generation_settings accepts the fields without error."""
     payload = {

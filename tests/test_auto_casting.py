@@ -340,5 +340,92 @@ class TestAutomaticCasting(unittest.TestCase):
         self.assertEqual(first[1]["voice_id"], second[1]["voice_id"])
 
 
+
+    def test_validate_manifest_with_escape_tags(self):
+        script = "[MC]: Xin chào.\n[KHACH_1]: Cháu chào bác."
+        raw_manifest = (
+            '<escape>{"speakers":['
+            '{"speaker_key":"MC","name":"Văn Sâm","gender":"male","age_group":"any","language":"vi","styles":["warm"],"confidence":0.65},'
+            '{"speaker_key":"KHACH_1","name":"Nguyễn Hữu Phong","gender":"male","age_group":"adult","language":"vi","styles":["sincere"],"confidence":0.99}'
+            ']}</escape>'
+        )
+        result = auto_casting.validate_casting_manifest(script, raw_manifest)
+        self.assertEqual(len(result["speakers"]), 2)
+        self.assertEqual(result["speakers"][0]["speaker_key"], "MC")
+        self.assertEqual(result["speakers"][1]["speaker_key"], "KHACH_1")
+
+    def test_validate_manifest_with_markdown_and_conversational_text(self):
+        script = "[MC]: Xin chào.\n[KHACH_1]: Cháu chào bác."
+        raw_manifest = (
+            'Dưới đây là casting manifest:\n```json\n<escape>{"speakers":['
+            '{"speaker_key":"MC","name":"Văn Sâm","gender":"male","age_group":"any","language":"vi","styles":["warm"],"confidence":0.65},'
+            '{"speaker_key":"KHACH_1","name":"Nguyễn Hữu Phong","gender":"male","age_group":"adult","language":"vi","styles":["sincere"],"confidence":0.99}'
+            ']}</escape>\n```\nChúc bạn một ngày tốt lành!'
+        )
+        result = auto_casting.validate_casting_manifest(script, raw_manifest)
+        self.assertEqual(len(result["speakers"]), 2)
+        self.assertEqual(result["speakers"][0]["speaker_key"], "MC")
+        self.assertEqual(result["speakers"][1]["speaker_key"], "KHACH_1")
+
+
+    def test_validate_manifest_with_katex_math_and_escapes(self):
+        script = "[MC]: Xin chào.\n[KHACH_1]: Cháu chào bác."
+        raw_manifest = (
+            "ChatGPT said:\n\n{\n"
+            '"speakers": {\n'
+            '"speaker\\_key": "MC",\n'
+            '"name": "Bác Sâm",\n'
+            '"gender": "any",\n'
+            '"age\\_group": "any",\n'
+            '"language": "vi",\n'
+            '"styles": \\["warm", "calm"\\],\n'
+            '"confidence": 0.4\n'
+            '},\n'
+            '{\n'
+            '"speaker_key": "KHACH_1",\n'
+            '"name": "Nguyễn Minh Đức",\n'
+            '"gender": "male",\n'
+            '"age_group": "adult",\n'
+            '"language": "vi",\n'
+            '"styles": ["\\n𝑠\\n𝑖\\n𝑛\\n𝑐\\n𝑒\\n𝑟\\n𝑒\\n"],\n'
+            '"confidence": 1.0\n'
+            '}\n'
+            ']\n}'
+        )
+        result = auto_casting.validate_casting_manifest(script, raw_manifest)
+        self.assertEqual(len(result["speakers"]), 2)
+        self.assertEqual(result["speakers"][0]["speaker_key"], "MC")
+        self.assertEqual(result["speakers"][1]["speaker_key"], "KHACH_1")
+        self.assertEqual(result["speakers"][1]["gender"], "male")
+        self.assertEqual(result["speakers"][1]["age_group"], "adult")
+
+    def test_validate_manifest_with_unclosed_styles_and_broken_json(self):
+        script = "[MC]: Xin chào.\n[KHACH_1]: Cháu chào bác."
+        raw_manifest = (
+            "{\n"
+            '"speakers": [\n'
+            '{"speaker_key": "MC", "name": "MC", "gender": "any", "age_group": "any", "language": "vi", "styles": ["warm", "calm", "confidence": 0.4},\n'
+            '{"speaker_key": "KHACH_1", "name": "Đức", "gender": "male", "age_group": "adult", "language": "vi", "styles": ["sincere"], "confidence": 0.9}\n'
+            ']\n}'
+        )
+        result = auto_casting.validate_casting_manifest(script, raw_manifest)
+        self.assertEqual(len(result["speakers"]), 2)
+        self.assertEqual(result["speakers"][0]["speaker_key"], "MC")
+        self.assertEqual(result["speakers"][1]["speaker_key"], "KHACH_1")
+        self.assertEqual(result["speakers"][1]["gender"], "male")
+
+    def test_validate_manifest_with_corrupted_json_regex_fallback(self):
+        script = "[MC]: Xin chào.\n[KHACH_1]: Cháu chào bác."
+        raw_manifest = (
+            "Đây là hồ sơ vai:\n"
+            "Vai 1: speaker_key: 'MC', name: 'Bác Sâm', gender: 'any', age_group: 'any', language: 'vi', styles: ['warm'], confidence: 0.5\n"
+            "Vai 2: speaker_key: 'KHACH_1', name: 'Đức', gender: 'male', age_group: 'adult', language: 'vi', styles: ['sincere'], confidence: 0.95\n"
+        )
+        result = auto_casting.validate_casting_manifest(script, raw_manifest)
+        self.assertEqual(len(result["speakers"]), 2)
+        self.assertEqual(result["speakers"][0]["speaker_key"], "MC")
+        self.assertEqual(result["speakers"][1]["speaker_key"], "KHACH_1")
+        self.assertEqual(result["speakers"][1]["gender"], "male")
+
 if __name__ == "__main__":
     unittest.main()

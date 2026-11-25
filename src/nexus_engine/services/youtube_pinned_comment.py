@@ -488,7 +488,10 @@ def execute_job(
         raise PinnedCommentAttentionRequired(
             "pinned_comment_gpm_identity", str(exc)
         ) from exc
-    except BrowserAutomationBlocked as exc:
+    except (
+        BrowserAutomationBlocked,
+        gpm_youtube_automation.GpmAutomationBlocked,
+    ) as exc:
         raise PinnedCommentAttentionRequired(
             "pinned_comment_gpm_blocked", str(exc)
         ) from exc

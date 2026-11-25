@@ -101,6 +101,19 @@ class TestRadarVideoQualityChecks(unittest.TestCase):
         self.assertNotIn("topic", report["checks"])
         self.assertNotIn("relevance", report["checks"])
 
+    def test_caption_qc_rejects_more_than_two_lines(self):
+        self.caption_path.write_text(
+            "1\n00:00:00,000 --> 00:00:03,000\nDòng một\nDòng hai\nDòng ba\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "3 dòng"):
+            video_qc._validate_caption(self.caption_path)
+
+        report = self._run(script="Nội dung đơn thoại hợp lệ.", cast_assignments=[])
+        self.assertEqual(report["failed_stage"], "captions")
+        self.assertIn("3 dòng", report["checks"]["captions"]["detail"])
+
     def test_dialogue_with_duplicate_voice_fails_at_casting(self):
         report = self._run(
             script="[MC]: Xin chào.\n[KHACH_1]: Chào anh.",

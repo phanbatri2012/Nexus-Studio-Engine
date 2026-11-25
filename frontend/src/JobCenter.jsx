@@ -554,6 +554,21 @@ function JobCenter({ onOpenVideo, refreshKey }) {
   }
 
   const runAction = async (job, action) => {
+    if (action === 'resume' && job.attention_details?.kind === 'flow_scene_failure') {
+      const sceneNumbers = (job.attention_details.failed_scenes || [])
+        .map(scene => scene.scene_number)
+        .join(', ')
+      if (!window.confirm(
+        `Thử lại cảnh ${sceneNumbers || 'lỗi'} trên Canvas hiện tại?\n\n` +
+        'Hành động này mở một chu kỳ mới, tối đa 5 lượt gửi Google Flow cho mỗi cảnh lỗi và có thể dùng quota.'
+      )) return
+    }
+    if (action === 'retry_new_flow_project' && job.attention_details?.kind === 'flow_scene_failure') {
+      if (!window.confirm(
+        'Đổi sang Canvas Google Flow mới và thử lại các cảnh lỗi?\n\n' +
+        'Mọi ảnh/video đã hoàn tất vẫn được giữ nguyên; thao tác mới có thể dùng quota.'
+      )) return
+    }
     if (action === 'force_stop') {
       if (!window.confirm(`⚠️ BẠN CÓ CHẮC MUỐN DỪNG NGAY LẬP TỨC?\n\nJob: "${job.title || job.id}"\n\nHành động này sẽ ngắt toàn bộ tiến trình con (FFmpeg/ChatGPT worker/download) và hủy job ngay lập tức!`)) {
         return
@@ -689,6 +704,8 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           <option value="video_generation">Tạo video</option>
           <option value="script_body_regeneration">Tạo lại toàn bộ lời đọc</option>
           <option value="short_video_generation">Tạo Short Video</option>
+          <option value="full_movie_merge">Ghép phim Full</option>
+          <option value="full_movie_thumbnail">Tạo thumbnail phim</option>
           <option value="audio_review">Kiểm duyệt audio</option>
           <option value="audio">Tạo audio</option>
           <option value="visual_scene_plan">Lập kế hoạch cảnh</option>
@@ -995,8 +1012,15 @@ function JobCenter({ onOpenVideo, refreshKey }) {
           {filteredJobs.map(job => {
             const rawDisplayStatus = job.display_status || job.status
             const displayStatus = rawDisplayStatus === 'completed' ? 'done' : rawDisplayStatus === 'failed' ? 'error' : rawDisplayStatus
+            const isCastingAttention = displayStatus === 'paused' && job.attention_required === 'auto_cast'
+            const isFlowSceneAttention = displayStatus === 'paused' && job.attention_details?.kind === 'flow_scene_failure'
+            const isPinnedCommentPinRetry = job.type === 'youtube_pinned_comment' && job.status === 'retry_wait' && job.publish_stage === 'posted'
             const status = (
-              displayStatus === 'paused' && job.attention_required === 'chatgpt_verification'
+              isFlowSceneAttention
+                ? { label: 'Cần thử lại cảnh Flow', color: '#f1c40f' }
+              : isCastingAttention
+                ? { label: 'Cần duyệt casting', color: '#f1c40f' }
+              : displayStatus === 'paused' && job.attention_required === 'chatgpt_verification'
                 ? job.automatic_login === 'pending'
                   ? { label: 'Đang Auto Login', color: '#4dd0e1' }
                   : { label: 'Cần xác minh ChatGPT', color: '#f1c40f' }
@@ -1012,6 +1036,8 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                   ? job.missing_configuration?.length > 0
                     ? { label: 'Cần cấu hình', color: '#f1c40f' }
                     : { label: 'Chờ tiếp tục', color: '#4dd0e1' }
+                : isPinnedCommentPinRetry
+                  ? { label: 'Đang chờ ghim lại', color: '#4dd0e1' }
                 : ['comment_publish', 'youtube_pinned_comment'].includes(job.type) && job.status === 'retry_wait'
                 ? { label: 'Đã hẹn đăng', color: '#4dd0e1' }
                 : STATUS_META[displayStatus] || STATUS_META.error
@@ -1179,7 +1205,11 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                     )}
                     {job.notification?.retry_active && job.notification?.retry_at && (
                       <div style={{ color: '#8aa', marginTop: '4px', fontSize: '0.78em' }}>
-                        {['comment_publish', 'youtube_pinned_comment'].includes(job.type) ? 'Dự kiến đăng lúc' : 'Tự chạy lại lúc'} {formatDate(job.notification.retry_at)}
+                        {isPinnedCommentPinRetry
+                          ? 'Tự ghim lại lúc'
+                          : ['comment_publish', 'youtube_pinned_comment'].includes(job.type)
+                            ? 'Dự kiến đăng lúc'
+                            : 'Tự chạy lại lúc'} {formatDate(job.notification.retry_at)}
                       </div>
                     )}
                     {job.type === 'muse_media_generation' && job.notification?.state === 'resume_required' && (
@@ -1203,12 +1233,57 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                         Lịch YouTube: {formatDate(job.scheduled_at)}
                       </div>
                     )}
-                    {job.error && (
+                    {isFlowSceneAttention && (
+                      <div
+                        role="status"
+                        data-testid="flow-scene-attention-card"
+                        style={{
+                          color: '#fde68a',
+                          background: 'rgba(245, 158, 11, 0.10)',
+                          border: '1px solid rgba(245, 158, 11, 0.45)',
+                          borderRadius: '8px',
+                          marginTop: '9px',
+                          padding: '10px 12px',
+                          fontSize: '0.84em'
+                        }}
+                      >
+                        <strong>⚠ {job.attention_details.message}</strong>
+                        {(job.attention_details.failed_scenes || []).map(scene => (
+                          <div key={scene.scene_index} style={{ marginTop: '5px', color: '#fef3c7' }}>
+                            Cảnh {scene.scene_number}: {scene.reason_code}
+                            {scene.last_error ? ` · ${scene.last_error}` : ''}
+                          </div>
+                        ))}
+                        <div style={{ marginTop: '5px', color: '#fbbf24' }}>
+                          Khuyến nghị: thử lại đúng cảnh lỗi trên Canvas hiện tại.
+                        </div>
+                      </div>
+                    )}
+                    {!isFlowSceneAttention && job.error && (isCastingAttention ? (
+                      <div
+                        role="status"
+                        data-testid="casting-attention-warning"
+                        style={{
+                          color: '#facc15',
+                          background: 'rgba(250, 204, 21, 0.08)',
+                          border: '1px solid rgba(250, 204, 21, 0.35)',
+                          borderRadius: '8px',
+                          marginTop: '9px',
+                          padding: '8px 10px',
+                          fontSize: '0.84em'
+                        }}
+                      >
+                        <strong>⚠ Cần duyệt casting trước khi TTS bắt đầu</strong>
+                        <div style={{ marginTop: '4px', whiteSpace: 'pre-wrap', color: '#fde68a' }}>
+                          {job.error}
+                        </div>
+                      </div>
+                    ) : (
                       <details style={{ marginTop: '9px', color: '#ff6b6b', fontSize: '0.84em' }}>
                         <summary>Xem lỗi</summary>
                         <div style={{ marginTop: '6px', whiteSpace: 'pre-wrap' }}>{job.error}</div>
                       </details>
-                    )}
+                    ))}
                     {job.attention_required === 'chatgpt_verification' && (
                       <div style={{ color: '#f1c40f', marginTop: '9px', fontSize: '0.84em' }}>
                         {job.automatic_login === 'pending'
@@ -1301,6 +1376,17 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                         {['youtube_browser_cdp', 'fb_browser_cdp'].includes(job.attention_required) ? 'Kiểm tra lại' : 'Tiếp tục'}
                       </button>
                     )}
+                    {job.can_retry_failed_scenes && (
+                      <button
+                        className="btn-run"
+                        disabled={Boolean(actionId)}
+                        style={{ padding: '8px 12px', width: 'auto', color: '#7ee787' }}
+                        title="Giữ nguyên mọi artifact đã hoàn tất và thử lại đúng cảnh lỗi trên Canvas hiện tại"
+                        onClick={() => runAction(job, 'resume')}
+                      >
+                        Thử lại cảnh {(job.attention_details?.failed_scenes || []).map(scene => scene.scene_number).join(', ')}
+                      </button>
+                    )}
                     {job.can_flow_fallback_static && (
                       <button
                         className="btn-secondary"
@@ -1317,7 +1403,7 @@ function JobCenter({ onOpenVideo, refreshKey }) {
                         className="btn-secondary"
                         disabled={Boolean(actionId)}
                         style={{ padding: '8px 12px', borderColor: '#38bdf8', color: '#38bdf8', fontWeight: '600' }}
-                        title="Tạo Canvas Google Flow mới sạch sẽ để sinh lại video intro"
+                        title="Đổi Canvas Google Flow sau khi cùng cảnh đã thất bại thêm một chu kỳ"
                         onClick={() => runAction(job, 'retry_new_flow_project')}
                       >
                         🔄 Đổi Canvas mới & Thử lại

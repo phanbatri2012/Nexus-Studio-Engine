@@ -23,6 +23,7 @@ from nexus_engine.services.gpm_service import (
     wait_for_cdp_readiness,
 )
 from nexus_engine.services.channel_scanner_service import (
+    BrowserAutomationBlocked,
     channel_browser_session,
     cleanup_owned_page,
 )
@@ -37,6 +38,10 @@ class GpmAutomationError(RuntimeError):
 
 class GpmAutomationIdentityError(GpmAutomationError):
     """Raised when the assigned profile is not logged into the expected channel."""
+
+
+class GpmAutomationBlocked(GpmAutomationError):
+    """Raised when YouTube shows a terminal blocker that requires user action."""
 
 
 _COMMENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -62,96 +67,147 @@ async def _wait_for_target_comment_thread(
     if not clean_comment_id:
         raise GpmAutomationError("Thiếu comment_id để xác minh bình luận mục tiêu.")
 
-    timeout_ms = max(1000, min(int(timeout_seconds * 1000), 15000))
-    try:
-        await page.wait_for_selector(
-            _COMMENTS_ROOT_SELECTOR,
-            state="attached",
-            timeout=timeout_ms,
-        )
-        # YouTube initially mounts ytd-comments as a zero-position placeholder.
-        # Scrolling at that point is a no-op; wait until layout places the real
-        # comments section below the player (or the page already scrolled there).
-        await page.wait_for_function(
-            """() => {
-                const comments = document.querySelector('ytd-comments')
-                    || document.querySelector('ytd-watch-flexy #comments');
-                if (!comments) return false;
-                const rect = comments.getBoundingClientRect();
-                const documentTop = rect.top + window.scrollY;
-                return rect.width > 0
-                    && rect.height > 0
-                    && (documentTop > 200 || window.scrollY > 200);
-            }""",
-            timeout=timeout_ms,
-        )
-        await page.evaluate(
-            """() => {
-                const comments = document.querySelector('ytd-comments')
-                    || document.querySelector('ytd-watch-flexy #comments');
-                if (comments) comments.scrollIntoView({block: 'center', inline: 'nearest'});
-            }"""
-        )
-        await page.wait_for_selector(
-            _COMMENT_RENDERER_SELECTOR,
-            state="visible",
-            timeout=timeout_ms,
-        )
-    except Exception as exc:
-        raise GpmAutomationError(
-            "YouTube không tải được danh sách bình luận sau khi layout đã sẵn sàng."
-        ) from exc
-
     target_selector = (
         f'ytd-comment-thread-renderer:has(a[href*="lc={clean_comment_id}"]), '
         f'ytd-comment-view-model:has(a[href*="lc={clean_comment_id}"])'
     )
-    try:
-        target_thread = await page.wait_for_selector(
-            target_selector,
-            state="visible",
-            timeout=timeout_ms,
+    total_timeout = max(3.0, min(float(timeout_seconds), 60.0))
+    deadline = time.monotonic() + total_timeout
+    max_iterations = max(4, min(40, int(total_timeout / 0.5) + 1))
+    last_error: Exception | None = None
+
+    # The responsive one-column layout can keep ytd-comments at zero height until
+    # the viewport crosses the recommendations feed. Always make bounded scroll
+    # progress instead of waiting for a height change that itself requires scroll.
+    for _iteration in range(max_iterations):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        selector_timeout_ms = max(100, min(750, int(remaining * 1000)))
+        try:
+            target_thread = await page.wait_for_selector(
+                target_selector,
+                state="visible",
+                timeout=selector_timeout_ms,
+            )
+            if target_thread:
+                return target_thread
+        except Exception as exc:
+            last_error = exc
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait_for(
+                page.evaluate(
+                    """(targetSelector) => {
+                        const target = document.querySelector(targetSelector);
+                        const comments = document.querySelector('ytd-comments')
+                            || document.querySelector('ytd-watch-flexy #comments');
+                        const viewport = Math.max(window.innerHeight || 0, 600);
+                        if (target && target.closest(
+                            'ytd-comment-thread-renderer, ytd-comment-view-model'
+                        )) {
+                            target.scrollIntoView({block: 'center', inline: 'nearest'});
+                            return;
+                        }
+                        if (comments) {
+                            const rect = comments.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                comments.scrollIntoView({block: 'center', inline: 'nearest'});
+                                return;
+                            }
+                        }
+                        const step = Math.max(480, Math.floor(viewport * 0.8));
+                        const maxScroll = Math.max(
+                            0,
+                            document.documentElement.scrollHeight - viewport
+                        );
+                        window.scrollTo({
+                            top: Math.min(maxScroll, window.scrollY + step),
+                            behavior: 'instant',
+                        });
+                    }""",
+                    target_selector,
+                ),
+                timeout=max(0.1, min(2.0, remaining)),
+            )
+        except Exception as exc:
+            last_error = exc
+
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            await asyncio.sleep(min(0.35, remaining))
+
+    page_state = await _collect_comment_page_state(page)
+    markers = [str(marker) for marker in page_state.get("markers") or [] if marker]
+    if markers:
+        raise GpmAutomationBlocked(
+            "YouTube đang chặn phần bình luận: " + ", ".join(markers)
         )
-    except Exception as exc:
-        raise GpmAutomationError(
-            f"Không xác minh được bình luận mục tiêu '{clean_comment_id}' trên trang YouTube."
-        ) from exc
-    if not target_thread:
-        raise GpmAutomationError(
-            f"Không xác minh được bình luận mục tiêu '{clean_comment_id}' trên trang YouTube."
+    renderer_count = int(page_state.get("thread_count") or 0) + int(
+        page_state.get("view_model_count") or 0
+    )
+    if renderer_count > 0:
+        message = (
+            f"YouTube đã tải danh sách nhưng chưa hiển thị bình luận mục tiêu "
+            f"'{clean_comment_id}' trong {total_timeout:.0f} giây."
         )
-    return target_thread
+    elif page_state.get("comments_attached"):
+        message = (
+            "Phần bình luận YouTube vẫn ở trạng thái lazy-load/skeleton sau "
+            f"{total_timeout:.0f} giây."
+        )
+    else:
+        message = (
+            "YouTube chưa gắn phần bình luận vào trang sau "
+            f"{total_timeout:.0f} giây."
+        )
+    if last_error is not None:
+        raise GpmAutomationError(message) from last_error
+    raise GpmAutomationError(message)
 
 
 async def _collect_comment_page_state(page: Any) -> dict[str, Any]:
     """Collect non-sensitive DOM state for failure logs."""
     try:
-        state = await page.evaluate(
-            """() => {
-                const comments = document.querySelector('ytd-comments')
-                    || document.querySelector('ytd-watch-flexy #comments');
-                const rect = comments ? comments.getBoundingClientRect() : null;
-                const body = (document.body?.innerText || '').toLowerCase();
-                const markers = [
-                    'comments are turned off', 'comments are disabled',
-                    'restricted mode has hidden comments',
-                    'chế độ hạn chế đã ẩn bình luận', 'bình luận bị tắt',
-                    'confirm your age', 'xác nhận tuổi',
-                    'unusual traffic', 'lưu lượng truy cập bất thường'
-                ];
-                return {
-                    ready_state: document.readyState,
-                    scroll_y: window.scrollY,
-                    comments_document_top: rect ? rect.top + window.scrollY : null,
-                    comments_height: rect ? rect.height : null,
-                    thread_count: document.querySelectorAll('ytd-comment-thread-renderer').length,
-                    view_model_count: document.querySelectorAll('ytd-comment-view-model').length,
-                    highlighted_count: document.querySelectorAll(
-                        'ytd-comment-thread-renderer[is-highlighted], ytd-comment-view-model[is-highlighted]'
-                    ).length,
-                    markers: markers.filter(marker => body.includes(marker)),
-                };
-            }"""
+        state = await asyncio.wait_for(
+            page.evaluate(
+                """() => {
+                    const comments = document.querySelector('ytd-comments')
+                        || document.querySelector('ytd-watch-flexy #comments');
+                    const rect = comments ? comments.getBoundingClientRect() : null;
+                    const body = (document.body?.innerText || '').toLowerCase();
+                    const markers = [
+                        'comments are turned off', 'comments are disabled',
+                        'restricted mode has hidden comments',
+                        'chế độ hạn chế đã ẩn bình luận', 'bình luận bị tắt',
+                        'confirm your age', 'xác nhận tuổi',
+                        'unusual traffic', 'lưu lượng truy cập bất thường'
+                    ];
+                    return {
+                        ready_state: document.readyState,
+                        viewport_height: window.innerHeight,
+                        scroll_y: window.scrollY,
+                        scroll_height: document.documentElement.scrollHeight,
+                        comments_attached: Boolean(comments),
+                        comments_document_top: rect ? rect.top + window.scrollY : null,
+                        comments_width: rect ? rect.width : null,
+                        comments_height: rect ? rect.height : null,
+                        thread_count: document.querySelectorAll('ytd-comment-thread-renderer').length,
+                        view_model_count: document.querySelectorAll('ytd-comment-view-model').length,
+                        highlighted_count: document.querySelectorAll(
+                            'ytd-comment-thread-renderer[is-highlighted], ytd-comment-view-model[is-highlighted]'
+                        ).length,
+                        skeleton_count: document.querySelectorAll(
+                            'ytd-comments tp-yt-paper-spinner, ytd-comments #placeholder-area'
+                        ).length,
+                        markers: markers.filter(marker => body.includes(marker)),
+                    };
+                }"""
+            ),
+            timeout=2.0,
         )
         return state if isinstance(state, dict) else {}
     except Exception:
@@ -804,6 +860,12 @@ async def pin_top_level_comment_via_gpm(
             raise
         except Exception as exc:
             failed = True
+            page_state = await _collect_comment_page_state(page)
+            logger.error(
+                "Lỗi khi ghim bình luận qua GPM: %s (page_state=%s)",
+                exc,
+                page_state,
+            )
             diagnostic_name = ""
             try:
                 diagnostic = await capture_browser_diagnostics_async(
@@ -820,6 +882,8 @@ async def pin_top_level_comment_via_gpm(
             except Exception as diagnostic_exc:
                 logger.warning("Không thể lưu chẩn đoán lỗi ghim bình luận: %s", diagnostic_exc)
             hint = f" Chẩn đoán: {diagnostic_name}." if diagnostic_name else ""
+            if isinstance(exc, (BrowserAutomationBlocked, GpmAutomationBlocked)):
+                raise
             if isinstance(exc, GpmAutomationError):
                 raise GpmAutomationError(f"{exc}{hint}") from exc
             raise GpmAutomationError(

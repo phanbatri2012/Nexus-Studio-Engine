@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from nexus_engine import main
-from nexus_engine.services import account_store, api_security, tts_service
+from nexus_engine.services import account_store, api_security, security_logging, tts_service
 
 
 FRONTEND_ORIGIN = "http://127.0.0.1:5173"
@@ -169,6 +169,36 @@ class MediaPathSecurityTests(unittest.TestCase):
                 main._resolve_media_file(root, "..\\account.json", ".png")
             with self.assertRaises(HTTPException):
                 main._resolve_media_file(root, "thumbnail.txt", ".png")
+
+
+class SecurityLoggingTests(unittest.TestCase):
+    def test_report_exception_persists_redacted_log_entry(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log_path = Path(temporary_directory) / "logs" / "backend_errors.log"
+            old_handlers = list(security_logging.LOGGER.handlers)
+            for handler in old_handlers:
+                security_logging.LOGGER.removeHandler(handler)
+            try:
+                with patch.object(security_logging, "ERROR_LOG_PATH", log_path):
+                    try:
+                        raise RuntimeError("Failed with Bearer sk-secret1234567890abcdef at C:\\Users\\Tri\\secret.txt")
+                    except RuntimeError as exc:
+                        error_id = security_logging.report_exception("comment_queue_job", exc)
+                    for handler in list(security_logging.LOGGER.handlers):
+                        handler.flush()
+                        handler.close()
+                        security_logging.LOGGER.removeHandler(handler)
+                content = log_path.read_text(encoding="utf-8")
+                self.assertIn(error_id, content)
+                self.assertIn("comment_queue_job failed", content)
+                self.assertNotIn("sk-secret1234567890abcdef", content)
+                self.assertIn("[LOCAL_PATH]", content)
+            finally:
+                for handler in list(security_logging.LOGGER.handlers):
+                    handler.close()
+                    security_logging.LOGGER.removeHandler(handler)
+                for handler in old_handlers:
+                    security_logging.LOGGER.addHandler(handler)
 
 
 if __name__ == "__main__":

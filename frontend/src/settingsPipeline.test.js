@@ -49,6 +49,8 @@ test('Settings exposes scene duration in the video prompt editor and live previe
   assert.match(settingsSource, /liveVidTemplate\.includes\('\{duration_seconds\}'\)/);
   assert.match(settingsSource, /liveVidTemplateWithDuration/);
   assert.match(settingsSource, /\.replace\('\{duration_seconds\}', liveDurationLabel\)/);
+  assert.match(settingsSource, /min="8"[\s\S]*max="10"[\s\S]*intro_scene_target_seconds/);
+  assert.match(settingsSource, /Math\.min\(10, Math\.max\(8, rawLiveDuration\)\)/);
 });
 
 test('Settings saves a stable default YouTube channel for every prompt version', () => {

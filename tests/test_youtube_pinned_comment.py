@@ -108,12 +108,14 @@ class TestYouTubePinnedCommentWorkflow(unittest.TestCase):
         publication = self._publication()
         public_at = (self.now + dt.timedelta(hours=2)).isoformat()
 
-        first, created = youtube_pinned_comment.enqueue_for_publication(
-            publication["id"], public_at=public_at
-        )
-        second, created_again = youtube_pinned_comment.enqueue_for_publication(
-            publication["id"], public_at=public_at
-        )
+        with patch.object(db, "utc_now", return_value=self.now.isoformat()):
+            first, created = youtube_pinned_comment.enqueue_for_publication(
+                publication["id"], public_at=public_at
+            )
+            second, created_again = youtube_pinned_comment.enqueue_for_publication(
+                publication["id"], public_at=public_at
+            )
+            claimed = db.claim_next_system_job(youtube_pinned_comment.JOB_TYPE)
 
         self.assertTrue(created)
         self.assertFalse(created_again)
@@ -124,7 +126,7 @@ class TestYouTubePinnedCommentWorkflow(unittest.TestCase):
             first["next_retry_at"],
             (self.now + dt.timedelta(hours=3)).isoformat(),
         )
-        self.assertIsNone(db.claim_next_system_job(youtube_pinned_comment.JOB_TYPE))
+        self.assertIsNone(claimed)
 
     def test_unscheduled_private_to_public_transition_anchors_at_observation(self):
         publication = {
@@ -300,6 +302,51 @@ class TestYouTubePinnedCommentWorkflow(unittest.TestCase):
             )
 
         self.assertEqual(completed["status"], "done")
+        find_comment.assert_not_called()
+        publish_comment.assert_not_called()
+
+    def test_visible_youtube_blocker_pauses_posted_comment_without_reinsert(self):
+        publication = self._publication()
+        db.update_video_publication(
+            publication["id"],
+            pinned_comment_status="posted",
+            pinned_comment_id="comment-saved-after-insert",
+            pinned_comment_posted_at=(self.now - dt.timedelta(minutes=5)).isoformat(),
+        )
+        job, _ = youtube_pinned_comment.enqueue_for_publication(
+            publication["id"],
+            public_at=(self.now - dt.timedelta(hours=2)).isoformat(),
+        )
+        with (
+            patch.object(youtube_pinned_comment, "_utc_now", return_value=self.now),
+            patch.object(
+                youtube_comments, "get_video_details", return_value=self._public_remote()
+            ),
+            patch.object(youtube_comments, "find_channel_top_level_comment") as find_comment,
+            patch.object(youtube_comments, "publish_top_level_comment") as publish_comment,
+            patch.object(
+                gpm_youtube_automation,
+                "pin_top_level_comment_via_gpm",
+                new=AsyncMock(
+                    side_effect=gpm_youtube_automation.GpmAutomationBlocked(
+                        "comments are disabled"
+                    )
+                ),
+            ),
+        ):
+            with self.assertRaises(
+                youtube_pinned_comment.PinnedCommentAttentionRequired
+            ) as raised:
+                youtube_pinned_comment.execute_job(
+                    job, access_token_provider=self._provider
+                )
+            paused = youtube_pinned_comment.handle_job_failure(job, raised.exception)
+
+        self.assertEqual(paused["status"], "paused")
+        self.assertEqual(
+            paused["result"]["attention_required"],
+            "pinned_comment_gpm_blocked",
+        )
         find_comment.assert_not_called()
         publish_comment.assert_not_called()
 
@@ -488,6 +535,10 @@ class TestYouTubePinnedCommentWorkflow(unittest.TestCase):
         center_item = main._system_job_center_item(paused, None)
         self.assertTrue(center_item["can_retry"])
         self.assertFalse(center_item["can_resume"])
+        self.assertEqual(
+            center_item["recovery_limit"],
+            len(youtube_pinned_comment.RETRY_DELAYS_SECONDS),
+        )
         restarted_item = main._run_system_job_center_action(
             paused["id"],
             "retry",
@@ -685,6 +736,100 @@ class _FakeLocatorList:
 
 
 class TestPinnedCommentBrowserAutomation(unittest.TestCase):
+    def test_wait_for_target_progressively_scrolls_until_comment_is_visible(self):
+        page = MagicMock()
+        target_thread = MagicMock()
+        page.wait_for_selector = AsyncMock(
+            side_effect=[TimeoutError("not visible"), TimeoutError("not visible"), target_thread]
+        )
+        page.evaluate = AsyncMock(return_value=None)
+
+        with patch.object(
+            gpm_youtube_automation.asyncio,
+            "sleep",
+            new=AsyncMock(),
+        ):
+            result = asyncio.run(
+                gpm_youtube_automation._wait_for_target_comment_thread(
+                    page,
+                    "comment_target_123",
+                    timeout_seconds=3.0,
+                )
+            )
+
+        self.assertIs(result, target_thread)
+        self.assertEqual(page.wait_for_selector.await_count, 3)
+        self.assertEqual(page.evaluate.await_count, 2)
+        for call in page.evaluate.await_args_list:
+            self.assertIn("comment_target_123", call.args[1])
+
+    def test_wait_for_target_stops_after_bounded_lazy_load_attempts(self):
+        page = MagicMock()
+        page.wait_for_selector = AsyncMock(side_effect=TimeoutError("not visible"))
+
+        async def evaluate(script, *_args):
+            if "ready_state" in script:
+                return {
+                    "comments_attached": True,
+                    "comments_height": 0,
+                    "thread_count": 0,
+                    "view_model_count": 0,
+                    "markers": [],
+                }
+            return None
+
+        page.evaluate = AsyncMock(side_effect=evaluate)
+        with patch.object(
+            gpm_youtube_automation.asyncio,
+            "sleep",
+            new=AsyncMock(),
+        ):
+            with self.assertRaisesRegex(
+                gpm_youtube_automation.GpmAutomationError,
+                "lazy-load/skeleton",
+            ):
+                asyncio.run(
+                    gpm_youtube_automation._wait_for_target_comment_thread(
+                        page,
+                        "comment_target_123",
+                        timeout_seconds=3.0,
+                    )
+                )
+
+        self.assertLessEqual(page.wait_for_selector.await_count, 7)
+
+    def test_wait_for_target_promotes_visible_comment_blocker(self):
+        page = MagicMock()
+        page.wait_for_selector = AsyncMock(side_effect=TimeoutError("not visible"))
+
+        async def evaluate(script, *_args):
+            if "ready_state" in script:
+                return {
+                    "comments_attached": True,
+                    "thread_count": 0,
+                    "view_model_count": 0,
+                    "markers": ["comments are disabled"],
+                }
+            return None
+
+        page.evaluate = AsyncMock(side_effect=evaluate)
+        with patch.object(
+            gpm_youtube_automation.asyncio,
+            "sleep",
+            new=AsyncMock(),
+        ):
+            with self.assertRaisesRegex(
+                gpm_youtube_automation.GpmAutomationBlocked,
+                "comments are disabled",
+            ):
+                asyncio.run(
+                    gpm_youtube_automation._wait_for_target_comment_thread(
+                        page,
+                        "comment_target_123",
+                        timeout_seconds=3.0,
+                    )
+                )
+
     def test_menu_recognizes_vietnamese_pin_and_unpin(self):
         page = MagicMock()
         page.locator.return_value = _FakeLocatorList([_FakeMenuItem("Ghim")])

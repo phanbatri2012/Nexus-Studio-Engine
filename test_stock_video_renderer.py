@@ -245,6 +245,11 @@ class StockVideoRendererTests(unittest.TestCase):
         bg_video.touch()
         icon_gif = self.temp_path / "icon.gif"
         icon_gif.touch()
+        caption_file = self.temp_path / "caption.srt"
+        caption_file.write_text(
+            "1\n00:00:00,000 --> 00:00:03,000\nDòng phụ đề hợp lệ.\n",
+            encoding="utf-8",
+        )
 
         video_id = db.save_video(
             url="https://youtube.com/watch?v=cmd_test",
@@ -283,6 +288,7 @@ class StockVideoRendererTests(unittest.TestCase):
              patch.object(stock_video_renderer, "AUDIO_DIR", self.temp_path), \
              patch.object(stock_video_renderer, "THUMBNAILS_DIR", self.temp_path), \
              patch.object(stock_video_renderer, "RENDERS_DIR", self.temp_path), \
+             patch("nexus_engine.services.video_production.create_srt", return_value=(caption_file, "audio-hash")), \
              patch.object(stock_video_renderer.subprocess, "Popen", side_effect=mock_popen):
 
             (self.temp_path / f"video_{video_id}.mp3").write_bytes(b"ID3" + b"\x00" * 1024)
@@ -318,6 +324,9 @@ class StockVideoRendererTests(unittest.TestCase):
             self.assertIn("scale=480:260:flags=neighbor", cmd_str)
             self.assertIn("geq=", cmd_str)
             self.assertIn("enable='gte(t,3)'", cmd_str)
+            self.assertIn("subtitles=", cmd_str)
+            self.assertIn("WrapStyle=2", cmd_str)
+            self.assertIn("MarginL=120,MarginR=120", cmd_str)
 
     def test_generate_title_text_overlay(self):
         out_title = self.temp_path / "styled_title_text.png"
@@ -375,7 +384,10 @@ class StockVideoRendererTests(unittest.TestCase):
 
             res = stock_video_renderer.produce_stock_video(
                 video_id=video_id,
-                snapshot={"render_mode": "stock_video"},
+                snapshot={
+                    "render_mode": "stock_video",
+                    "pipeline": {"captions": False},
+                },
                 progress=lambda m, s="": None,
                 cancel_check=lambda: None,
             )
@@ -492,6 +504,7 @@ class StockVideoRendererTests(unittest.TestCase):
                     video_id=video_id,
                     snapshot={
                         "render_mode": "stock_video",
+                        "pipeline": {"captions": False},
                         "stock_video_settings": {"thumbnail_corner_mode": expected_corner},
                     },
                     progress=lambda m, s="": None,
@@ -506,6 +519,7 @@ class StockVideoRendererTests(unittest.TestCase):
                     video_id=video_id,
                     snapshot={
                         "render_mode": "stock_video",
+                        "pipeline": {"captions": False},
                         "stock_video_settings": {"thumbnail_corner_mode": "random"},
                     },
                     progress=lambda m, s="": None,

@@ -1061,6 +1061,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             "src": "",
             "assetId": "new-video",
             "identityKeys": ["asset:new-video"],
+            "isVideo": True,
             "completed": True,
         }
         worker._video_completed_candidate_seen_at["asset:new-video"] = -100.0
@@ -1099,6 +1100,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                 "src": "",
                 "assetId": "new-video-card",
                 "identityKeys": ["asset:new-video-card"],
+                "isVideo": True,
                 "completed": True,
             },
         ]
@@ -1142,6 +1144,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             "src": "",
             "assetId": "old-video",
             "identityKeys": ["asset:old-video"],
+            "isVideo": True,
             "completed": True,
         }
 
@@ -1187,6 +1190,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             "assetId": "new-video",
             "matchUrls": ["https://flow-content.google/image/poster"],
             "identityKeys": ["asset:new-video"],
+            "isVideo": True,
             "completed": True,
         }
 
@@ -1202,6 +1206,100 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                 await worker._inspect_video_candidate_detail(candidate, set())
 
         close_detail.assert_awaited_once()
+
+    async def test_video_source_rejects_ui_locator_and_image_card(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        worker = GoogleFlowWorker(page)
+        invalid_candidates = [
+            {
+                "src": "flow_canvas_tile:Video result",
+                "cardAria": "Video result",
+                "labelText": "video",
+                "completed": True,
+            },
+            {
+                "src": "https://flow-content.google/image/poster.png",
+                "labelText": "video output",
+                "completed": True,
+            },
+        ]
+
+        self.assertEqual(worker._find_new_video_source(invalid_candidates, set()), "")
+        self.assertEqual(
+            worker._find_new_video_source(
+                [{"src": "blob:https://flow.google/video-real", "completed": True}],
+                set(),
+            ),
+            "blob:https://flow.google/video-real",
+        )
+
+    async def test_find_video_for_prompt_keeps_image_only_response_pending(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-one"
+        page.evaluate = AsyncMock(
+            return_value={
+                "promptFound": True,
+                "queued": False,
+                "isLatestPrompt": True,
+                "candidates": [
+                    {
+                        "src": "flow_canvas_tile:Video result",
+                        "matchUrls": ["https://flow-content.google/image/poster.png"],
+                        "cardAria": "Video result",
+                        "completed": True,
+                    }
+                ],
+            }
+        )
+        worker = GoogleFlowWorker(page)
+
+        with (
+            patch.object(worker, "_collect_video_candidates", AsyncMock(return_value=[])),
+            patch.object(worker, "_inspect_video_candidate_detail", AsyncMock()) as inspect_detail,
+        ):
+            result = await worker._find_video_for_prompt("late prompt")
+
+        self.assertEqual(result["state"], "pending")
+        self.assertEqual(result["source"], "")
+        self.assertEqual(result["image_only_count"], 1)
+        inspect_detail.assert_not_awaited()
+
+    async def test_download_video_rejects_unverified_canvas_locator_without_retry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            page = MagicMock()
+            page.url = "https://flow.google.com/project/project-one"
+            page.request.get = AsyncMock()
+            worker = GoogleFlowWorker(page)
+            target = Path(temp_dir) / "video.mp4"
+
+            with patch.object(worker, "_download_video_from_ui", AsyncMock()) as ui_download:
+                with self.assertRaises(FlowVideoPending) as raised:
+                    await worker.download_video("flow_canvas_tile:Video result", str(target))
+
+            self.assertEqual(raised.exception.reason_code, "flow_video_output_unverified")
+            ui_download.assert_not_awaited()
+            page.request.get.assert_not_awaited()
+
+    async def test_download_video_tile_without_download_control_stays_pending(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            page = MagicMock()
+            page.url = "https://flow.google.com/project/project-one"
+            page.request.get = AsyncMock()
+            worker = GoogleFlowWorker(page)
+            target = Path(temp_dir) / "video.mp4"
+
+            with patch.object(
+                worker,
+                "_download_video_from_ui",
+                AsyncMock(return_value=False),
+            ) as ui_download:
+                with self.assertRaises(FlowVideoPending) as raised:
+                    await worker.download_video("flow_video_tile:Video result", str(target))
+
+            self.assertEqual(raised.exception.reason_code, "flow_video_download_pending")
+            ui_download.assert_awaited_once()
+            page.request.get.assert_not_awaited()
 
     async def test_wait_for_video_treats_latest_agent_queue_message_as_active(self):
         page = MagicMock()
@@ -2556,6 +2654,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         page.locator.side_effect = locate
         worker = GoogleFlowWorker(page)
         save_button = MagicMock()
+        save_button.is_visible = AsyncMock(return_value=True)
         save_button.click = AsyncMock()
         with (
             patch.object(
@@ -2656,6 +2755,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         page.locator.side_effect = locate
         worker = GoogleFlowWorker(page)
         save_button = MagicMock()
+        save_button.is_visible = AsyncMock(return_value=True)
         save_button.click = AsyncMock()
         with (
             patch.object(
@@ -3086,6 +3186,126 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
         sync_refs.assert_not_awaited()
         submit.assert_not_awaited()
 
+    async def test_image_late_output_rejects_unscoped_canvas_candidate(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-new"
+        page.evaluate = AsyncMock(
+            return_value={
+                "promptFound": True,
+                "hasPending": False,
+                "candidates": [
+                    {
+                        "src": "https://flow-content.google/image/old-scene-3",
+                        "assetId": "old-scene-3",
+                        "turnRole": "canvas",
+                    }
+                ],
+                "error": "",
+            }
+        )
+        worker = GoogleFlowWorker(page)
+
+        with patch.object(
+            worker,
+            "_validate_image_candidate",
+            AsyncMock(return_value="https://flow-content.google/image/old-scene-3"),
+        ) as validate:
+            result = await worker._find_completed_image_for_prompt(
+                "Scene 3/187 [AYT-request-scene-3]"
+            )
+
+        self.assertEqual(result, "")
+        validate.assert_not_awaited()
+
+    async def test_image_late_output_accepts_verified_prompt_turn_candidate(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-new"
+        page.evaluate = AsyncMock(
+            return_value={
+                "promptFound": True,
+                "hasPending": False,
+                "candidates": [
+                    {
+                        "src": "https://flow-content.google/image/new-scene-3",
+                        "assetId": "new-scene-3",
+                        "turnRole": "agent",
+                        "matchScope": "prompt_turn",
+                    }
+                ],
+                "error": "",
+            }
+        )
+        worker = GoogleFlowWorker(page)
+
+        with patch.object(
+            worker,
+            "_validate_image_candidate",
+            AsyncMock(return_value="https://flow-content.google/image/new-scene-3"),
+        ) as validate:
+            result = await worker._find_completed_image_for_prompt(
+                "Scene 3/187 [AYT-request-scene-3]"
+            )
+
+        self.assertEqual(
+            result,
+            "https://flow-content.google/image/new-scene-3",
+        )
+        validate.assert_awaited_once()
+
+    async def test_image_reconciliation_does_not_reuse_arbitrary_canvas_asset(self):
+        page = MagicMock()
+        page.url = "https://flow.google.com/project/project-new"
+        worker = GoogleFlowWorker(page)
+        stale_candidate = {
+            "src": "https://flow-content.google/image/old-scene-3",
+            "assetId": "old-scene-3",
+        }
+
+        async def no_verified_late_result(*_prompts):
+            worker._last_image_prompt_found = True
+            worker._last_image_prompt_scan_succeeded = True
+            worker._last_image_pending_detected = True
+            return ""
+
+        with (
+            patch.object(
+                worker,
+                "_find_completed_image_for_prompt",
+                AsyncMock(side_effect=no_verified_late_result),
+            ),
+            patch.object(
+                worker,
+                "_collect_image_candidates",
+                AsyncMock(return_value=[stale_candidate]),
+            ) as collect,
+            patch.object(
+                worker,
+                "_validate_image_candidate",
+                AsyncMock(return_value=stale_candidate["src"]),
+            ) as validate,
+            patch.object(
+                worker,
+                "_get_existing_image_error_texts",
+                AsyncMock(return_value=set()),
+            ),
+            patch.object(worker, "_submit_prompt_and_wait_for_ack", AsyncMock()) as submit,
+        ):
+            with self.assertRaises(FlowImagePending):
+                await worker.generate_scene(
+                    "Scene 3 exact prompt",
+                    "text",
+                    [],
+                    scene_index=2,
+                    scene_count=187,
+                    request_key="request-scene-3",
+                    reconcile_only=True,
+                    check_late_result=True,
+                )
+
+        collect.assert_not_awaited()
+        validate.assert_not_awaited()
+        submit.assert_not_awaited()
+
     async def test_completed_late_video_is_reused_before_frame_sync_or_resubmit(self):
         page = MagicMock()
         page.url = "https://flow.google.com/project/project-one"
@@ -3137,8 +3357,13 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 worker,
-                "_get_existing_error_texts",
+                "_get_existing_video_error_texts",
                 AsyncMock(return_value={"Không thành công: vi phạm chính sách"}),
+            ),
+            patch.object(
+                worker,
+                "_get_existing_video_error_count",
+                AsyncMock(return_value=1),
             ),
             patch.object(worker, "_ensure_agent_session_ready", AsyncMock()) as ensure_session,
             patch.object(worker, "_submit_prompt_and_wait_for_ack", AsyncMock()) as submit,
@@ -3155,6 +3380,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                     end_frame_path=end_frame,
                     scene_index=0,
                     reconcile_only=True,
+                    video_error_count_before_submit=1,
                 )
 
         ensure_session.assert_not_awaited()
@@ -3376,6 +3602,7 @@ class GoogleFlowWorkerTests(unittest.IsolatedAsyncioTestCase):
                         "matchUrls": ["https://flow.google/poster-late.png"],
                         "assetId": "late-video",
                         "identityKeys": ["asset:late-video"],
+                        "isVideo": True,
                         "completed": True,
                     }
                 ],

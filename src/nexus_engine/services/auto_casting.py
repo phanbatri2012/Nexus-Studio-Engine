@@ -22,6 +22,17 @@ MANIFEST_AGE_GROUPS = {"any", "young", "adult", "senior"}
 class AutoCastingAttentionRequired(RuntimeError):
     """Raised when a safe distinct cast cannot be produced automatically."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        attention_code: str = "casting_evidence_insufficient",
+        error_id: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.attention_code = str(attention_code or "casting_evidence_insufficient")
+        self.error_id = str(error_id or "")
+
 
 class CastingManifestValidationError(ValueError):
     """Raised when ChatGPT did not return a valid casting manifest."""
@@ -52,22 +63,124 @@ def script_speaker_keys(script: str) -> list[str]:
     return result
 
 
+def _extract_speakers_regex_fallback(text: str) -> list[dict]:
+    """Fallback extraction of speakers when JSON syntax is corrupted by LLM."""
+    cleaned = unicodedata.normalize("NFKD", text)
+    cleaned = re.sub(r"\\([_\[\]{}*`~])", r"\1", cleaned)
+
+    # Split into speaker chunks (quoted or unquoted speaker_key / role)
+    chunks = re.split(r'(?=(?:\{\s*)?["\']?(?:speaker_key|role)["\']?\s*:)', cleaned)
+
+    speakers: list[dict] = []
+    for chunk in chunks:
+        k_match = re.search(r'["\']?(?:speaker_key|role)["\']?\s*:\s*["\']?([^"\',\n}]+)["\']?', chunk)
+        if not k_match:
+            continue
+        speaker_key = k_match.group(1).strip()
+
+        name_match = re.search(r'["\']?name["\']?\s*:\s*["\']?([^"\',\n}]+)["\']?', chunk)
+        name = name_match.group(1).strip() if name_match else speaker_key
+
+        gender_match = re.search(r'["\']?gender["\']?\s*:\s*["\']?([^"\',\n}]+)["\']?', chunk)
+        gender = gender_match.group(1).strip().lower() if gender_match else "any"
+        if gender not in MANIFEST_GENDERS:
+            gender = "any"
+
+        age_match = re.search(r'["\']?age_group["\']?\s*:\s*["\']?([^"\',\n}]+)["\']?', chunk)
+        age = age_match.group(1).strip().lower() if age_match else "any"
+        if age not in MANIFEST_AGE_GROUPS:
+            age = "any"
+
+        lang_match = re.search(r'["\']?language["\']?\s*:\s*["\']?([^"\',\n}]+)["\']?', chunk)
+        lang = lang_match.group(1).strip().lower() if lang_match else "vi"
+
+        conf_match = re.search(r'["\']?confidence["\']?\s*:\s*([0-9.]+)', chunk)
+        try:
+            confidence = float(conf_match.group(1)) if conf_match else 0.5
+            confidence = max(0.0, min(1.0, confidence))
+        except (ValueError, TypeError):
+            confidence = 0.5
+
+        styles: list[str] = []
+        styles_section = re.search(
+            r'["\']?styles["\']?\s*:\s*([^}\n]+(?:\n[^}\n]+)*?)(?:,\s*["\']?(?:confidence|name|gender|age_group|language|speaker_key|role)["\']?|\})',
+            chunk,
+        )
+        if styles_section:
+            raw_styles = styles_section.group(1)
+            words = re.findall(r'["\']([a-zA-Z0-9_\-]+)["\']', raw_styles)
+            if not words:
+                words = re.findall(r'\b([a-zA-Z0-9_\-]+)\b', raw_styles)
+            for w in words:
+                w_clean = w.strip().lower()
+                if w_clean and w_clean not in (
+                    "styles", "confidence", "name", "gender", "age_group", "language", "speaker_key", "role"
+                ):
+                    if w_clean not in styles:
+                        styles.append(w_clean)
+        if not styles:
+            styles = ["warm"]
+
+        speakers.append({
+            "speaker_key": speaker_key,
+            "name": name,
+            "gender": gender,
+            "age_group": age,
+            "language": lang,
+            "styles": styles,
+            "confidence": confidence,
+        })
+    return speakers
+
+
 def _extract_json_object(value: object) -> dict:
     if isinstance(value, dict):
         return value
     if not isinstance(value, str):
         raise CastingManifestValidationError("Casting manifest phải là JSON object.")
     text = value.strip()
-    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.I)
+    text = unicodedata.normalize("NFKD", text)
+    text = re.sub(r"^[ \t]*ChatGPT said:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?escape>", "", text, flags=re.IGNORECASE).strip()
+    # Unescape markdown formatting characters commonly inserted into JSON by ChatGPT
+    text = re.sub(r"\\([_\[\]{}*`~])", r"\1", text)
+    # Fix '"speakers": {' when ChatGPT mistakenly outputs an object opening for the array
+    text = re.sub(r'("speakers"\s*:\s*)\{', r"\1[", text)
+
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.I)
     if fenced:
         text = fenced.group(1).strip()
+    else:
+        brace_start = text.find("{")
+        brace_end = text.rfind("}")
+        if brace_start != -1 and brace_end > brace_start:
+            text = text[brace_start : brace_end + 1]
+    text = re.sub(r"</?escape>", "", text, flags=re.IGNORECASE).strip()
+
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise CastingManifestValidationError("Casting manifest không phải JSON hợp lệ.") from exc
-    if not isinstance(parsed, dict):
-        raise CastingManifestValidationError("Casting manifest phải là JSON object.")
-    return parsed
+        if isinstance(parsed, dict) and isinstance(parsed.get("speakers"), list):
+            return parsed
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: Auto-repair unclosed styles array bracket (e.g. "styles": [ ... \n "confidence": ...)
+    repaired = re.sub(r'("styles"\s*:\s*\[[^\]]+?)(,\s*"confidence")', r"\1]\2", text)
+    try:
+        parsed = json.loads(repaired)
+        if isinstance(parsed, dict) and isinstance(parsed.get("speakers"), list):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 3: Robust fallback regex extraction
+    fallback_speakers = _extract_speakers_regex_fallback(value)
+    if fallback_speakers:
+        return {"speakers": fallback_speakers}
+
+    raise CastingManifestValidationError("Casting manifest không phải JSON hợp lệ.")
 
 
 def validate_casting_manifest(script: str, value: object) -> dict:

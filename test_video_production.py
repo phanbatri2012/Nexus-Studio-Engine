@@ -17,6 +17,7 @@ from PIL import Image
 from nexus_engine import main
 from nexus_engine.services import database
 from nexus_engine.services import publication_scheduler
+from nexus_engine.services import subtitle_layout
 from nexus_engine.services import video_production
 from nexus_engine.services import youtube_publisher
 from nexus_engine.services import youtube_publish_workflow
@@ -359,6 +360,57 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertTrue(len(windows) > 0)
         self.assertTrue(all(w["duration"] >= 20.0 for w in windows))
 
+    def test_intro_video_windows_are_hard_bounded_and_preserve_words(self):
+        captions = [
+            {"start": 0.69, "end": 10.63, "text": "one two three four five six"},
+            {"start": 11.53, "end": 25.19, "text": "seven eight nine ten eleven twelve"},
+            {"start": 26.43, "end": 39.91, "text": "thirteen fourteen fifteen sixteen"},
+            {"start": 40.81, "end": 51.17, "text": "seventeen eighteen nineteen"},
+        ]
+        windows = video_production.build_scene_windows(
+            captions,
+            duration_seconds=80.0,
+            minimum_seconds=25.0,
+            target_seconds=30.0,
+            maximum_seconds=35.0,
+            intro_end_seconds=39.91,
+            intro_target_seconds=8.0,
+            enable_intro_video=True,
+        )
+
+        video_windows = [window for window in windows if window["is_video"]]
+        self.assertEqual(len(video_windows), 4)
+        self.assertTrue(
+            all(8.0 <= window["duration"] <= 10.0 for window in video_windows)
+        )
+        self.assertAlmostEqual(video_windows[-1]["end"], 39.91, places=6)
+        expected_words = " ".join(item["text"] for item in captions).split()
+        actual_words = " ".join(window["transcript"] for window in windows).split()
+        self.assertEqual(actual_words, expected_words)
+        for previous, current in zip(windows, windows[1:]):
+            self.assertAlmostEqual(previous["end"], current["start"], places=6)
+
+    def test_intro_partition_chooses_nearest_feasible_8_to_10_second_span(self):
+        cases = (
+            (10.63, 100.0, (1, 10.0)),
+            (15.0, 100.0, (2, 16.0)),
+            (21.0, 100.0, (2, 20.0)),
+            (7.0, 100.0, (1, 7.0)),
+            (7.0, 7.0, (1, 7.0)),
+            (float("nan"), 100.0, (0, 0.0)),
+            (20.0, float("inf"), (0, 0.0)),
+        )
+        for requested, total, expected in cases:
+            with self.subTest(requested=requested, total=total):
+                self.assertEqual(
+                    video_production._choose_intro_video_partition(
+                        requested,
+                        total,
+                        8.0,
+                    ),
+                    expected,
+                )
+
     def test_extract_intro_boundary_multi_tier_matching(self):
         # Test long intro matching with slight transcription differences
         script = (
@@ -385,9 +437,169 @@ class VideoProductionServiceTests(unittest.TestCase):
             enable_intro_video=True,
         )
         video_windows = [w for w in windows if w["is_video"]]
-        self.assertEqual(len(video_windows), 3)
+        self.assertEqual(len(video_windows), 6)
         self.assertTrue(all(w["is_video"] for w in video_windows))
-        self.assertFalse(windows[3]["is_video"])
+        self.assertTrue(all(8.0 <= w["duration"] <= 10.0 for w in video_windows))
+        self.assertAlmostEqual(video_windows[-1]["end"], 55.0, places=6)
+        self.assertFalse(windows[6]["is_video"])
+
+    def test_long_intro_uses_full_92_second_boundary_and_preserves_all_words(self):
+        intro_end = 92.53
+        word_counts = [33, 33, 33, 33, 32, 32, 32, 32, 32, 32]
+        captions = []
+        next_word = 0
+        for index, word_count in enumerate(word_counts):
+            start = intro_end * index / len(word_counts)
+            end = intro_end * (index + 1) / len(word_counts)
+            words = [
+                f"intro_{word_index}"
+                for word_index in range(next_word, next_word + word_count)
+            ]
+            next_word += word_count
+            captions.append({"start": start, "end": end, "text": " ".join(words)})
+        captions.append(
+            {
+                "start": intro_end,
+                "end": 120.0,
+                "text": "body_0 body_1 body_2 body_3",
+            }
+        )
+
+        windows = video_production.build_scene_windows(
+            captions,
+            duration_seconds=120.0,
+            intro_end_seconds=intro_end,
+            intro_target_seconds=8.0,
+            enable_intro_video=True,
+        )
+
+        video_windows = [window for window in windows if window["is_video"]]
+        self.assertEqual(next_word, 324)
+        self.assertEqual(len(video_windows), 10)
+        self.assertTrue(
+            all(8.0 <= window["duration"] <= 10.0 for window in video_windows)
+        )
+        self.assertTrue(
+            all(abs(window["duration"] - 9.253) < 0.001 for window in video_windows)
+        )
+        self.assertAlmostEqual(video_windows[-1]["end"], intro_end, places=6)
+        expected_words = " ".join(item["text"] for item in captions).split()
+        actual_words = " ".join(window["transcript"] for window in windows).split()
+        self.assertEqual(actual_words, expected_words)
+        for previous, current in zip(windows, windows[1:]):
+            self.assertAlmostEqual(previous["end"], current["start"], places=6)
+
+    def test_intro_boundary_is_clamped_without_extending_short_intro_into_body(self):
+        captions = [
+            {"start": 0.0, "end": 4.0, "text": "short intro words"},
+            {"start": 4.0, "end": 12.0, "text": "body words remain in body"},
+        ]
+
+        short_windows = video_production.build_scene_windows(
+            captions,
+            duration_seconds=12.0,
+            intro_end_seconds=4.0,
+            enable_intro_video=True,
+        )
+        short_video_windows = [w for w in short_windows if w["is_video"]]
+        self.assertEqual(len(short_video_windows), 1)
+        self.assertAlmostEqual(short_video_windows[0]["end"], 4.0, places=6)
+        self.assertEqual(short_video_windows[0]["transcript"], "short intro words")
+        self.assertEqual(
+            video_production._scene_video_target_duration(short_video_windows[0], {}),
+            8.0,
+        )
+        self.assertFalse(short_windows[1]["is_video"])
+        self.assertAlmostEqual(short_windows[1]["start"], 4.0, places=6)
+
+        clamped_windows = video_production.build_scene_windows(
+            captions,
+            duration_seconds=12.0,
+            intro_end_seconds=99.0,
+            enable_intro_video=True,
+        )
+        self.assertAlmostEqual(clamped_windows[-1]["end"], 12.0, places=6)
+        clamped_video_windows = [w for w in clamped_windows if w["is_video"]]
+        self.assertEqual(len(clamped_video_windows), 1)
+        self.assertAlmostEqual(clamped_video_windows[0]["end"], 10.0, places=6)
+        self.assertFalse(clamped_windows[-1]["is_video"])
+
+        invalid_windows = video_production.build_scene_windows(
+            captions,
+            duration_seconds=12.0,
+            intro_end_seconds=float("nan"),
+            enable_intro_video=True,
+        )
+        self.assertFalse(any(window["is_video"] for window in invalid_windows))
+
+    def test_missing_intro_marker_uses_bounded_fallback(self):
+        boundary = video_production.extract_intro_boundary(
+            "Narration without a structured intro marker.",
+            [{"start": 0.0, "end": 30.0, "text": "narration words"}],
+            200.0,
+        )
+
+        self.assertEqual(boundary, 24.0)
+
+    def test_full_intro_plan_hash_rebuilds_legacy_40_second_plan(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=full-intro-plan-rebuild",
+            "Full intro plan rebuild",
+            "Transcript",
+            "### [INTRO]\nLong intro\n\n### [BODY]\nBody",
+        )
+        captions = [
+            {
+                "start": float(index * 5),
+                "end": float((index + 1) * 5),
+                "text": f"Narrative caption number {index} with unique visual detail",
+            }
+            for index in range(16)
+        ]
+        capped_windows = video_production.build_scene_windows(
+            captions,
+            duration_seconds=80.0,
+            intro_end_seconds=40.0,
+            enable_intro_video=True,
+        )
+        full_windows = video_production.build_scene_windows(
+            captions,
+            duration_seconds=80.0,
+            intro_end_seconds=55.0,
+            enable_intro_video=True,
+        )
+        capped_plan = video_production.build_default_visual_scene_plan(
+            capped_windows,
+            "Full intro plan rebuild",
+            "Documentary realism",
+        )
+        video_production.save_visual_scene_plan(
+            video_id,
+            "legacy-capped-plan-hash",
+            capped_plan,
+        )
+
+        rebuilt = video_production._load_or_build_visual_scene_plan(
+            video_id,
+            {"image_generation_settings": {"style_prompt": "Documentary realism"}},
+            {
+                "video": database.get_video(video_id),
+                "windows": full_windows,
+                "plan_hash": "full-intro-plan-hash",
+            },
+            force_new_project=False,
+        )
+
+        self.assertEqual(
+            sum(bool(scene["is_video"]) for scene in rebuilt["scenes"]),
+            6,
+        )
+        rebuilt_artifact = database.get_latest_video_artifact(
+            video_id,
+            "visual_scene_plan",
+            "ready",
+        )
+        self.assertEqual(rebuilt_artifact["content_hash"], "full-intro-plan-hash")
 
     def test_media_validation_uses_pyav_when_ffprobe_is_missing(self):
         probe_result = {
@@ -448,6 +660,7 @@ class VideoProductionServiceTests(unittest.TestCase):
         audio_path.write_bytes(b"audio")
         devices = []
         progress_messages = []
+        transcribe_calls = []
 
         class FakeWhisperModel:
             def __init__(self, _model_name, *, device, compute_type):
@@ -455,6 +668,7 @@ class VideoProductionServiceTests(unittest.TestCase):
                 devices.append((device, compute_type))
 
             def transcribe(self, *_args, **_kwargs):
+                transcribe_calls.append(dict(_kwargs))
                 if self.device == "cuda":
                     def failing_segments():
                         raise RuntimeError("missing CUDA runtime")
@@ -483,6 +697,7 @@ class VideoProductionServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(devices, [("cuda", "float16"), ("cpu", "int8")])
+        self.assertTrue(all(call.get("word_timestamps") is True for call in transcribe_calls))
         self.assertIn("Xin chào", caption_path.read_text(encoding="utf-8"))
         self.assertTrue(any("CPU int8" in message for _, message in progress_messages))
 
@@ -1213,6 +1428,104 @@ class VideoProductionServiceTests(unittest.TestCase):
             self.assertEqual(job_recreate["payload"]["mode"], "recreate")
             self.assertIn("Tạo mới", job_recreate["title"])
 
+    def test_trigger_render_resume_purges_only_stale_final_profile(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=stale-subtitle-profile",
+            "Stale Subtitle Profile",
+            "Transcript",
+            "Script",
+        )
+        database.upsert_audio_task(
+            video_id=video_id,
+            request_hash="hash-stale-subtitle",
+            task_id="task-stale-subtitle",
+            status="completed",
+            audio_url="http://127.0.0.1:8080/api/audio/stale.mp3",
+            error="",
+            segments_json="[]",
+            voice_id="sample-voice",
+            voice_name="Sample Voice",
+        )
+        final_path = Path(self.temporary_directory.name) / "stale-final.mp4"
+        final_path.write_bytes(b"final")
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="final_mp4",
+            path=str(final_path),
+            content_hash="stale-final-hash",
+            status="ready",
+            mime_type="video/mp4",
+            size_bytes=final_path.stat().st_size,
+            metadata={},
+        )
+        routed_job = {"id": "render-stale", "status": "queued", "job_type": "video_render"}
+
+        with (
+            patch.object(database, "list_active_system_jobs", return_value=[]),
+            patch.object(video_production, "purge_video_render_artifacts") as purge,
+            patch.object(main, "_route_video_render_job", return_value=(routed_job, True, "render")),
+        ):
+            result = main.trigger_render_video(video_id, mode="resume")
+
+        self.assertTrue(result["success"])
+        purge.assert_called_once_with(video_id)
+
+    def test_trigger_render_resume_purges_when_subtitle_hash_changed(self):
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=changed-subtitle-hash",
+            "Changed Subtitle Hash",
+            "Transcript",
+            "Script",
+        )
+        database.upsert_audio_task(
+            video_id=video_id,
+            request_hash="hash-changed-subtitle",
+            task_id="task-changed-subtitle",
+            status="completed",
+            audio_url="http://127.0.0.1:8080/api/audio/changed.mp3",
+            error="",
+            segments_json="[]",
+            voice_id="sample-voice",
+            voice_name="Sample Voice",
+        )
+        final_path = Path(self.temporary_directory.name) / "current-profile-old-sub.mp4"
+        final_path.write_bytes(b"final")
+        caption_path = Path(self.temporary_directory.name) / "new-caption.srt"
+        caption_path.write_text(
+            "1\n00:00:00,000 --> 00:00:02,000\nPhụ đề mới.\n",
+            encoding="utf-8",
+        )
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="captions",
+            path=str(caption_path),
+            content_hash="new-subtitle-hash",
+            status="ready",
+        )
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="final_mp4",
+            path=str(final_path),
+            content_hash="old-final-hash",
+            status="ready",
+            metadata={
+                "subtitle_hash": "old-subtitle-hash",
+                "subtitle_profile_version": subtitle_layout.SUBTITLE_PROFILE_VERSION,
+                "subtitle_render_style_version": subtitle_layout.SUBTITLE_RENDER_STYLE_VERSION,
+            },
+        )
+        routed_job = {"id": "render-new-sub", "status": "queued", "job_type": "video_render"}
+
+        with (
+            patch.object(database, "list_active_system_jobs", return_value=[]),
+            patch.object(video_production, "purge_video_render_artifacts") as purge,
+            patch.object(main, "_route_video_render_job", return_value=(routed_job, True, "render")),
+        ):
+            result = main.trigger_render_video(video_id, mode="resume")
+
+        self.assertTrue(result["success"])
+        purge.assert_called_once_with(video_id)
+
     def test_produce_video_propagates_force_new_project(self):
         video_id = database.save_video(
             "https://www.youtube.com/watch?v=flow-force-new",
@@ -1324,6 +1637,318 @@ class VideoProductionServiceTests(unittest.TestCase):
         )
         self.assertNotIn("không chữ cực đẹp", plan_intro["scenes"][0]["prompt"])
         self.assertTrue(len(plan_intro["scenes"][0]["action"]) > 10)
+
+    def test_visual_plan_hash_tracks_only_effective_scene_0_thumbnail(self):
+        thumbnails_dir = Path(self.temporary_directory.name) / "thumbnails"
+        thumbnails_dir.mkdir()
+        old_clean = thumbnails_dir / "clean-old.png"
+        new_clean = thumbnails_dir / "clean-new.png"
+        old_clean.write_bytes(b"old-clean-thumbnail")
+        new_clean.write_bytes(b"new-clean-thumbnail")
+
+        def script(*, clean_urls: list[str], text_url: str) -> str:
+            clean_markers = "\n".join(f"[IMAGE_URL:{url}]" for url in clean_urls)
+            return (
+                "### [THUMBNAIL KHÔNG CHỮ]\n"
+                f"A calm documentary opening scene\n{clean_markers}\n\n"
+                "### [THUMBNAIL CÓ CHỮ]\n"
+                f"A dramatic title composition\n[IMAGE_URL:{text_url}]\n"
+            )
+
+        base_script = script(
+            clean_urls=[
+                "/api/thumbnails/clean-old.png",
+                "/api/thumbnails/clean-new.png",
+            ],
+            text_url="/api/thumbnails/text-old.png",
+        )
+        text_only_changed_script = script(
+            clean_urls=[
+                "/api/thumbnails/clean-old.png",
+                "/api/thumbnails/clean-new.png",
+            ],
+            text_url="/api/thumbnails/text-new.png",
+        )
+        primary_swapped_script = script(
+            clean_urls=[
+                "/api/thumbnails/clean-new.png",
+                "/api/thumbnails/clean-old.png",
+            ],
+            text_url="/api/thumbnails/text-new.png",
+        )
+        windows = [
+            {
+                "index": 0,
+                "start": 0.0,
+                "end": 8.0,
+                "duration": 8.0,
+                "transcript": "Opening narration",
+                "is_video": True,
+            }
+        ]
+
+        def plan_hash(thumbnail: dict[str, str]) -> str:
+            return video_production._calculate_visual_plan_hash(
+                caption_hash="caption-hash",
+                windows=windows,
+                title="Video title",
+                style_prompt="Documentary realism",
+                intro_end_seconds=8.0,
+                prompt_version="prompt-v1",
+                scene_0_source="from_thumbnail_without_text",
+                scene_0_prompt_template="scene zero template",
+                scene_body_prompt_template="body template",
+                scene_0_thumbnail=thumbnail,
+            )
+
+        with patch.object(video_production, "THUMBNAILS_DIR", thumbnails_dir):
+            base_thumbnail = video_production._resolve_scene_0_thumbnail(
+                base_script,
+                "from_thumbnail_without_text",
+            )
+            text_only_changed = video_production._resolve_scene_0_thumbnail(
+                text_only_changed_script,
+                "from_thumbnail_without_text",
+            )
+            primary_swapped = video_production._resolve_scene_0_thumbnail(
+                primary_swapped_script,
+                "from_thumbnail_without_text",
+            )
+
+        self.assertEqual(base_thumbnail["image_url"], "/api/thumbnails/clean-old.png")
+        self.assertEqual(Path(base_thumbnail["reference_path"]), old_clean)
+        self.assertEqual(plan_hash(base_thumbnail), plan_hash(text_only_changed))
+        self.assertNotEqual(plan_hash(base_thumbnail), plan_hash(primary_swapped))
+        self.assertEqual(primary_swapped["image_url"], "/api/thumbnails/clean-new.png")
+        self.assertEqual(Path(primary_swapped["reference_path"]), new_clean)
+
+    def test_regenerated_clean_thumbnail_rebuilds_plan_and_invalidates_only_dependent_intro(self):
+        thumbnails_dir = Path(self.temporary_directory.name) / "thumbnails"
+        visual_plans_dir = Path(self.temporary_directory.name) / "visual-plans"
+        thumbnails_dir.mkdir()
+        old_thumbnail = thumbnails_dir / "intro-old.png"
+        new_thumbnail = thumbnails_dir / "intro-new.png"
+        old_thumbnail.write_bytes(b"old-intro-thumbnail")
+        new_thumbnail.write_bytes(b"new-intro-thumbnail")
+        title = "Thumbnail regeneration cache test"
+        old_script = (
+            "### [THUMBNAIL KHÔNG CHỮ]\n"
+            "A consistent documentary opening concept\n"
+            "[IMAGE_URL:/api/thumbnails/intro-old.png]\n"
+        )
+        new_script = old_script.replace("intro-old.png", "intro-new.png")
+        windows = [
+            {
+                "index": 0,
+                "start": 0.0,
+                "end": 8.0,
+                "duration": 8.0,
+                "transcript": "The host opens the story in a quiet studio",
+                "is_video": True,
+                "media_type": "video",
+            },
+            {
+                "index": 1,
+                "start": 8.0,
+                "end": 16.0,
+                "duration": 8.0,
+                "transcript": "The guest reflects beside a window",
+                "is_video": True,
+                "media_type": "video",
+            },
+            {
+                "index": 2,
+                "start": 16.0,
+                "end": 40.0,
+                "duration": 24.0,
+                "transcript": "The discussion continues with a wider studio view",
+                "is_video": False,
+                "media_type": "image",
+            },
+        ]
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=thumbnail-intro-cache",
+            title,
+            "Transcript",
+            old_script,
+        )
+
+        def plan_hash(thumbnail: dict[str, str]) -> str:
+            return video_production._calculate_visual_plan_hash(
+                caption_hash="caption-hash",
+                windows=windows,
+                title=title,
+                style_prompt="Documentary realism",
+                intro_end_seconds=16.0,
+                prompt_version="",
+                scene_0_source="from_thumbnail_without_text",
+                scene_0_prompt_template="",
+                scene_body_prompt_template="",
+                scene_0_thumbnail=thumbnail,
+            )
+
+        with (
+            patch.object(video_production, "THUMBNAILS_DIR", thumbnails_dir),
+            patch.object(video_production, "VISUAL_PLANS_DIR", visual_plans_dir),
+            patch(
+                "nexus_engine.services.prompt_assets.list_prompt_assets",
+                return_value=[],
+            ),
+        ):
+            old_context = video_production._resolve_scene_0_thumbnail(
+                old_script,
+                "from_thumbnail_without_text",
+            )
+            new_context = video_production._resolve_scene_0_thumbnail(
+                new_script,
+                "from_thumbnail_without_text",
+            )
+            old_hash = plan_hash(old_context)
+            new_hash = plan_hash(new_context)
+            old_plan = video_production.build_default_visual_scene_plan(
+                windows,
+                title,
+                "Documentary realism",
+                generated_script=old_script,
+                scene_0_source="from_thumbnail_without_text",
+            )
+            video_production.save_visual_scene_plan(video_id, old_hash, old_plan)
+            database.update_script(video_id, new_script)
+
+            rebuilt = video_production._load_or_build_visual_scene_plan(
+                video_id,
+                {
+                    "image_generation_settings": {
+                        "style_prompt": "Documentary realism",
+                        "scene_0_source": "from_thumbnail_without_text",
+                    }
+                },
+                {
+                    "video": database.get_video(video_id),
+                    "windows": windows,
+                    "plan_hash": new_hash,
+                    "prompt_version": "",
+                    "scene_0_source": "from_thumbnail_without_text",
+                    "scene_0_prompt_template": "",
+                    "scene_body_prompt_template": "",
+                },
+                force_new_project=False,
+            )
+
+        self.assertNotEqual(old_hash, new_hash)
+        self.assertEqual(Path(rebuilt["scenes"][0]["reference_path"]), new_thumbnail)
+        self.assertEqual(rebuilt["scenes"][1:], old_plan["scenes"][1:])
+        rebuilt_artifact = database.get_latest_video_artifact(
+            video_id,
+            "visual_scene_plan",
+            "ready",
+        )
+        self.assertEqual(rebuilt_artifact["content_hash"], new_hash)
+
+        profile = {}
+        video_settings = {"intro_scene_target_seconds": 8.0}
+        old_scene_0_hash = video_production._scene_hash(
+            video_id,
+            old_plan["scenes"][0],
+            profile,
+            "",
+            old_context["reference_hash"],
+        )
+        new_scene_0_hash = video_production._scene_hash(
+            video_id,
+            rebuilt["scenes"][0],
+            profile,
+            "",
+            new_context["reference_hash"],
+        )
+        old_scene_1_hash = video_production._scene_hash(
+            video_id,
+            old_plan["scenes"][1],
+            profile,
+            "",
+            "",
+        )
+        new_scene_1_hash = video_production._scene_hash(
+            video_id,
+            rebuilt["scenes"][1],
+            profile,
+            "",
+            "",
+        )
+        self.assertNotEqual(old_scene_0_hash, new_scene_0_hash)
+        self.assertEqual(old_scene_1_hash, new_scene_1_hash)
+
+        old_clip_0_hash = video_production._scene_video_hash(
+            video_id,
+            old_plan["scenes"][0],
+            profile,
+            video_settings,
+            "",
+            old_scene_0_hash,
+            old_scene_1_hash,
+        )
+        new_clip_0_hash = video_production._scene_video_hash(
+            video_id,
+            rebuilt["scenes"][0],
+            profile,
+            video_settings,
+            "",
+            new_scene_0_hash,
+            new_scene_1_hash,
+        )
+        old_clip_1_hash = video_production._scene_video_hash(
+            video_id,
+            old_plan["scenes"][1],
+            profile,
+            video_settings,
+            "",
+            old_scene_1_hash,
+            "unchanged-scene-2-hash",
+        )
+        new_clip_1_hash = video_production._scene_video_hash(
+            video_id,
+            rebuilt["scenes"][1],
+            profile,
+            video_settings,
+            "",
+            new_scene_1_hash,
+            "unchanged-scene-2-hash",
+        )
+        self.assertNotEqual(old_clip_0_hash, new_clip_0_hash)
+        self.assertEqual(old_clip_1_hash, new_clip_1_hash)
+
+        clip_0 = Path(self.temporary_directory.name) / "intro-0.mp4"
+        clip_1 = Path(self.temporary_directory.name) / "intro-1.mp4"
+        clip_0.write_bytes(b"0" * 2048)
+        clip_1.write_bytes(b"1" * 2048)
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene_video:0",
+            path=str(clip_0),
+            content_hash=old_clip_0_hash,
+            status="completed",
+            mime_type="video/mp4",
+        )
+        database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene_video:1",
+            path=str(clip_1),
+            content_hash=old_clip_1_hash,
+            status="completed",
+            mime_type="video/mp4",
+        )
+
+        self.assertEqual(
+            video_production.purge_intro_video_artifacts(
+                video_id,
+                keep_successful=True,
+            ),
+            0,
+        )
+        kept_clip_0 = database.get_latest_video_artifact(video_id, "scene_video:0")
+        kept_clip_1 = database.get_latest_video_artifact(video_id, "scene_video:1")
+        self.assertNotEqual(kept_clip_0["content_hash"], new_clip_0_hash)
+        self.assertEqual(kept_clip_1["content_hash"], new_clip_1_hash)
 
 
     def test_sanitize_scene_prompt_context_lowercases_headline_and_strips_punctuation(self):
@@ -1461,7 +2086,7 @@ class VideoProductionServiceTests(unittest.TestCase):
             "scene",
             duration_seconds=6.75,
         )
-        self.assertIn("approximately 6.75 seconds", default_prompt)
+        self.assertIn("approximately 8 seconds", default_prompt)
         self.assertEqual(default_prompt.count("Target duration:"), 1)
 
         custom_prompt = video_production._format_scene_video_prompt(
@@ -1473,7 +2098,7 @@ class VideoProductionServiceTests(unittest.TestCase):
                 "the full duration."
             ),
         )
-        self.assertIn("approximately 6.75 seconds", custom_prompt)
+        self.assertIn("approximately 8 seconds", custom_prompt)
         self.assertEqual(custom_prompt.count("Target duration:"), 1)
 
         legacy_prompt = video_production._format_scene_video_prompt(
@@ -1481,8 +2106,15 @@ class VideoProductionServiceTests(unittest.TestCase):
             duration_seconds=6.75,
             video_prompt_template="{frame_directive} Animate {action} smoothly.",
         )
-        self.assertIn("approximately 6.75 seconds", legacy_prompt)
+        self.assertIn("approximately 8 seconds", legacy_prompt)
         self.assertEqual(legacy_prompt.count("Target duration:"), 1)
+
+        capped_prompt = video_production._format_scene_video_prompt(
+            "scene",
+            duration_seconds=14.72,
+        )
+        self.assertIn("approximately 10 seconds", capped_prompt)
+        self.assertNotIn("14.72", capped_prompt)
 
         self.assertEqual(
             video_production._scene_video_target_duration(
@@ -1497,6 +2129,156 @@ class VideoProductionServiceTests(unittest.TestCase):
                 {"intro_scene_target_seconds": 0},
             ),
             8.0,
+        )
+        self.assertEqual(
+            video_production._scene_video_target_duration(
+                {"duration": 10.63},
+                {"intro_scene_target_seconds": 15},
+            ),
+            10.0,
+        )
+
+    def test_body_scene_image_promotes_across_verified_reindex(self):
+        video_id = database.save_video(
+            "https://youtube.com/watch?v=verified-reindex-cache",
+            "Verified reindex cache",
+            "Transcript",
+            "Script",
+        )
+        old_scene = {
+            "index": 3,
+            "start": 39.91,
+            "end": 51.17,
+            "duration": 11.26,
+            "transcript": "A stable body scene",
+            "is_video": False,
+            "media_type": "image",
+            "subject": "subject",
+            "action": "action",
+            "setting": "setting",
+            "era": "era",
+            "composition": "composition",
+            "lighting": "lighting",
+            "color": "color",
+            "prompt": "A sufficiently detailed documentary prompt for the stable body scene.",
+            "primary_reference_id": "",
+            "reference_path": "",
+        }
+        new_scene = {
+            **old_scene,
+            "index": 4,
+            "is_video": False,
+            "media_type": "image",
+        }
+        image_path = Path(self.temporary_directory.name) / "reindexed-body.png"
+        Image.new("RGB", (1376, 768), color=(35, 75, 115)).save(image_path)
+        candidate = database.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:3",
+            path=str(image_path),
+            content_hash=video_production._scene_hash(
+                video_id,
+                old_scene,
+                {},
+                "",
+                "",
+            ),
+            status="completed",
+            mime_type="image/png",
+            metadata=old_scene,
+        )
+
+        reusable = video_production._resolve_reusable_scene_image_artifact(
+            video_id=video_id,
+            scene=new_scene,
+            profile={},
+            negative_prompt="",
+            reference_hash="",
+            reindex_candidates=[candidate],
+        )
+
+        self.assertIsNotNone(reusable)
+        promoted, _validation = reusable
+        self.assertEqual(promoted["artifact_type"], "scene:4")
+        self.assertEqual(promoted["metadata"]["reindexed_from_scene"], 3)
+        self.assertEqual(Path(promoted["path"]), image_path)
+
+        changed_scene = {**new_scene, "index": 5, "action": "changed action"}
+        self.assertIsNone(
+            video_production._resolve_reusable_scene_image_artifact(
+                video_id=video_id,
+                scene=changed_scene,
+                profile={},
+                negative_prompt="",
+                reference_hash="",
+                reindex_candidates=[candidate],
+            )
+        )
+        self.assertFalse(
+            video_production._body_scenes_match_across_reindex(
+                {**old_scene, "is_video": True, "media_type": "video"},
+                new_scene,
+            )
+        )
+
+    def test_rebuilt_plan_preserves_only_exact_body_scene_visuals(self):
+        previous_scene = {
+            "index": 3,
+            "start": 39.91,
+            "end": 51.17,
+            "duration": 11.26,
+            "transcript": "A stable body scene",
+            "is_video": False,
+            "media_type": "image",
+            "subject": "stable subject",
+            "action": "stable action",
+            "setting": "stable setting",
+            "era": "stable era",
+            "composition": "stable composition",
+            "lighting": "stable lighting",
+            "color": "stable color",
+            "prompt": "A sufficiently detailed documentary prompt for the stable body scene.",
+            "primary_reference_id": "reference-1",
+            "reference_path": "reference.png",
+        }
+        exact_body = {
+            **previous_scene,
+            "index": 4,
+            "is_video": False,
+            "media_type": "image",
+            "action": "new generated action",
+            "prompt": "new generated prompt",
+        }
+        changed_body = {
+            **exact_body,
+            "index": 5,
+            "start": 51.17,
+            "end": 61.89,
+            "transcript": "Different transcript",
+        }
+        current_plan = {"scenes": [exact_body, changed_body]}
+
+        preserved = video_production._preserve_unchanged_body_scene_visuals(
+            {"scenes": [previous_scene]},
+            current_plan,
+        )
+
+        self.assertEqual(preserved, 1)
+        self.assertEqual(exact_body["action"], "stable action")
+        self.assertEqual(exact_body["prompt"], previous_scene["prompt"])
+        self.assertEqual(exact_body["primary_reference_id"], "reference-1")
+        self.assertEqual(changed_body["action"], "new generated action")
+        self.assertEqual(changed_body["prompt"], "new generated prompt")
+        self.assertEqual(
+            video_production._preserve_unchanged_body_scene_visuals(
+                {
+                    "scenes": [
+                        {**previous_scene, "is_video": True, "media_type": "video"}
+                    ]
+                },
+                {"scenes": [{**exact_body, "action": "fresh action"}]},
+            ),
+            0,
         )
 
     def test_video_hash_changes_without_invalidating_image_hash(self):
@@ -2052,7 +2834,7 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertEqual(result["media_paths"], [video_path, image_paths[1]])
         self.assertEqual(result["intro_video_summary"]["generated_count"], 1)
 
-    def test_scene_media_stops_video_generation_after_confirmed_credit_exhaustion(self):
+    def test_scene_media_propagates_video_credit_exhaustion_without_fallback(self):
         from nexus_engine.services.google_flow_worker import FlowCreditExhausted
 
         video_id = database.save_video(
@@ -2067,8 +2849,6 @@ class VideoProductionServiceTests(unittest.TestCase):
             image_path = Path(self.temporary_directory.name) / f"credit-{index}.png"
             Image.new("RGB", (1376, 768), color=(30 + index, 40, 50)).save(image_path)
             image_paths.append(image_path)
-        progress_updates = []
-
         @asynccontextmanager
         async def fake_session(_video_id, *, force_new_project=False):
             yield shared_worker
@@ -2096,30 +2876,16 @@ class VideoProductionServiceTests(unittest.TestCase):
             ) as generate_video,
             patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
         ):
-            result = video_production.generate_scene_media(
-                video_id=video_id,
-                scenes=scenes,
-                settings={"enable_intro_video": True},
-                progress=lambda message, stage: progress_updates.append(
-                    (message, stage)
-                ),
-                cancel_check=lambda: None,
-            )
+            with self.assertRaises(FlowCreditExhausted):
+                video_production.generate_scene_media(
+                    video_id=video_id,
+                    scenes=scenes,
+                    settings={"enable_intro_video": True},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
 
         generate_video.assert_awaited_once()
-        self.assertEqual(result["media_paths"], image_paths)
-        self.assertEqual(result["intro_video_summary"]["fallback_count"], 2)
-        self.assertEqual(
-            {
-                item["reason_code"]
-                for item in result["intro_video_summary"]["fallback_scenes"]
-            },
-            {"flow_credit_exhausted"},
-        )
-        self.assertIn(
-            "flow_video_credit_exhausted",
-            [stage for _, stage in progress_updates],
-        )
 
     def test_scene_media_submits_at_most_two_images_per_pass(self):
         from nexus_engine.services.google_flow_worker import FlowImagePending
@@ -2422,7 +3188,7 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertEqual(generate_video.await_count, 4)
         self.assertEqual(raised.exception.pending_video_scene_indices, [0, 1, 2, 3, 4, 5])
 
-    def test_scene_media_falls_back_when_veo_is_unsupported(self):
+    def test_scene_media_propagates_unsupported_veo_without_fallback(self):
         from nexus_engine.services.google_flow_worker import FlowModeError
 
         shared_worker = MagicMock()
@@ -2447,17 +3213,55 @@ class VideoProductionServiceTests(unittest.TestCase):
             ) as generate_video,
             patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
         ):
-            result = video_production.generate_scene_media(
-                video_id=42,
-                scenes=[{"index": 0, "prompt": "scene", "is_video": True}],
-                settings={"enable_intro_video": True},
-                progress=lambda message, stage: None,
-                cancel_check=lambda: None,
-            )
+            with self.assertRaises(FlowModeError):
+                video_production.generate_scene_media(
+                    video_id=42,
+                    scenes=[{"index": 0, "prompt": "scene", "is_video": True}],
+                    settings={"enable_intro_video": True},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
 
         generate_video.assert_awaited_once()
-        self.assertEqual(result["media_paths"], image_paths)
-        self.assertEqual(result["intro_video_summary"]["fallback_count"], 1)
+
+    def test_scene_media_propagates_agent_video_settings_error_without_fallback(self):
+        from nexus_engine.services.google_flow_worker import FlowAgentSettingsError
+
+        shared_worker = MagicMock()
+        image_path = Path(self.temporary_directory.name) / "settings-scene-0.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(image_path)
+
+        @asynccontextmanager
+        async def fake_session(video_id, *, force_new_project=False):
+            yield shared_worker
+
+        generate_video = AsyncMock(
+            side_effect=FlowAgentSettingsError("Không chọn được số lượng video Agent x1.")
+        )
+        with (
+            patch.object(video_production, "_flow_worker_session", fake_session),
+            patch.object(
+                video_production,
+                "_generate_scene_image_async",
+                AsyncMock(return_value=image_path),
+            ),
+            patch.object(
+                video_production,
+                "_generate_scene_video_async",
+                generate_video,
+            ),
+            patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
+        ):
+            with self.assertRaises(FlowAgentSettingsError):
+                video_production.generate_scene_media(
+                    video_id=43,
+                    scenes=[{"index": 0, "prompt": "scene", "is_video": True}],
+                    settings={"enable_intro_video": True},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
+
+        generate_video.assert_awaited_once()
 
     def test_scene_media_propagates_pending_video_without_image_fallback(self):
         from nexus_engine.services.google_flow_worker import FlowVideoPending
@@ -2490,11 +3294,13 @@ class VideoProductionServiceTests(unittest.TestCase):
                             "Flow is still processing scene 0",
                             queued_since="2026-10-18T01:00:00+00:00",
                             next_retry_at="2026-10-18T01:01:00+00:00",
+                            reconciliation_poll_count=15,
                         ),
                         FlowVideoPending(
                             "Flow is still processing scene 1",
                             queued_since="2026-10-18T01:00:05+00:00",
                             next_retry_at="2026-10-18T01:01:05+00:00",
+                            reconciliation_poll_count=15,
                         ),
                     ]
                 ),
@@ -2520,8 +3326,9 @@ class VideoProductionServiceTests(unittest.TestCase):
             raised.exception.queued_since,
             "2026-10-18T01:00:00+00:00",
         )
+        self.assertEqual(raised.exception.reconciliation_poll_count, 15)
 
-    def test_scene_media_separates_policy_failure_from_pending_scene(self):
+    def test_scene_media_propagates_policy_failure_without_fallback(self):
         from nexus_engine.services.google_flow_worker import (
             FlowGenerationError,
             FlowVideoPending,
@@ -2563,7 +3370,7 @@ class VideoProductionServiceTests(unittest.TestCase):
             ),
             patch.object(video_production, "cleanup_duplicate_scene_artifacts"),
         ):
-            with self.assertRaises(FlowVideoPending) as raised:
+            with self.assertRaises(FlowGenerationError):
                 video_production.generate_scene_media(
                     video_id=42,
                     scenes=[
@@ -2576,12 +3383,14 @@ class VideoProductionServiceTests(unittest.TestCase):
                     cancel_check=lambda: None,
                 )
 
-        self.assertEqual(generate_video.await_count, 2)
-        self.assertEqual(raised.exception.pending_scene_indices, [1])
+        self.assertEqual(generate_video.await_count, 1)
 
-    def test_scene_media_reuses_terminal_video_fallback_without_resubmit(self):
+    def test_scene_media_reuses_terminal_video_failure_without_resubmit(self):
         from PIL import Image
-        from nexus_engine.services.google_flow_worker import FlowModeError
+        from nexus_engine.services.google_flow_worker import (
+            FlowGenerationError,
+            FlowModeError,
+        )
 
         video_id = database.save_video(
             "https://www.youtube.com/watch?v=flow-video-checkpoint",
@@ -2645,13 +3454,14 @@ class VideoProductionServiceTests(unittest.TestCase):
             patch.object(video_production, "_flow_mock_enabled", return_value=False),
         )
         with common_patches[0], common_patches[1], common_patches[2], common_patches[3], common_patches[4]:
-            first_result = video_production.generate_scene_media(
-                video_id=video_id,
-                scenes=scenes,
-                settings={"enable_intro_video": True},
-                progress=lambda message, stage: None,
-                cancel_check=lambda: None,
-            )
+            with self.assertRaises(FlowModeError):
+                video_production.generate_scene_media(
+                    video_id=video_id,
+                    scenes=scenes,
+                    settings={"enable_intro_video": True},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
 
         self.assertEqual(worker.generate_scene_video.await_count, 1)
         self.assertEqual(
@@ -2667,8 +3477,6 @@ class VideoProductionServiceTests(unittest.TestCase):
                 "terminal"
             ]
         )
-        self.assertEqual(first_result["media_paths"], [first_video, image_paths[1], image_paths[2]])
-
         worker.generate_scene_video.reset_mock()
         worker.generate_scene_video.side_effect = None
         worker.generate_scene_video.return_value = "https://flow/video/scene-one"
@@ -2688,18 +3496,16 @@ class VideoProductionServiceTests(unittest.TestCase):
             patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
             patch.object(video_production, "_flow_mock_enabled", return_value=False),
         ):
-            result = video_production.generate_scene_media(
-                video_id=video_id,
-                scenes=scenes,
-                settings={"enable_intro_video": True},
-                progress=lambda message, stage: None,
-                cancel_check=lambda: None,
-            )
+            with self.assertRaises(FlowGenerationError):
+                video_production.generate_scene_media(
+                    video_id=video_id,
+                    scenes=scenes,
+                    settings={"enable_intro_video": True},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                )
 
         worker.generate_scene_video.assert_not_awaited()
-        self.assertEqual(result["media_paths"][0], first_video)
-        self.assertEqual(result["media_paths"][1], image_paths[1])
-        self.assertEqual(result["media_paths"][2], image_paths[2])
 
     def test_scene_image_retries_once_only_for_explicit_flow_error(self):
         from PIL import Image
@@ -3428,6 +4234,84 @@ class VideoProductionServiceTests(unittest.TestCase):
         self.assertEqual(completed["duration_seconds"], 8.0)
         self.assertNotIn("error", completed["metadata"])
         self.assertNotIn("reason_code", completed["metadata"])
+
+    def test_video_reconciliation_preserves_original_receipt_and_timeout(self):
+        from nexus_engine.services.google_flow_worker import FlowVideoPending
+
+        video_id = database.save_video(
+            "https://www.youtube.com/watch?v=flow-receipt-stability",
+            "Flow receipt stability",
+            "Transcript",
+            "Script",
+        )
+        start_frame = Path(self.temporary_directory.name) / "receipt-start.png"
+        end_frame = Path(self.temporary_directory.name) / "receipt-end.png"
+        Image.new("RGB", (1376, 768), color=(30, 40, 50)).save(start_frame)
+        Image.new("RGB", (1376, 768), color=(50, 40, 30)).save(end_frame)
+        submitted_at = dt.datetime.now(dt.timezone.utc)
+        original_receipt = {
+            "request_key": "original-request",
+            "media_type": "video",
+            "scene_index": 0,
+            "submitted_at": submitted_at.isoformat(),
+            "deadline_at": (submitted_at + dt.timedelta(seconds=600)).isoformat(),
+        }
+        refreshed_receipt = {
+            "request_key": "refreshed-request",
+            "submitted_at": (submitted_at + dt.timedelta(seconds=30)).isoformat(),
+            "deadline_at": (submitted_at + dt.timedelta(seconds=630)).isoformat(),
+            "ui_revision": "new-field",
+        }
+        worker = MagicMock()
+        worker.generate_scene_video = AsyncMock(
+            side_effect=[
+                FlowVideoPending("submitted", receipt=original_receipt),
+                FlowVideoPending("still pending", receipt=refreshed_receipt),
+            ]
+        )
+        worker.download_video = AsyncMock()
+        worker.get_last_video_timing.return_value = {}
+        worker.get_last_generation_receipt.return_value = refreshed_receipt
+        scene = {"index": 0, "prompt": "scene", "is_video": True}
+
+        def run_generation():
+            return asyncio.run(
+                video_production._generate_scene_video_async(
+                    video_id=video_id,
+                    scene=scene,
+                    scene_count=1,
+                    start_frame_path=start_frame,
+                    end_frame_path=end_frame,
+                    profile={},
+                    settings={"intro_video_max_wait_seconds": 600},
+                    progress=lambda message, stage: None,
+                    cancel_check=lambda: None,
+                    worker=worker,
+                )
+            )
+
+        with (
+            patch.object(video_production, "SCENES_DIR", Path(self.temporary_directory.name)),
+            patch.object(video_production, "_flow_mock_enabled", return_value=False),
+        ):
+            with self.assertRaises(FlowVideoPending):
+                run_generation()
+            first_pending = database.get_latest_video_artifact(video_id, "scene_video:0")
+            first_queued_since = first_pending["metadata"]["queued_since"]
+
+            with self.assertRaises(FlowVideoPending):
+                run_generation()
+
+        pending = database.get_latest_video_artifact(video_id, "scene_video:0")
+        persisted_receipt = pending["metadata"]["flow_receipt"]
+        self.assertEqual(persisted_receipt["request_key"], "original-request")
+        self.assertEqual(persisted_receipt["submitted_at"], original_receipt["submitted_at"])
+        self.assertEqual(persisted_receipt["deadline_at"], original_receipt["deadline_at"])
+        self.assertEqual(persisted_receipt["ui_revision"], "new-field")
+        self.assertEqual(pending["metadata"]["queued_since"], first_queued_since)
+        self.assertEqual(pending["metadata"]["reconciliation_poll_count"], 1)
+        self.assertTrue(worker.generate_scene_video.await_args.kwargs["reconcile_only"])
+        worker.get_last_generation_receipt.assert_not_called()
 
     def test_scene_video_rejects_duplicate_download_hash(self):
         video_id = database.save_video(

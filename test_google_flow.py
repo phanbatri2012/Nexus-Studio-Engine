@@ -47,7 +47,7 @@ class GoogleFlowAccountTests(unittest.TestCase):
         self.assertEqual(restored["password"], "plain-password-for-test")
         self.assertEqual(restored["session_cookies"][0]["value"], "cookie-for-test")
 
-    def test_credentials_require_a_valid_email(self):
+    def test_credentials_allow_profile_only_but_validate_provided_email(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             account_path = Path(temporary_directory) / "google_flow_account.json"
             with patch.object(
@@ -55,10 +55,10 @@ class GoogleFlowAccountTests(unittest.TestCase):
                 "GOOGLE_FLOW_ACCOUNT_PATH",
                 account_path,
             ):
-                with self.assertRaises(ValueError):
-                    google_flow_account.save_credentials(
-                        {"email": "", "password": "secret"}
-                    )
+                status = google_flow_account.save_credentials(
+                    {"email": "", "password": "secret"}
+                )
+                self.assertEqual(status["email"], "")
                 with self.assertRaises(ValueError):
                     google_flow_account.save_credentials(
                         {"email": "not-an-email", "password": "secret"}
@@ -204,7 +204,7 @@ class GoogleFlowEndpointTests(unittest.IsolatedAsyncioTestCase):
             result = await main.check_flow_login()
 
         self.assertTrue(result["success"])
-        acquire.assert_called_once_with()
+        acquire.assert_called_once_with("PROFILE_GOOGLE_FLOW_1")
         verify_session.assert_awaited_once_with(account)
         usage_lease.close.assert_called_once_with()
 

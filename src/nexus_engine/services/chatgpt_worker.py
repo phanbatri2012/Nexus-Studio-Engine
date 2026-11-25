@@ -511,6 +511,54 @@ def select_reusable_chapter_response(
     return ""
 
 
+
+
+def is_chatgpt_accessibility_or_boilerplate(text: str) -> bool:
+    """Check if text is purely an accessibility header or screen-reader boilerplate label."""
+    if not text:
+        return True
+    cleaned = text.strip().lower()
+    if cleaned in (
+        "chatgpt said:",
+        "chatgpt said",
+        "you said:",
+        "you said",
+        "latest response",
+        "response",
+        "assistant said:",
+        "assistant said",
+        "chatgpt can make mistakes. check important info.",
+        "chatgpt có thể mắc lỗi. hãy kiểm tra các thông tin quan trọng.",
+    ):
+        return True
+    if (
+        cleaned.startswith("chatgpt said:")
+        or cleaned.startswith("chatgpt said")
+        or cleaned.startswith("you said:")
+        or cleaned.startswith("latest response")
+    ) and len(cleaned.split()) <= 4:
+        return True
+    if (
+        cleaned.startswith("chatgpt can make mistakes")
+        or cleaned.startswith("chatgpt có thể mắc lỗi")
+    ) and len(cleaned.split()) <= 14:
+        return True
+    return False
+
+
+def strip_chatgpt_speech_header(text: str) -> str:
+    """Strip screen-reader accessibility prefixes like 'ChatGPT said:' or 'You said:' from text."""
+    if not text:
+        return ""
+    cleaned = re.sub(
+        r"^(?:chatgpt\s+said|you\s+said|latest\s+response)\s*[:：]?\s*",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip()
+
+
 def select_reusable_outline_response(
     conversation_turns: list[tuple[str, str]],
 ) -> str:
@@ -609,13 +657,19 @@ def get_visible_conversation_turns(page: Page) -> list[tuple[int, str]]:
     try:
         raw_turns = page.evaluate("""() => {
             const units = Array.from(document.querySelectorAll(
-                '[data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [class*="group/user-message"], .bg-user-message, div.MarkdownRoot-rZKhxa, [data-message-author-role], img[alt*="Generated image"], img[alt*="DALL"]'
-            ));
+                '[data-content-search-unit-key], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [class*="group/user-message"], .bg-user-message, div[class*="MarkdownRoot"], [data-message-author-role], img[alt*="Generated image"], img[alt*="DALL"]'
+            )).filter(unit => {
+                if (unit.classList && (unit.classList.contains('sr-only') || unit.className.includes('sr-only'))) return false;
+                if (unit.tagName === 'H4' || unit.tagName === 'H3') return false;
+                return true;
+            });
             const results = [];
             let currentTurn = 0;
             let lastRole = null;
             for (const unit of units) {
-                const isUser = unit.matches('[data-user-message-bubble="true"], [class*="group/user-message"], [class*="group/user-message"] *, .bg-user-message, .bg-user-message *')
+                const searchKey = (unit.getAttribute('data-content-search-unit-key') || unit.getAttribute('data-chatgpt-search-unit-key') || '').toLowerCase();
+                const isUser = searchKey.includes('user')
+                    || unit.matches('[data-user-message-bubble="true"], [class*="group/user-message"], [class*="group/user-message"] *, .bg-user-message, .bg-user-message *')
                     || unit.getAttribute('data-message-author-role') === 'user'
                     || (unit.getAttribute('data-conversation-role') || '') === 'user';
                 const role = isUser ? 'user' : 'assistant';
@@ -645,13 +699,17 @@ def get_latest_conversation_turn(page: Page, role: str) -> int:
 
 def get_assistant_message_count(page: Page) -> int:
     try:
+        search_unit_count = page.locator('[data-content-search-unit-key*="assistant"]').count()
+        if search_unit_count > 0:
+            return search_unit_count
         legacy_count = page.locator('[data-message-author-role="assistant"]').count()
         if legacy_count > 0:
             return legacy_count
         return page.evaluate("""() => {
-            return document.querySelectorAll(
-                '[data-markdown-text-style="assistant-message"]'
-            ).length;
+            const units = document.querySelectorAll(
+                '[data-content-search-unit-key*="assistant"], [data-markdown-text-style="assistant-message"], div[class*="MarkdownRoot"]'
+            );
+            return units.length;
         }""")
     except Exception:
         return 0
@@ -659,14 +717,16 @@ def get_assistant_message_count(page: Page) -> int:
 
 def get_user_message_count(page: Page) -> int:
     try:
+        search_unit_count = page.locator('[data-content-search-unit-key*="user"]').count()
+        if search_unit_count > 0:
+            return search_unit_count
+        user_bubble_count = page.locator('[data-user-message-bubble="true"]').count()
+        if user_bubble_count > 0:
+            return user_bubble_count
         legacy_count = page.locator('[data-message-author-role="user"]').count()
         if legacy_count > 0:
             return legacy_count
-        return page.evaluate("""() => {
-            return document.querySelectorAll(
-                '[data-user-message-bubble="true"]'
-            ).length;
-        }""")
+        return 0
     except Exception:
         return 0
 
@@ -2255,6 +2315,9 @@ def clean_text(text: str) -> str:
     # 1. Decode HTML entities (e.g. &#124; -> |, &quot; -> ", &amp; -> &, &#39; -> ', etc.)
     text = html.unescape(text)
 
+    # 1b. Strip ChatGPT reasoning / escape tag delimiters (e.g. <escape>...</escape>)
+    text = re.sub(r"</?escape>", "", text, flags=re.IGNORECASE)
+
     # 2. Normalize special Unicode spaces and characters (\u00a0 -> space, remove zero-width chars)
     text = text.replace("\u00a0", " ").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
     text = unicodedata.normalize("NFKC", text)
@@ -2305,6 +2368,8 @@ def clean_text(text: str) -> str:
         lower_line = stripped.lower()
         if lower_line == "edit" or lower_line.startswith(":::") or lower_line == ":::":
             continue
+        if lower_line in ("chatgpt said:", "chatgpt said", "you said:", "you said", "latest response"):
+            continue
         if section_delimiter_line.match(stripped):
             continue
         if any(lower_line.startswith(kw) for kw in skip_keywords):
@@ -2326,6 +2391,7 @@ def clean_text(text: str) -> str:
     result = re.sub(r"^\s*:::\s*", "", result)
     # Remove trailing Canvas Action Pills or suggestions attached to narrative ends
     result = TRAILING_ACTION_PILLS_PATTERN.sub(r'\1', result).strip()
+    result = re.sub(r'^(?:chatgpt\s+said|you\s+said|latest\s+response)\s*[:：]?\s*', '', result, flags=re.IGNORECASE).strip()
     return result
 
 
@@ -2827,6 +2893,13 @@ def _extract_clean_markdown_text(node) -> str:
 
 
 def _read_assistant_message(message) -> str:
+    try:
+        class_name = message.get_attribute("class") or ""
+        if "sr-only" in class_name:
+            return ""
+    except Exception:
+        pass
+
     markdown_nodes = message.locator(
         '.markdown, [data-markdown-text-style="assistant-message"], [class*="MarkdownRoot"]'
     )
@@ -2847,11 +2920,13 @@ def _read_assistant_message(message) -> str:
                 if markdown_count == 1
                 else markdown_nodes.nth(index)
             )
-            markdown_text = _extract_clean_markdown_text(markdown_node)
+            raw_text = _extract_clean_markdown_text(markdown_node)
+            markdown_text = strip_chatgpt_speech_header(raw_text)
         except Exception:
             continue
         if (
             markdown_text
+            and not is_chatgpt_accessibility_or_boilerplate(markdown_text)
             and not _is_pure_thinking_indicator(markdown_text)
             and not looks_like_editorial_artifact(markdown_text)
             and markdown_text not in markdown_parts
@@ -2871,7 +2946,7 @@ def _read_assistant_message(message) -> str:
     if markdown_parts:
         valid_parts = [
             p for p in markdown_parts
-            if p and not _is_pure_thinking_indicator(p) and not looks_like_editorial_artifact(p)
+            if p and not _is_pure_thinking_indicator(p) and not looks_like_editorial_artifact(p) and not is_chatgpt_accessibility_or_boilerplate(p)
         ]
         if valid_parts:
             has_substantive = any(
@@ -2885,8 +2960,14 @@ def _read_assistant_message(message) -> str:
                 ]
             if valid_parts:
                 return "\n\n".join(valid_parts)
-    fallback = _extract_clean_markdown_text(message)
-    if _is_pure_thinking_indicator(fallback) or looks_like_editorial_artifact(fallback):
+    raw_fallback = _extract_clean_markdown_text(message)
+    fallback = strip_chatgpt_speech_header(raw_fallback)
+    if (
+        not fallback
+        or is_chatgpt_accessibility_or_boilerplate(fallback)
+        or _is_pure_thinking_indicator(fallback)
+        or looks_like_editorial_artifact(fallback)
+    ):
         return ""
     return fallback
 
@@ -2894,6 +2975,21 @@ def _read_assistant_message(message) -> str:
 def _get_message_node_role(node) -> str:
     """Extract role string ('user' or 'assistant') from DOM node attributes."""
     try:
+        class_name = node.get_attribute("class") or ""
+        # Screen-reader headings (e.g. h4.sr-only) must NEVER be treated as message turns
+        if "sr-only" in class_name:
+            return ""
+
+        search_key = (
+            node.get_attribute("data-content-search-unit-key")
+            or node.get_attribute("data-chatgpt-search-unit-key")
+            or ""
+        ).lower()
+        if "assistant" in search_key:
+            return "assistant"
+        if "user" in search_key:
+            return "user"
+
         role = (
             node.get_attribute("data-message-author-role")
             or node.get_attribute("data-conversation-role")
@@ -2903,6 +2999,8 @@ def _get_message_node_role(node) -> str:
         if node.get_attribute("data-user-message-bubble") == "true":
             return "user"
         if node.get_attribute("data-markdown-text-style") == "assistant-message":
+            return "assistant"
+        if "MarkdownRoot" in class_name:
             return "assistant"
     except Exception:
         pass
@@ -2916,7 +3014,7 @@ def get_assistant_response_after_latest_user(
     """Read the reply following the latest user message without count baselines."""
     try:
         messages = page.locator(
-            '[data-message-author-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"]'
+            '[data-content-search-unit-key], [data-message-author-role], [data-conversation-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], div[class*="MarkdownRoot"]'
         )
         try:
             msg_count = messages.count()
@@ -2954,6 +3052,8 @@ def get_assistant_response_after_latest_user(
         data = page.evaluate("""() => {
             const cleanNode = (el) => {
                 if (!el) return '';
+                if (el.classList && (el.classList.contains('sr-only') || el.className.includes('sr-only'))) return '';
+                if (el.tagName === 'H4' || el.tagName === 'H3') return '';
                 const clone = el.cloneNode(true);
                 clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [data-testid*="thought-summary"], [class*="thought"], [class*="reasoning"], [class*="thinking"], [class*="thought-summary"], [class*="thought_summary"], [class*="reasoning-summary"], [class*="reasoning_summary"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
                 clone.querySelectorAll('.katex').forEach((kEl) => {
@@ -2986,17 +3086,24 @@ def get_assistant_response_after_latest_user(
             };
 
             const allNodes = [...document.querySelectorAll(
-                '[data-user-message-bubble="true"], [data-message-author-role="user"], [data-markdown-text-style="assistant-message"], [data-message-author-role="assistant"]'
+                '[data-user-message-bubble="true"], [data-content-search-unit-key], [data-message-author-role], [data-markdown-text-style="assistant-message"], [data-conversation-role], div[class*="MarkdownRoot"]'
             )];
-            const topLevel = allNodes.filter((el, idx) => !allNodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
+            const topLevel = allNodes.filter((el, idx) => {
+                if (el.classList && (el.classList.contains('sr-only') || el.className.includes('sr-only'))) return false;
+                if (el.tagName === 'H4' || el.tagName === 'H3') return false;
+                return !allNodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el));
+            });
 
             return topLevel.map(u => {
-                const isUser = u.getAttribute('data-user-message-bubble') === 'true'
-                    || (u.getAttribute('data-message-author-role') || '').toLowerCase() === 'user'
-                    || (u.getAttribute('data-conversation-role') || '').toLowerCase() === 'user';
-                const isAssistant = u.getAttribute('data-markdown-text-style') === 'assistant-message'
-                    || (u.getAttribute('data-message-author-role') || '').toLowerCase() === 'assistant'
-                    || (u.getAttribute('data-conversation-role') || '').toLowerCase() === 'assistant';
+                const searchKey = (u.getAttribute('data-content-search-unit-key') || u.getAttribute('data-chatgpt-search-unit-key') || '').toLowerCase();
+                const convRole = (u.getAttribute('data-conversation-role') || u.getAttribute('data-message-author-role') || '').toLowerCase();
+                const isUser = convRole === 'user'
+                    || searchKey.includes('user')
+                    || u.getAttribute('data-user-message-bubble') === 'true';
+                const isAssistant = convRole === 'assistant'
+                    || searchKey.includes('assistant')
+                    || u.getAttribute('data-markdown-text-style') === 'assistant-message'
+                    || (u.className && u.className.includes('MarkdownRoot'));
                 return {
                     role: isUser ? 'user' : (isAssistant ? 'assistant' : ''),
                     text: cleanNode(u)
@@ -3060,7 +3167,7 @@ def get_new_assistant_response(
 
             if turn_exists:
                 assistant_nodes = turn.locator(
-                    '[data-message-author-role="assistant"], [data-markdown-text-style="assistant-message"], .markdown'
+                    '[data-content-search-unit-key*="assistant"], div[class*="MarkdownRoot"], [data-markdown-text-style="assistant-message"], [data-message-author-role="assistant"], .markdown'
                 )
                 try:
                     assistant_count = assistant_nodes.count()
@@ -3069,14 +3176,14 @@ def get_new_assistant_response(
                     has_nodes = True
                 if has_nodes:
                     response_text = _read_assistant_message(assistant_nodes.last)
-                    if response_text:
+                    if response_text and not is_chatgpt_accessibility_or_boilerplate(response_text):
                         return response_text
 
         # Compatibility fallback for ChatGPT DOM variants without numbered
         # turns. The count baseline survives React DOM re-renders, unlike a
         # temporary CSS marker attached to old message nodes.
         assistant_messages = page.locator(
-            '[data-message-author-role="assistant"], [data-markdown-text-style="assistant-message"]'
+            '[data-content-search-unit-key*="assistant"], div[class*="MarkdownRoot"], [data-markdown-text-style="assistant-message"], [data-message-author-role="assistant"]'
         )
         assistant_count = assistant_messages.count()
         if (
@@ -3087,7 +3194,10 @@ def get_new_assistant_response(
             )
         ):
             return ""
-        return _read_assistant_message(assistant_messages.last)
+        candidate = _read_assistant_message(assistant_messages.last)
+        if candidate and not is_chatgpt_accessibility_or_boilerplate(candidate):
+            return candidate
+        return ""
     except Exception:
         return ""
 
@@ -3324,6 +3434,7 @@ def _extract_correlated_descendant_response(
     current_node: str,
     correlation_field: str,
     correlation_value: object,
+    excluded_message_ids: set[str] | frozenset[str] | None = None,
 ) -> str:
     candidates: list[str] = []
     for node_id, node in mapping.items():
@@ -3331,6 +3442,9 @@ def _extract_correlated_descendant_response(
             continue
         message = node.get("message")
         if not isinstance(message, dict):
+            continue
+        msg_id = str(message.get("id") or node_id or "")
+        if excluded_message_ids and msg_id in excluded_message_ids:
             continue
         if _get_payload_message_metadata(message).get(correlation_field) != correlation_value:
             continue
@@ -3368,30 +3482,35 @@ def _extract_correlated_descendant_response(
 def _extract_payload_response_after_user(
     messages: list[dict],
     expected_user_text: str,
+    excluded_message_ids: set[str] | frozenset[str] | None = None,
 ) -> str:
-    latest_user_index = -1
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
         if _get_payload_message_role(message) != "user":
             continue
         user_text = _get_payload_content_text(message)
-        if not expected_user_text or history_prompt_text_matches(
+        if expected_user_text and not history_prompt_text_matches(
             expected_user_text,
             user_text,
         ):
-            latest_user_index = index
-            break
-    if latest_user_index < 0:
-        return ""
-
-    response_text = ""
-    for message in messages[latest_user_index + 1:]:
-        if _get_payload_message_role(message) == "user":
-            break
-        candidate = _get_completed_payload_assistant_text(message)
-        if candidate and not _is_pure_thinking_indicator(candidate):
-            response_text = candidate
-    return response_text
+            continue
+        response_text = ""
+        for following in messages[index + 1:]:
+            if _get_payload_message_role(following) == "user":
+                break
+            msg_id = str(following.get("id") or "")
+            if excluded_message_ids and msg_id in excluded_message_ids:
+                continue
+            candidate = _get_completed_payload_assistant_text(following)
+            if candidate and not _is_pure_thinking_indicator(candidate):
+                response_text = candidate
+        if response_text:
+            return response_text
+        if excluded_message_ids:
+            # The matching turn has no unexcluded assistant reply yet; do not
+            # fall back to an earlier identical prompt turn.
+            return ""
+    return ""
 
 
 def _log_payload_recovery_selection(
@@ -3412,6 +3531,7 @@ def _log_payload_recovery_selection(
 def extract_assistant_response_from_conversation_payload(
     payload: dict,
     expected_user_text: str,
+    excluded_message_ids: set[str] | frozenset[str] | None = None,
 ) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -3489,6 +3609,7 @@ def extract_assistant_response_from_conversation_payload(
             branch_response = _extract_payload_response_after_user(
                 list(reversed(branch)),
                 expected_user_text,
+                excluded_message_ids=excluded_message_ids,
             )
             if branch_response:
                 _log_payload_recovery_selection(
@@ -3521,6 +3642,7 @@ def extract_assistant_response_from_conversation_payload(
             exchange_response = _extract_payload_response_after_user(
                 exchange_messages,
                 expected_user_text,
+                excluded_message_ids=excluded_message_ids,
             )
             if exchange_response:
                 _log_payload_recovery_selection(
@@ -3537,6 +3659,7 @@ def extract_assistant_response_from_conversation_payload(
                     current_node,
                     correlation_field,
                     correlation_value,
+                    excluded_message_ids=excluded_message_ids,
                 )
                 if isinstance(mapping, dict)
                 else ""
@@ -3565,9 +3688,14 @@ def extract_assistant_response_from_conversation_payload(
             if _get_payload_message_role(message) == "user"
         ]
         latest_user = preceding_users[-1] if preceding_users else None
-        if latest_user is not None and history_prompt_text_matches(
-            expected_user_text,
-            _get_payload_content_text(latest_user),
+        current_msg_id = str(current_message.get("id") or "")
+        if (
+            latest_user is not None
+            and not (excluded_message_ids and current_msg_id in excluded_message_ids)
+            and history_prompt_text_matches(
+                expected_user_text,
+                _get_payload_content_text(latest_user),
+            )
         ):
             current_response = _get_completed_payload_assistant_text(
                 current_message,
@@ -3585,7 +3713,11 @@ def extract_assistant_response_from_conversation_payload(
     response_text = (
         ""
         if current_node
-        else _extract_payload_response_after_user(messages, expected_user_text)
+        else _extract_payload_response_after_user(
+            messages,
+            expected_user_text,
+            excluded_message_ids=excluded_message_ids,
+        )
     )
     if (
         not response_text
@@ -3598,7 +3730,11 @@ def extract_assistant_response_from_conversation_payload(
             if isinstance(node, dict) and isinstance(node.get("message"), dict)
         ]
         all_msgs.sort(key=lambda m: float(m.get("create_time") or 0.0))
-        fallback_resp = _extract_payload_response_after_user(all_msgs, expected_user_text)
+        fallback_resp = _extract_payload_response_after_user(
+            all_msgs,
+            expected_user_text,
+            excluded_message_ids=excluded_message_ids,
+        )
         if fallback_resp and not _is_pure_thinking_indicator(fallback_resp):
             _log_payload_recovery_selection(
                 len(messages),
@@ -3652,6 +3788,41 @@ def _accept_or_recover_assistant_response(
     return response_text
 
 
+def has_empty_dil_renderer(page: Page) -> bool:
+    """Return True when ChatGPT renders an empty DilRenderer shell instead of DOM prose."""
+    try:
+        result = page.evaluate("""() => {
+            const containers = [...document.querySelectorAll('[data-dil-response], [data-dil-source-message-id]')];
+            if (!containers.length) return false;
+            const last = containers[containers.length - 1];
+            const host = last.closest('[data-markdown-text-style="assistant-message"]') || last;
+            return ((host.innerText || host.textContent || '').trim() === '');
+        }""")
+        return isinstance(result, bool) and result
+    except Exception:
+        return False
+
+
+def _get_dom_message_ids(page: Page) -> set[str]:
+    """Snapshot message IDs visible in the DOM before submitting a prompt."""
+    try:
+        ids = page.evaluate("""() => {
+            const out = [];
+            document.querySelectorAll('[data-message-id], [data-dil-source-message-id], [data-dil-message-id]').forEach((el) => {
+                for (const attr of ['data-message-id', 'data-dil-source-message-id', 'data-dil-message-id']) {
+                    const val = (el.getAttribute(attr) || '').trim();
+                    if (val) out.push(val);
+                }
+            });
+            return out;
+        }""")
+        if isinstance(ids, list):
+            return {str(item).strip() for item in ids if isinstance(item, str) and item.strip()}
+    except Exception:
+        pass
+    return set()
+
+
 def wait_for_assistant_response(
     page: Page,
     previous_assistant_turn: int,
@@ -3661,6 +3832,7 @@ def wait_for_assistant_response(
     previous_user_turn: int | None = None,
     previous_user_count: int | None = None,
     submitted_prompt_text: str = "",
+    excluded_message_ids: set[str] | frozenset[str] | None = None,
 ) -> str:
     """Wait for a new response without relying only on the stop button."""
     started_at = time.monotonic()
@@ -3669,8 +3841,20 @@ def wait_for_assistant_response(
     last_response = ""
     last_change_at = started_at
     saw_busy_state = False
-    last_backend_poll_at = 0.0
     backend_poll_interval = 4.0
+    last_backend_poll_at = started_at - backend_poll_interval
+
+    def _poll_backend() -> str:
+        if excluded_message_ids:
+            return recover_assistant_response_from_backend(
+                page,
+                expected_user_text=submitted_prompt_text,
+                excluded_message_ids=excluded_message_ids,
+            )
+        return recover_assistant_response_from_backend(
+            page,
+            expected_user_text=submitted_prompt_text,
+        )
 
     while True:
         accept_external_app_permission_dialog(page)
@@ -3678,20 +3862,20 @@ def wait_for_assistant_response(
         saw_busy_state = saw_busy_state or busy
         now = time.monotonic()
 
-        # 1. Periodic background API polling if DOM is degraded, crashed, thinking, or generation stopped
+        # 1. Periodic background API polling if DOM is degraded, crashed, thinking,
+        # DilRenderer-empty, or generation stopped
         render_crashed = is_chatgpt_render_error_present(page)
+        dil_empty = not last_response and not busy and has_empty_dil_renderer(page)
         should_poll_backend = (
             render_crashed
             or (last_response and (looks_like_chatgpt_error(last_response) or _is_pure_thinking_indicator(last_response)))
             or (saw_busy_state and not busy)
+            or (dil_empty and now - started_at >= 2.0)
             or (now - started_at >= 15.0 and not last_response)
         )
         if should_poll_backend and (now - last_backend_poll_at >= backend_poll_interval):
             last_backend_poll_at = now
-            backend_text = recover_assistant_response_from_backend(
-                page,
-                expected_user_text=submitted_prompt_text,
-            )
+            backend_text = _poll_backend()
             if backend_text and not _is_pure_thinking_indicator(backend_text):
                 return backend_text
 
@@ -3722,8 +3906,13 @@ def wait_for_assistant_response(
             else ASSISTANT_RESPONSE_STABLE_SECONDS
         )
         has_verified_new_turn = saw_busy_state or is_new_turn_node or (now - started_at >= 10.0)
-        if (
+        is_substantive_response = bool(
             last_response
+            and not is_chatgpt_accessibility_or_boilerplate(last_response)
+            and len(last_response.split()) >= 3
+        )
+        if (
+            is_substantive_response
             and has_verified_new_turn
             and not _is_pure_thinking_indicator(last_response)
             and not looks_like_chatgpt_error(last_response)
@@ -3748,10 +3937,7 @@ def wait_for_assistant_response(
 
         # 5. Handle timeout
         if now >= deadline:
-            recovered_response = recover_assistant_response_from_backend(
-                page,
-                submitted_prompt_text,
-            ) or recover_assistant_response_after_reload(
+            recovered_response = _poll_backend() or recover_assistant_response_after_reload(
                 page,
                 submitted_prompt_text,
             )
@@ -3787,8 +3973,8 @@ def wait_for_existing_assistant_response(
     last_response = ""
     last_change_at = started_at
     saw_busy_state = False
-    last_backend_poll_at = 0.0
     backend_poll_interval = 4.0
+    last_backend_poll_at = started_at - backend_poll_interval
 
     while True:
         accept_external_app_permission_dialog(page)
@@ -3825,8 +4011,13 @@ def wait_for_existing_assistant_response(
             if saw_busy_state
             else ASSISTANT_RESPONSE_STABLE_SECONDS
         )
-        if (
+        is_substantive_response = bool(
             last_response
+            and not is_chatgpt_accessibility_or_boilerplate(last_response)
+            and len(last_response.split()) >= 3
+        )
+        if (
+            is_substantive_response
             and not _is_pure_thinking_indicator(last_response)
             and not looks_like_chatgpt_error(last_response)
             and not render_crashed
@@ -3913,14 +4104,22 @@ def fetch_chatgpt_conversation_payload(page: Page, conversation_id: str = "") ->
     return {}
 
 
-def recover_assistant_response_from_backend(page: Page, expected_user_text: str = "") -> str:
+def recover_assistant_response_from_backend(
+    page: Page,
+    expected_user_text: str = "",
+    excluded_message_ids: set[str] | frozenset[str] | None = None,
+) -> str:
     """Attempt direct API payload extraction from OpenAI backend without reloading page."""
     conv_id = _get_conversation_id_from_url(page.url)
     if not conv_id:
         return ""
     payload = fetch_chatgpt_conversation_payload(page, conv_id)
     if payload:
-        response = extract_assistant_response_from_conversation_payload(payload, expected_user_text)
+        response = extract_assistant_response_from_conversation_payload(
+            payload,
+            expected_user_text,
+            excluded_message_ids=excluded_message_ids,
+        )
         if (
             response
             and not looks_like_chatgpt_error(response)
@@ -4065,6 +4264,8 @@ def get_reusable_chapter_response(page: Page) -> str:
         """() => {
             const cleanNode = (el) => {
                 if (!el) return '';
+                if (el.classList && (el.classList.contains('sr-only') || el.className.includes('sr-only'))) return '';
+                if (el.tagName === 'H4' || el.tagName === 'H3') return '';
                 const clone = el.cloneNode(true);
                 clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [data-testid*="thought-summary"], [class*="thought"], [class*="reasoning"], [class*="thinking"], [class*="thought-summary"], [class*="thought_summary"], [class*="reasoning-summary"], [class*="reasoning_summary"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
                 clone.querySelectorAll('.katex').forEach((kEl) => {
@@ -4096,8 +4297,12 @@ def get_reusable_chapter_response(page: Page) -> str:
                 return (clone.innerText || clone.textContent || '').trim();
             };
             const nodes = [...document.querySelectorAll(
-                '[data-message-author-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [data-conversation-role]'
-            )];
+                '[data-content-search-unit-key], [data-message-author-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [data-conversation-role], div[class*="MarkdownRoot"]'
+            )].filter(el => {
+                if (el.classList && (el.classList.contains('sr-only') || el.className.includes('sr-only'))) return false;
+                if (el.tagName === 'H4' || el.tagName === 'H3') return false;
+                return true;
+            });
             const unique = nodes.filter((el, idx) => !nodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
             return unique.map(el => {
                 let role = el.getAttribute('data-message-author-role') || el.getAttribute('data-conversation-role') || '';
@@ -4137,6 +4342,8 @@ def get_reusable_outline_response(page: Page) -> str:
         """() => {
             const cleanNode = (el) => {
                 if (!el) return '';
+                if (el.classList && (el.classList.contains('sr-only') || el.className.includes('sr-only'))) return '';
+                if (el.tagName === 'H4' || el.tagName === 'H3') return '';
                 const clone = el.cloneNode(true);
                 clone.querySelectorAll('button, .sr-only, [data-testid*="citation"], sup.citation, header, [class*="header-"], [class*="editorControls"], [class*="suggestion"], [class*="pill"], [data-testid*="thought"], [data-testid*="reasoning"], [data-testid*="thinking"], [data-testid*="thought-summary"], [class*="thought"], [class*="reasoning"], [class*="thinking"], [class*="thought-summary"], [class*="thought_summary"], [class*="reasoning-summary"], [class*="reasoning_summary"], .result-thinking, [data-testid*="search"], [data-testid*="web-search"], [class*="web-search"], details, summary').forEach(b => b.remove());
                 clone.querySelectorAll('.katex').forEach((kEl) => {
@@ -4168,8 +4375,12 @@ def get_reusable_outline_response(page: Page) -> str:
                 return (clone.innerText || clone.textContent || '').trim();
             };
             const nodes = [...document.querySelectorAll(
-                '[data-message-author-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [data-conversation-role]'
-            )];
+                '[data-content-search-unit-key], [data-message-author-role], [data-user-message-bubble="true"], [data-markdown-text-style="assistant-message"], [data-conversation-role], div[class*="MarkdownRoot"]'
+            )].filter(el => {
+                if (el.classList && (el.classList.contains('sr-only') || el.className.includes('sr-only'))) return false;
+                if (el.tagName === 'H4' || el.tagName === 'H3') return false;
+                return true;
+            });
             const unique = nodes.filter((el, idx) => !nodes.some((other, otherIdx) => otherIdx !== idx && other.contains(el)));
             return unique.map(el => {
                 let role = el.getAttribute('data-message-author-role') || el.getAttribute('data-conversation-role') || '';
@@ -4403,6 +4614,7 @@ def send_prompt(
     previous_assistant_count = get_assistant_message_count(page)
     previous_user_turn = get_latest_conversation_turn(page, "user")
     previous_user_count = get_user_message_count(page)
+    previous_message_ids = _get_dom_message_ids(page)
 
     # Mark existing messages so we can identify the new one
     page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-markdown-text-style=\"assistant-message\"]').forEach(el => el.classList.add('my-old-msg'))")
@@ -4619,6 +4831,7 @@ def send_prompt(
         previous_user_turn=previous_user_turn,
         previous_user_count=previous_user_count,
         submitted_prompt_text=prompt_text,
+        excluded_message_ids=previous_message_ids,
         allow_empty_response=allow_empty_response,
     )
 
@@ -5973,12 +6186,26 @@ def _run_dialogue_pre_audio_pipeline(
 
     if os.environ.get("CASTING_MANIFEST_REQUIRED", "").strip() == "1":
         print("[DIALOGUE] >>> CASTING MANIFEST", file=sys.stderr)
-        generate_casting_manifest(
-            page,
-            state,
-            prompts,
-            required=True,
-        )
+        try:
+            generate_casting_manifest(
+                page,
+                state,
+                prompts,
+                required=True,
+            )
+        except Exception as manifest_exc:
+            print(
+                f"[DIALOGUE] Warning: Casting manifest generation failed ({manifest_exc}); "
+                "falling back to heuristic manifest to preserve downstream metadata & thumbnails.",
+                file=sys.stderr,
+            )
+            script = build_dialogue_video_script(state)
+            state["casting_manifest"] = {
+                "speakers": auto_casting.build_speaker_manifest(script)
+            }
+            clear_pending_generation_prompt(state, "casting manifest", "")
+            clear_pending_generation_prompt(state, "casting manifest retry", "")
+            persist_generation_state(state)
 
     # Step 6: Tiêu đề (Title)
     if pipeline.get("title", True) and not state.get("title"):

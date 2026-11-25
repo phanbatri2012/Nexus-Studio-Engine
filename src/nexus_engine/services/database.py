@@ -5795,6 +5795,7 @@ SCHEDULED_RETRY_JOB_TYPES = frozenset(
         "comment_draft",
         "flow_media_generation",
         "muse_media_generation",
+        "full_movie_thumbnail",
     }
 )
 
@@ -9194,6 +9195,47 @@ VIDEO_PRODUCTION_MUTABLE_FIELDS = {
     "flow_scene_count",
     "flow_completed_scenes",
 }
+
+
+def list_orphaned_active_render_videos() -> list[dict]:
+    """Return active render states that no longer have a coordinating job."""
+    active_render_states = (
+        "queued",
+        "running",
+        "retry_wait",
+        "processing",
+        "rendering",
+        "media_generation",
+        "generating",
+        "pending",
+    )
+    placeholders = ", ".join("?" for _ in active_render_states)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT videos.*
+            FROM videos
+            WHERE render_status IN ({placeholders})
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM system_jobs
+                  WHERE system_jobs.video_id = videos.id
+                    AND system_jobs.job_type IN (
+                        'flow_media_generation',
+                        'muse_media_generation',
+                        'video_render'
+                    )
+                    AND system_jobs.status IN ('queued', 'running', 'retry_wait', 'paused')
+              )
+            ORDER BY videos.id
+            """,
+            active_render_states,
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
 
 
 def update_video_production(video_id: int, **changes) -> dict | None:

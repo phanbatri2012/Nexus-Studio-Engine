@@ -100,6 +100,10 @@ from nexus_engine.services import (
     browser_youtube_uploader,
     chatgpt_projects,
     competitor_radar,
+    full_movie_pipeline,
+    full_movie_thumbnail_pipeline,
+    full_movie_thumbnail_worker,
+    full_movie_worker,
     prompt_assets,
     publication_scheduler,
     production_coordinator as production_coordinator_service,
@@ -112,6 +116,7 @@ from nexus_engine.services import (
     short_video_worker,
     script_body_regeneration,
     source_voice_analyzer,
+    subtitle_layout,
     video_qc,
     video_production,
     youtube_comments,
@@ -333,6 +338,9 @@ def _wake_chatgpt_dependent_queues() -> None:
     comment_queue_kicker = globals().get("_kick_comment_queue")
     if comment_queue_kicker:
         comment_queue_kicker()
+    thumbnail_queue_kicker = globals().get("full_movie_thumbnail_worker")
+    if thumbnail_queue_kicker:
+        thumbnail_queue_kicker.kick()
 
 
 shared_chatgpt_runtime.set_finish_callback(_wake_chatgpt_dependent_queues)
@@ -427,7 +435,7 @@ class PromptImageGenerationData(BaseModel):
     thumbnail_variant: Literal["with_text", "without_text"] = "with_text"
     scene_0_source: Literal["from_thumbnail_without_text", "from_thumbnail_with_text", "from_intro_transcript"] = "from_thumbnail_without_text"
     enable_intro_video: bool = True
-    intro_scene_target_seconds: float = 8.0
+    intro_scene_target_seconds: float = Field(default=8.0, ge=8.0, le=10.0)
     intro_crop_watermark: bool = True
     intro_video_max_wait_seconds: int = Field(default=900, ge=60, le=3600)
     intro_video_max_in_flight: int = Field(default=4, ge=1, le=12)
@@ -895,6 +903,30 @@ class YouTubeDownloadRequest(BaseModel):
     destination: str = Field(min_length=1, max_length=32767)
     videos: List[YouTubeDownloadVideoRequest] = Field(min_length=1, max_length=500)
     number_folders: bool = False
+
+
+class FullMoviePathRequest(BaseModel):
+    source_path: str = Field(min_length=1, max_length=32767)
+
+
+class FullMovieCreateRequest(BaseModel):
+    source_path: str = Field(min_length=1, max_length=32767)
+    ordered_source_names: List[str] = Field(default_factory=list, max_length=2000)
+
+
+class FullMovieThumbnailCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+    movie_path: str = Field(min_length=1, max_length=32767)
+
+
+class FullMovieEpisodeApproval(BaseModel):
+    source_name: str = Field(min_length=1, max_length=1024)
+    title_us: str = Field(min_length=1, max_length=500)
+
+
+class FullMovieApprovalRequest(BaseModel):
+    movie_title_us: str = Field(min_length=1, max_length=500)
+    episodes: List[FullMovieEpisodeApproval] = Field(min_length=1, max_length=2000)
 
 
 class YouTubeOAuthConfigRequest(BaseModel):
@@ -3249,6 +3281,140 @@ def choose_youtube_download_folder():
     }
 
 
+@app.post("/api/full-movie/select-folder")
+def choose_full_movie_folder():
+    try:
+        selected = full_movie_pipeline.select_source_folder()
+    except full_movie_pipeline.FullMovieError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"success": True, **selected}
+
+
+@app.post("/api/full-movie/scan")
+def scan_full_movie_folder(request: FullMoviePathRequest):
+    try:
+        scan = full_movie_pipeline.scan_folder(request.source_path)
+    except full_movie_pipeline.FullMovieError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "scan": scan}
+
+
+@app.post("/api/full-movie/jobs")
+def create_full_movie_job(request: FullMovieCreateRequest):
+    try:
+        job, created = full_movie_pipeline.create_job(
+            request.source_path,
+            request.ordered_source_names,
+        )
+    except full_movie_pipeline.FullMovieError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    full_movie_worker.kick()
+    return {
+        "success": True,
+        "created": created,
+        "job": full_movie_pipeline.public_job(job),
+    }
+
+
+@app.get("/api/full-movie/jobs/latest")
+def get_latest_full_movie_job():
+    jobs = db.list_system_jobs(
+        limit=1,
+        job_type=full_movie_worker.JOB_TYPE,
+    )
+    return {
+        "success": True,
+        "job": full_movie_pipeline.public_job(jobs[0]) if jobs else None,
+    }
+
+
+@app.get("/api/full-movie/jobs/{job_id}")
+def get_full_movie_job(job_id: str):
+    job = db.get_system_job(job_id)
+    if not job or str(job.get("job_type") or "") != full_movie_worker.JOB_TYPE:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job ghép phim.")
+    return {"success": True, "job": full_movie_pipeline.public_job(job)}
+
+
+@app.post("/api/full-movie/jobs/{job_id}/approve")
+def approve_full_movie_names(job_id: str, request: FullMovieApprovalRequest):
+    try:
+        job = full_movie_pipeline.approve_job(
+            job_id,
+            request.movie_title_us,
+            [episode.model_dump() for episode in request.episodes],
+        )
+    except full_movie_pipeline.FullMovieAttentionRequired as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except full_movie_pipeline.FullMovieError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    full_movie_worker.kick()
+    return {"success": True, "job": full_movie_pipeline.public_job(job)}
+
+
+@app.post("/api/full-movie/thumbnail/select-video")
+def choose_full_movie_thumbnail_video():
+    try:
+        selected = full_movie_thumbnail_pipeline.select_video_file()
+    except full_movie_thumbnail_pipeline.FullMovieThumbnailError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"success": True, **selected}
+
+
+@app.post("/api/full-movie/thumbnail/jobs")
+def create_full_movie_thumbnail_job(request: FullMovieThumbnailCreateRequest):
+    try:
+        job, created = full_movie_thumbnail_pipeline.create_job(
+            request.title,
+            request.movie_path,
+        )
+    except full_movie_thumbnail_pipeline.FullMovieThumbnailError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    full_movie_thumbnail_worker.kick()
+    return {
+        "success": True,
+        "created": created,
+        "job": full_movie_thumbnail_pipeline.public_job(job),
+    }
+
+
+@app.get("/api/full-movie/thumbnail/jobs/latest")
+def get_latest_full_movie_thumbnail_job():
+    jobs = db.list_system_jobs(
+        limit=1,
+        job_type=full_movie_thumbnail_worker.JOB_TYPE,
+    )
+    return {
+        "success": True,
+        "job": full_movie_thumbnail_pipeline.public_job(jobs[0]) if jobs else None,
+    }
+
+
+@app.get("/api/full-movie/thumbnail/jobs/{job_id}")
+def get_full_movie_thumbnail_job(job_id: str):
+    job = db.get_system_job(job_id)
+    if not job or str(job.get("job_type") or "") != full_movie_thumbnail_worker.JOB_TYPE:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job thumbnail phim.")
+    return {"success": True, "job": full_movie_thumbnail_pipeline.public_job(job)}
+
+
+@app.get("/api/full-movie/thumbnail/jobs/{job_id}/images/{slot}")
+def get_full_movie_thumbnail_image(job_id: str, slot: str):
+    job = db.get_system_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job thumbnail phim.")
+    try:
+        image_path = full_movie_thumbnail_pipeline.image_path_for_slot(job, slot.casefold())
+    except full_movie_thumbnail_pipeline.FullMovieThumbnailError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        str(image_path),
+        media_type="image/jpeg",
+        filename=image_path.name,
+        content_disposition_type="inline",
+    )
+
+
 @app.post("/api/youtube-download/start")
 def start_youtube_download(request: YouTubeDownloadRequest):
     try:
@@ -4441,15 +4607,50 @@ def _resolve_radar_auto_cast(
                 "Không tìm thấy video nguồn để phân tích âm sắc giọng."
             )
         cached_profile = source_row.get("voice_profile") or {}
+        cached_profile_version = str(source_row.get("voice_profile_version") or "")
+        cached_profile_status = str(source_row.get("voice_profile_status") or "")
+        try:
+            cached_failure_count = max(
+                1, min(2, int(cached_profile.get("failure_count") or 1))
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            cached_failure_count = 1
         if (
-            str(source_row.get("voice_profile_version") or "")
-            == source_voice_analyzer.MODEL_REVISION
-            and str(source_row.get("voice_profile_status") or "") != "error"
+            cached_profile_version == source_voice_analyzer.ANALYZER_REVISION
+            and cached_profile_status != "error"
             and isinstance(cached_profile, dict)
             and cached_profile
         ):
             source_profile = cached_profile
         else:
+            if (
+                cached_profile_version == source_voice_analyzer.ANALYZER_REVISION
+                and cached_profile_status == "error"
+                and isinstance(cached_profile, dict)
+                and cached_profile
+            ):
+                retryable = bool(cached_profile.get("retryable"))
+                failure_count = cached_failure_count
+                retry_after = _parse_utc_datetime(
+                    str(cached_profile.get("retry_after") or "")
+                )
+                retry_blocked = (
+                    not retryable
+                    or failure_count >= 2
+                    or (
+                        retry_after is not None
+                        and retry_after > datetime.datetime.now(datetime.timezone.utc)
+                    )
+                )
+                if retry_blocked:
+                    cached_error_id = str(cached_profile.get("error_id") or "")
+                    suffix = f" Mã lỗi: {cached_error_id}." if cached_error_id else ""
+                    raise auto_casting.AutoCastingAttentionRequired(
+                        "Phân tích âm sắc tự động chưa sẵn sàng; "
+                        f"cần duyệt casting thủ công.{suffix}",
+                        attention_code="source_voice_analysis_failed",
+                        error_id=cached_error_id,
+                    )
             target_channel_id = int(automation.get("target_youtube_channel_id") or 0)
             target_channel = (
                 db.get_youtube_channel(target_channel_id) if target_channel_id else None
@@ -4462,24 +4663,62 @@ def _resolve_radar_auto_cast(
                     proxy=raw_proxy,
                 )
             except Exception as exc:
+                failure_code = str(
+                    getattr(exc, "failure_code", "")
+                    or (
+                        "source_media_unavailable"
+                        if isinstance(exc, ProxyConfigurationError)
+                        else "audio_decode_failed"
+                    )
+                )
+                retryable = bool(getattr(exc, "retryable", False))
+                previous_failures = (
+                    cached_failure_count
+                    if cached_profile_version == source_voice_analyzer.ANALYZER_REVISION
+                    and cached_profile_status == "error"
+                    and isinstance(cached_profile, dict)
+                    else 0
+                )
+                failure_count = min(2, previous_failures + 1)
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                retry_after = (
+                    (now_utc + datetime.timedelta(hours=6)).isoformat()
+                    if retryable and failure_count < 2
+                    else ""
+                )
+                diagnostic = str(getattr(exc, "diagnostic", "") or exc)
+                error_id = security_logging.report_exception(
+                    "source voice analysis",
+                    RuntimeError(f"{failure_code}: {diagnostic}"),
+                )
                 db.update_competitor_source_voice_profile(
                     source_id,
                     status="error",
                     profile={
+                        "status": "error",
                         "gender": "any",
+                        "failure_code": failure_code,
+                        "retryable": retryable,
+                        "failure_count": failure_count,
+                        "retry_after": retry_after,
+                        "error_id": error_id,
+                        "analyzer_revision": source_voice_analyzer.ANALYZER_REVISION,
                         "model_revision": source_voice_analyzer.MODEL_REVISION,
                         "model_checksum": source_voice_analyzer.MODEL_SHA256,
                     },
-                    version=source_voice_analyzer.MODEL_REVISION,
+                    version=source_voice_analyzer.ANALYZER_REVISION,
                 )
                 raise auto_casting.AutoCastingAttentionRequired(
-                    "Không thể xác minh âm sắc giọng nguồn; cần duyệt casting thủ công."
+                    "Phân tích âm sắc tự động chưa sẵn sàng; "
+                    f"cần duyệt casting thủ công. Mã lỗi: {error_id}.",
+                    attention_code="source_voice_analysis_failed",
+                    error_id=error_id,
                 ) from exc
             db.update_competitor_source_voice_profile(
                 source_id,
                 status=str(source_profile.get("status") or "uncertain"),
                 profile=source_profile,
-                version=source_voice_analyzer.MODEL_REVISION,
+                version=source_voice_analyzer.ANALYZER_REVISION,
             )
     registry = {
         entry["speaker_key"]: stored
@@ -4846,6 +5085,8 @@ ALL_JOB_LABELS = {
     "video_generation": "Tạo video",
     SCRIPT_BODY_REGENERATION_JOB_TYPE: "Tạo lại toàn bộ lời đọc",
     "short_video_generation": "Tạo Short Video",
+    full_movie_worker.JOB_TYPE: "Ghép phim Full",
+    full_movie_thumbnail_worker.JOB_TYPE: "Tạo thumbnail phim",
     **COMMENT_JOB_LABELS,
     **FLOW_MEDIA_JOB_LABELS,
     **MUSE_MEDIA_JOB_LABELS,
@@ -5086,6 +5327,22 @@ def _reconcile_active_comment_draft_job_duplicates() -> int:
     return reconciled
 
 
+def _reconcile_orphaned_drafting_comments() -> int:
+    """Reset comments stuck in 'drafting' when no active comment_draft job owns them."""
+    active_owners = _active_comment_draft_owners()
+    reconciled = 0
+    for comment in db.list_youtube_comments(status="drafting", limit=500):
+        comment_id = str(comment.get("comment_id") or "").strip()
+        if not comment_id or comment_id in active_owners:
+            continue
+        if comment.get("reply_youtube_id"):
+            db.update_youtube_comment(comment_id, status="replied", error="")
+        else:
+            db.update_youtube_comment(comment_id, status="new", error="")
+        reconciled += 1
+    return reconciled
+
+
 def _enqueue_comment_publish_jobs(comment_ids: list[str]) -> list[dict]:
     jobs = []
     for comment in db.get_youtube_comments(
@@ -5154,7 +5411,9 @@ def _execute_comment_sync_job(job: dict) -> None:
     remote_comments = youtube_comments.list_channel_comment_threads(
         access_token, channel["channel_id"], proxy=proxy_info
     )
+    _reconcile_orphaned_drafting_comments()
     matched_ids: list[str] = []
+    seen_comment_ids: set[str] = set()
     ignored = 0
     for remote_comment in remote_comments:
         if remote_comment.get("author_channel_id") == channel["channel_id"]:
@@ -5171,6 +5430,7 @@ def _execute_comment_sync_job(job: dict) -> None:
         ):
             ignored += 1
             continue
+        seen_comment_ids.add(str(remote_comment.get("comment_id") or ""))
         risk_level, risk_reason = youtube_comments.assess_comment_risk(
             remote_comment.get("text") or ""
         )
@@ -5221,6 +5481,24 @@ def _execute_comment_sync_job(job: dict) -> None:
                     status="skipped",
                     error="",
                 )
+    stale_reconcile_checked = 0
+    for stale_comment in db.list_youtube_comments(
+        channel_db_id=channel_db_id,
+        status="reconcile_required",
+        limit=20,
+    ):
+        stale_id = str(stale_comment.get("comment_id") or "")
+        if not stale_id or stale_id in seen_comment_ids:
+            continue
+        stale_reconcile_checked += 1
+        try:
+            _reconcile_existing_youtube_reply(stale_comment, channel, access_token)
+        except Exception as exc:
+            logger.warning(
+                "Không thể đối chiếu lại bình luận reconcile_required %s: %s",
+                stale_id,
+                security_logging.redact_sensitive(exc),
+            )
     db.update_youtube_channel(channel_db_id, last_sync_at=db.utc_now(), status="connected")
     mode = channel.get("auto_mode") or "draft_only"
     prioritized_comments = sorted(
@@ -6163,6 +6441,73 @@ def _pause_muse_jobs_for_manual_resume_after_restart() -> int:
     return paused
 
 
+def _reconcile_orphaned_video_render_states() -> dict[str, int]:
+    counts = {"paused": 0, "ready": 0, "error": 0, "canceled": 0}
+    for video in db.list_orphaned_active_render_videos():
+        video_id = int(video.get("id") or 0)
+        if not video_id:
+            continue
+        terminal_artifacts = _flow_terminal_scene_artifacts(video_id)
+        final_artifact = db.get_latest_video_artifact(
+            video_id, "final_mp4", status="ready"
+        )
+        final_path = Path(str((final_artifact or {}).get("path") or ""))
+        try:
+            has_valid_mp4 = bool(
+                final_artifact
+                and final_path.is_file()
+                and final_path.stat().st_size > 0
+            )
+        except OSError:
+            has_valid_mp4 = False
+        if terminal_artifacts:
+            details = _build_flow_attention_details(video_id)
+            failed_scenes = details.get("failed_scenes") or []
+            blocking_reason = str(
+                (failed_scenes[0] if failed_scenes else {}).get("last_error") or ""
+            )
+            db.update_video_production_state(
+                video_id,
+                render_status="paused",
+                current_stage="flow_image_needs_attention",
+                production_progress=str(details.get("message") or ""),
+                blocking_reason=blocking_reason,
+            )
+            counts["paused"] += 1
+        elif has_valid_mp4:
+            db.update_video_production_state(
+                video_id,
+                render_status="ready",
+                current_stage="completed",
+                production_progress="Video MP4 đã hoàn tất",
+                blocking_reason="",
+            )
+            counts["ready"] += 1
+        elif str(video.get("video_status") or "") == db.VIDEO_STATUS_ERROR:
+            db.update_video_production_state(
+                video_id,
+                render_status="error",
+                current_stage="error",
+                production_progress=str(
+                    video.get("production_progress") or "Video đã ở trạng thái lỗi."
+                ),
+                blocking_reason=str(video.get("blocking_reason") or ""),
+            )
+            counts["error"] += 1
+        else:
+            db.update_video_production_state(
+                video_id,
+                render_status="canceled",
+                current_stage="interrupted",
+                production_progress=(
+                    "Tiến trình dựng trước đó bị gián đoạn và không có checkpoint hợp lệ."
+                ),
+                blocking_reason="interrupted",
+            )
+            counts["canceled"] += 1
+    return counts
+
+
 @app.on_event("startup")
 def resume_background_jobs() -> None:
     from nexus_engine.services import drain_mode
@@ -6231,6 +6576,18 @@ def resume_background_jobs() -> None:
             "Paused %d Short Video job(s) for explicit checkpoint resume after restart.",
             paused_short_jobs,
         )
+    paused_full_movie_jobs = full_movie_worker.pause_after_restart()
+    if paused_full_movie_jobs:
+        logger.info(
+            "Paused %d Full Movie job(s) for explicit checkpoint resume after restart.",
+            paused_full_movie_jobs,
+        )
+    paused_full_movie_thumbnail_jobs = full_movie_thumbnail_worker.pause_after_restart()
+    if paused_full_movie_thumbnail_jobs:
+        logger.info(
+            "Paused %d Full Movie thumbnail job(s) for explicit checkpoint resume after restart.",
+            paused_full_movie_thumbnail_jobs,
+        )
     paused_vieneu_jobs = vieneu_tts_worker.pause_after_restart()
     if paused_vieneu_jobs:
         logger.info(
@@ -6243,6 +6600,15 @@ def resume_background_jobs() -> None:
             "Đã chuyển %d job Google Flow legacy sang hàng đợi media.",
             migrated_flow_jobs,
         )
+    orphan_recovery = _reconcile_orphaned_video_render_states()
+    if sum(orphan_recovery.values()):
+        logger.info(
+            "Đã reconcile render state mồ côi: paused=%d ready=%d error=%d canceled=%d.",
+            orphan_recovery["paused"],
+            orphan_recovery["ready"],
+            orphan_recovery["error"],
+            orphan_recovery["canceled"],
+        )
     db.recover_interrupted_system_jobs("trust_builder_session")
     db.recover_interrupted_system_jobs("competitor_scan")
     recovered_browser_jobs = _recover_legacy_browser_cdp_blocked_jobs()
@@ -6252,6 +6618,12 @@ def resume_background_jobs() -> None:
             recovered_browser_jobs,
         )
     _reconcile_active_comment_draft_job_duplicates()
+    orphaned_drafting = _reconcile_orphaned_drafting_comments()
+    if orphaned_drafting:
+        logger.info(
+            "Đã giải phóng %d bình luận kẹt trạng thái drafting không có job.",
+            orphaned_drafting,
+        )
     db.pause_queued_attention_jobs()
     _kick_video_queue()
     _kick_flow_media_queue()
@@ -6332,6 +6704,8 @@ def stop_video_queue_wakeup_timer() -> None:
     if _publish_coordinator is not None:
         _publish_coordinator.stop()
     short_video_worker.stop()
+    full_movie_worker.stop()
+    full_movie_thumbnail_worker.stop()
     vieneu_tts_worker.stop()
     if _radar_coordinator is not None:
         _radar_coordinator.stop()
@@ -6844,12 +7218,19 @@ def _execute_video_job(job: dict) -> None:
             )
     except auto_casting.AutoCastingAttentionRequired as exc:
         safe_error = security_logging.redact_sensitive(str(exc))
+        attention_code = str(
+            getattr(exc, "attention_code", "")
+            or "casting_evidence_insufficient"
+        )
+        casting_error_id = str(getattr(exc, "error_id", "") or "")
         _update_video_job(
             job_id,
             status="paused",
-            progress="Cần cấu hình thêm giọng khách phù hợp",
+            progress="Cần duyệt casting giọng khách",
             result_json={
                 "attention_required": "auto_cast",
+                "attention_code": attention_code,
+                "error_id": casting_error_id,
                 "video_id": video_id,
             },
             error=safe_error,
@@ -8783,10 +9164,19 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         current_job = db.get_system_job(job["id"]) or job
         attention_result = dict(current_job.get("result") or {})
         attention_result["attention_required"] = "flow_image_generation"
+        attention_details = _build_flow_attention_details(
+            int(job.get("video_id") or 0),
+            attention_result,
+        )
+        attention_result["attention_details"] = attention_details
+        attention_message = str(
+            attention_details.get("message")
+            or "Tạo ảnh Google Flow cần người dùng chọn hành động phục hồi."
+        )
         db.update_system_job(
             job["id"],
             status="paused",
-            progress="Tạo ảnh Google Flow cần kiểm tra thủ công",
+            progress=attention_message,
             error=safe_error,
             result_json=attention_result,
             next_retry_at="",
@@ -8798,7 +9188,7 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
                 int(job["video_id"]),
                 render_status="paused",
                 current_stage="flow_image_needs_attention",
-                production_progress="Tạo ảnh Google Flow cần kiểm tra thủ công",
+                production_progress=attention_message,
                 blocking_reason=safe_error,
             )
         return
@@ -8893,7 +9283,7 @@ def _handle_production_job_error(job: dict, exc: Exception) -> None:
         recovery_result["reconcile_last_completed_count"] = current_completed
         recovery_result["reconcile_stagnant_count"] = stagnant_count
 
-        MAX_CONSECUTIVE_STAGNANT_RECONCILES = 25
+        MAX_CONSECUTIVE_STAGNANT_RECONCILES = 15
         if stagnant_count >= MAX_CONSECUTIVE_STAGNANT_RECONCILES:
             stalled_msg = (
                 f"Google Flow đã thử đối soát {stagnant_count} lần liên tiếp mà không có ảnh/video mới hoàn tất. "
@@ -10263,13 +10653,23 @@ def recast_stale_competitor_casting(request: RecastStaleRequest):
             recast_count += 1
         except auto_casting.AutoCastingAttentionRequired as exc:
             safe_error = security_logging.redact_sensitive(exc)
+            attention_code = str(
+                getattr(exc, "attention_code", "")
+                or "casting_evidence_insufficient"
+            )
+            casting_error_id = str(getattr(exc, "error_id", "") or "")
             job = context.get("job") or {}
             if job.get("id"):
                 db.update_system_job(
                     job["id"],
                     status="paused",
                     progress="Cần duyệt casting sau khi recast",
-                    result_json={"attention_required": "auto_cast", "video_id": video_id},
+                    result_json={
+                        "attention_required": "auto_cast",
+                        "attention_code": attention_code,
+                        "error_id": casting_error_id,
+                        "video_id": video_id,
+                    },
                     error=safe_error,
                     finished_at="",
                 )
@@ -10499,6 +10899,245 @@ class MuseCheckpointNotRecoverableError(ValueError):
     pass
 
 
+class FlowCheckpointNotRecoverableError(ValueError):
+    pass
+
+
+def _flow_terminal_scene_artifacts(video_id: int) -> list[tuple[str, dict]]:
+    terminal_artifacts: list[tuple[str, dict]] = []
+    for artifact_type, artifact in db.list_latest_video_artifacts(
+        video_id, ("scene:",)
+    ).items():
+        metadata = artifact.get("metadata") or {}
+        if artifact.get("status") != "failed":
+            continue
+        if not (
+            metadata.get("terminal") is True
+            or str(metadata.get("reason_code") or "")
+            in {"flow_max_attempts_exceeded", "flow_image_needs_attention"}
+        ):
+            continue
+        terminal_artifacts.append((artifact_type, artifact))
+
+    def scene_index(item: tuple[str, dict]) -> int:
+        artifact_type, artifact = item
+        metadata = artifact.get("metadata") or {}
+        try:
+            return max(0, int(metadata.get("index", artifact_type.split(":", 1)[1])))
+        except (IndexError, TypeError, ValueError):
+            return 0
+
+    return sorted(terminal_artifacts, key=scene_index)
+
+
+def _redact_flow_attention_error(value: object) -> str:
+    safe_error = security_logging.redact_sensitive(str(value or ""))[:1000]
+    return re.sub(
+        r"(?is)\b((?:negative[_ -]?)?(?:safe[_ -]?)?prompt\s*[:=]\s*)[^\r\n]+",
+        r"\1[REDACTED]",
+        safe_error,
+    )
+
+
+def _build_flow_attention_details(video_id: int, result: dict | None = None) -> dict:
+    result = dict(result or {})
+    artifacts = db.list_latest_video_artifacts(video_id, ("scene:",))
+    terminal_artifacts = _flow_terminal_scene_artifacts(video_id)
+    failed_scenes: list[dict] = []
+    manual_retry_epoch = 0
+    for artifact_type, artifact in terminal_artifacts:
+        metadata = artifact.get("metadata") or {}
+        try:
+            index = max(0, int(metadata.get("index", artifact_type.split(":", 1)[1])))
+        except (IndexError, TypeError, ValueError):
+            index = 0
+        try:
+            submission_count = max(
+                0,
+                int(
+                    metadata.get("submission_count")
+                    if metadata.get("submission_count") is not None
+                    else metadata.get("generation_attempt")
+                    or 0
+                ),
+            )
+        except (TypeError, ValueError, OverflowError):
+            submission_count = 0
+        try:
+            scene_epoch = max(0, int(metadata.get("manual_retry_epoch") or 0))
+        except (TypeError, ValueError, OverflowError):
+            scene_epoch = 0
+        manual_retry_epoch = max(manual_retry_epoch, scene_epoch)
+        reason_code = str(
+            metadata.get("last_reason_code")
+            or metadata.get("reason_code")
+            or "flow_image_needs_attention"
+        )
+        if not re.fullmatch(r"[a-z0-9_]+", reason_code):
+            reason_code = "flow_image_needs_attention"
+        failed_scenes.append(
+            {
+                "scene_index": index,
+                "scene_number": index + 1,
+                "reason_code": reason_code,
+                "submission_count": submission_count,
+                "last_error": _redact_flow_attention_error(
+                    metadata.get("last_error") or metadata.get("error") or ""
+                ),
+            }
+        )
+
+    flow_progress = result.get("flow_media_progress")
+    flow_progress = flow_progress if isinstance(flow_progress, dict) else {}
+    completed_images = sum(
+        1
+        for artifact in artifacts.values()
+        if artifact.get("status") in {"completed", "ready"}
+    )
+    try:
+        total_images = max(0, int(flow_progress.get("images_total") or 0))
+    except (TypeError, ValueError, OverflowError):
+        total_images = 0
+    if total_images <= 0:
+        video = db.get_video(video_id) or {}
+        try:
+            total_images = max(0, int(video.get("flow_scene_count") or 0))
+        except (TypeError, ValueError, OverflowError):
+            total_images = 0
+    if total_images <= 0 and artifacts:
+        scene_indices = []
+        for artifact_type in artifacts:
+            try:
+                scene_indices.append(max(0, int(artifact_type.split(":", 1)[1])))
+            except (IndexError, TypeError, ValueError):
+                continue
+        total_images = max(scene_indices, default=-1) + 1
+
+    if len(failed_scenes) == 1:
+        failed = failed_scenes[0]
+        message = (
+            f"Cảnh {failed['scene_number']} thất bại sau "
+            f"{failed['submission_count']} lượt gửi; "
+            f"{completed_images}/{total_images or '?'} ảnh đã hoàn tất."
+        )
+    else:
+        message = (
+            f"{len(failed_scenes)} cảnh Google Flow thất bại; "
+            f"{completed_images}/{total_images or '?'} ảnh đã hoàn tất."
+        )
+    can_retry = bool(failed_scenes)
+    can_new_canvas = bool(can_retry and manual_retry_epoch >= 1)
+    return {
+        "kind": "flow_scene_failure",
+        "message": message,
+        "failed_scenes": failed_scenes,
+        "recommended_action": "retry_failed_scenes" if can_retry else "inspect_checkpoint",
+        "manual_retry_epoch": manual_retry_epoch,
+        "completed_images": completed_images,
+        "total_images": total_images,
+        "can_retry_failed_scenes": can_retry,
+        "can_retry_new_canvas": can_new_canvas,
+        "capabilities": {
+            "retry_failed_scenes": can_retry,
+            "retry_new_canvas": can_new_canvas,
+        },
+    }
+
+
+def _reset_flow_terminal_scenes_for_manual_retry(video_id: int) -> int:
+    terminal_artifacts = _flow_terminal_scene_artifacts(video_id)
+    if not terminal_artifacts:
+        raise FlowCheckpointNotRecoverableError(
+            "Không tìm thấy cảnh ảnh Flow lỗi hợp lệ để thử lại. "
+            "Hãy tải lại trạng thái hoặc dùng ‘Tạo lại từ cảnh…’."
+        )
+    for artifact_type, artifact in terminal_artifacts:
+        metadata = dict(artifact.get("metadata") or {})
+        try:
+            retry_epoch = max(0, int(metadata.get("manual_retry_epoch") or 0)) + 1
+        except (TypeError, ValueError, OverflowError):
+            retry_epoch = 1
+        if "last_error" not in metadata and metadata.get("error"):
+            metadata["last_error"] = _redact_flow_attention_error(
+                metadata.get("error") or ""
+            )
+        if "last_failure_stage" not in metadata and metadata.get("failure_stage"):
+            metadata["last_failure_stage"] = str(metadata.get("failure_stage") or "")
+        if "last_reason_code" not in metadata and metadata.get("reason_code"):
+            metadata["last_reason_code"] = str(metadata.get("reason_code") or "")
+        metadata.update(
+            {
+                "terminal": False,
+                "manual_retry_epoch": retry_epoch,
+                "submission_count": 0,
+                "generation_attempt": 0,
+                "transient_retry_count": 0,
+                "perceptual_duplicate_retries": 0,
+                "safe_prompt_used": False,
+                "flow_receipt": None,
+                "flow_submission_intent": None,
+                "next_retry_at": "",
+            }
+        )
+        metadata.pop("error", None)
+        metadata.pop("failure_stage", None)
+        metadata.pop("reason_code", None)
+        db.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type=artifact_type,
+            path=str(artifact.get("path") or ""),
+            content_hash=str(artifact.get("content_hash") or ""),
+            status="queued",
+            mime_type=str(artifact.get("mime_type") or "image/png"),
+            metadata=metadata,
+        )
+    return len(terminal_artifacts)
+
+
+def _resume_flow_media_job(job: dict) -> dict:
+    job_id = str(job.get("id") or "")
+    video_id = int(
+        job.get("video_id") or (job.get("payload") or {}).get("video_id") or 0
+    )
+    if not job_id or not video_id:
+        raise FlowCheckpointNotRecoverableError(
+            "Job Google Flow thiếu định danh video."
+        )
+    if str(job.get("status") or "") != "paused":
+        raise FlowCheckpointNotRecoverableError(
+            "Job Google Flow không ở trạng thái tạm dừng để phục hồi."
+        )
+
+    result = dict(job.get("result") or {})
+    attention_required = str(result.get("attention_required") or "")
+    update_fields: dict[str, object] = {"error": ""}
+    if attention_required == "flow_image_generation":
+        _reset_flow_terminal_scenes_for_manual_retry(video_id)
+        payload = dict(job.get("payload") or {})
+        payload["force_new_project"] = False
+        payload["force_new_flow_project"] = False
+        update_fields["payload_json"] = payload
+
+    result["reconcile_stagnant_count"] = 0
+    result.pop("attention_required", None)
+    result.pop("attention_details", None)
+    update_fields["result_json"] = result
+    db.update_system_job(job_id, **update_fields)
+    updated = db.resume_system_job(job_id)
+    if not updated:
+        raise FlowCheckpointNotRecoverableError(
+            "Không thể đưa job Google Flow trở lại hàng đợi."
+        )
+    db.update_video_production_state(
+        video_id,
+        render_status="queued",
+        current_stage="flow_media_generation",
+        production_progress="Đang chờ tiếp tục tạo media Google Flow từ checkpoint",
+        blocking_reason="",
+    )
+    return updated
+
+
 def _resume_muse_media_job(
     job: dict,
     *,
@@ -10659,13 +11298,23 @@ def _route_video_render_job(
         mode=mode,
         force_new_project=force_new_project,
     )
+    if (
+        created
+        and mode == "resume"
+        and str(job.get("job_type") or "") == "flow_media_generation"
+        and _flow_terminal_scene_artifacts(video_id)
+    ):
+        _reset_flow_terminal_scenes_for_manual_retry(video_id)
     phase = (
         "render" if job.get("job_type") == "video_render" else "media_generation"
     )
     if not created and mode == "resume" and str(job.get("status") or "") == "paused":
         job_id = job["id"]
         job_type = str(job.get("job_type") or "")
-        db.resume_system_job(job_id)
+        if job_type == "flow_media_generation":
+            job = _resume_flow_media_job(job)
+        else:
+            db.resume_system_job(job_id)
         stage = (
             "flow_media_generation"
             if job_type == "flow_media_generation"
@@ -11610,6 +12259,19 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         and result.get("attention_required")
     )
     notification = _public_media_job_notification(job)
+    attention_details = (
+        dict(result.get("attention_details") or {})
+        if isinstance(result.get("attention_details"), dict)
+        else {}
+    )
+    if (
+        job_type == "flow_media_generation"
+        and video_id
+        and result.get("attention_required") == "flow_image_generation"
+    ):
+        current_attention = _build_flow_attention_details(int(video_id), result)
+        if current_attention.get("failed_scenes"):
+            attention_details = current_attention
     display_status = status_map.get(
         str(notification.get("display_status") or status),
         str(notification.get("display_status") or status),
@@ -11858,12 +12520,16 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         },
         "muse_can_resume": muse_can_resume,
         "recovery_limit": (
-            len(YOUTUBE_RECOVERY_DELAYS_SECONDS)
-            if job_type in {"youtube_upload", "youtube_publish"}
+            len(youtube_pinned_comment.RETRY_DELAYS_SECONDS)
+            if job_type == "youtube_pinned_comment"
             else (
-                len(VIDEO_RECOVERY_DELAYS_SECONDS)
-                if job_type == "video_generation"
-                else 0
+                len(YOUTUBE_RECOVERY_DELAYS_SECONDS)
+                if job_type in {"youtube_upload", "youtube_publish"}
+                else (
+                    len(VIDEO_RECOVERY_DELAYS_SECONDS)
+                    if job_type == "video_generation"
+                    else 0
+                )
             )
         ),
         "resume_from_step": job.get("resume_from_step", ""),
@@ -11879,7 +12545,7 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         ),
         "can_cancel": (
             status in {"queued", "retry_wait", "paused"}
-            or (job_type in {"video_generation", SCRIPT_BODY_REGENERATION_JOB_TYPE, "short_video_generation", "flow_media_generation", "muse_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
+            or (job_type in {"video_generation", SCRIPT_BODY_REGENERATION_JOB_TYPE, "short_video_generation", full_movie_worker.JOB_TYPE, full_movie_thumbnail_worker.JOB_TYPE, "flow_media_generation", "muse_media_generation", "video_render", "video_qc", "visual_scene_plan", "competitor_scan", "youtube_upload", "youtube_publish", "fb_crosspost", "fb_crosspost_sync", "thumbnail_generation", "tiktok_publish", "trust_builder_session"} and status == "running")
         ),
         "can_retry": (
             pinned_comment_attention
@@ -11892,11 +12558,18 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         "can_resume_checkpoint": bool(checkpoint_resume_step),
         "checkpoint_resume_step": checkpoint_resume_step,
         "can_pause": (
-            status in {"queued", "retry_wait"}
-            and notification.get("state") != "resume_required"
+            (
+                status in {"queued", "retry_wait"}
+                and notification.get("state") != "resume_required"
+            )
+            or (job_type in {full_movie_worker.JOB_TYPE, full_movie_thumbnail_worker.JOB_TYPE} and status == "running")
         ),
         "can_resume": (
-            (status == "paused" and not pinned_comment_attention)
+            (
+                status == "paused"
+                and not pinned_comment_attention
+                and result.get("attention_required") != "flow_image_generation"
+            )
             or (
                 job_type == "muse_media_generation"
                 and notification.get("state") == "resume_required"
@@ -11909,22 +12582,46 @@ def _system_job_center_item(job: dict, queue_position: int | None, *, hydrate: b
         "can_delete": status != "running",
         "can_flow_fallback_static": (
             job_type == "flow_media_generation"
+            and result.get("attention_required") != "flow_image_generation"
             and (
-                status in {"paused", "error"}
+                status == "error"
                 or result.get("attention_required") in {"flow_reconcile_stalled", "flow_video_quota_exhausted"}
                 or bool(result.get("pending_video_scene_indices"))
+                or (status == "paused" and not result.get("attention_required"))
             )
         ),
         "can_flow_reset_project": (
             job_type == "flow_media_generation"
             and (
-                status in {"paused", "error"}
-                or result.get("attention_required") == "flow_reconcile_stalled"
+                (
+                    result.get("attention_required") == "flow_image_generation"
+                    and bool(attention_details.get("can_retry_new_canvas"))
+                )
+                or (
+                    result.get("attention_required") != "flow_image_generation"
+                    and (
+                        status == "error"
+                        or result.get("attention_required") == "flow_reconcile_stalled"
+                        or (
+                            status == "paused"
+                            and not result.get("attention_required")
+                        )
+                    )
+                )
             )
+        ),
+        "can_retry_failed_scenes": bool(
+            job_type == "flow_media_generation"
+            and status == "paused"
+            and result.get("attention_required") == "flow_image_generation"
+            and attention_details.get("can_retry_failed_scenes")
         ),
         "attention_required": (
             result.get("attention_required", "")
         ),
+        "attention_details": attention_details,
+        "attention_code": str(result.get("attention_code") or ""),
+        "error_id": str(result.get("error_id") or ""),
         "automatic_login": result.get("automatic_login", ""),
         "missing_configuration": result.get("missing_configuration") or [],
         "publish_stage": publish_stage,
@@ -11950,6 +12647,25 @@ def _populate_system_job_payload_result(item: dict, payload: dict, result: dict)
         item["title"] = payload.get("url")
     if not item.get("attention_required") and result.get("attention_required"):
         item["attention_required"] = result.get("attention_required", "")
+    if isinstance(result.get("attention_details"), dict):
+        item["attention_details"] = dict(result["attention_details"])
+    if (
+        item.get("type") == "flow_media_generation"
+        and item.get("video_id")
+        and result.get("attention_required") == "flow_image_generation"
+    ):
+        attention_details = _build_flow_attention_details(
+            int(item["video_id"]), result
+        )
+        item["attention_details"] = attention_details
+        item["can_resume"] = False
+        item["can_retry_failed_scenes"] = bool(
+            attention_details.get("can_retry_failed_scenes")
+        )
+        item["can_flow_reset_project"] = bool(
+            attention_details.get("can_retry_new_canvas")
+        )
+        item["can_flow_fallback_static"] = False
     if not item.get("automatic_login") and result.get("automatic_login"):
         item["automatic_login"] = result.get("automatic_login", "")
     if not item.get("missing_configuration") and result.get("missing_configuration"):
@@ -12347,6 +13063,8 @@ JOB_CENTER_SYSTEM_JOB_TYPES = (
     "video_generation",
     SCRIPT_BODY_REGENERATION_JOB_TYPE,
     "short_video_generation",
+    full_movie_worker.JOB_TYPE,
+    full_movie_thumbnail_worker.JOB_TYPE,
     *COMMENT_JOB_TYPES,
     *FLOW_MEDIA_JOB_TYPES,
     *MUSE_MEDIA_JOB_TYPES,
@@ -12359,6 +13077,8 @@ JOB_CENTER_SYSTEM_JOB_TYPES = (
 def _job_supports_action(item: dict, action: str) -> bool:
     if action == "cancel":
         capability = "can_cancel"
+    elif action == "resume":
+        return bool(item.get("can_resume") or item.get("can_retry_failed_scenes"))
     elif action == "fallback_static":
         capability = "can_flow_fallback_static"
     elif action == "retry_new_flow_project":
@@ -12688,6 +13408,10 @@ def _kick_job_queues(job_types: set[str]) -> None:
         _kick_video_queue()
     if "short_video_generation" in job_types:
         short_video_worker.kick()
+    if full_movie_worker.JOB_TYPE in job_types:
+        full_movie_worker.kick()
+    if full_movie_thumbnail_worker.JOB_TYPE in job_types:
+        full_movie_thumbnail_worker.kick()
     if any(job_type in COMMENT_JOB_TYPES for job_type in job_types):
         _kick_comment_queue()
     if any(job_type in FLOW_MEDIA_JOB_TYPES for job_type in job_types):
@@ -12718,6 +13442,19 @@ def _run_system_job_center_action(
         db.get_system_job_queue_position(job_id),
         hydrate=True,
     )
+    if (
+        action == "resume"
+        and str(job.get("job_type") or "") == "flow_media_generation"
+        and str((job.get("result") or {}).get("attention_required") or "")
+        == "flow_image_generation"
+        and not _flow_terminal_scene_artifacts(
+            int(job.get("video_id") or (job.get("payload") or {}).get("video_id") or 0)
+        )
+    ):
+        raise JobCenterActionNotAllowedError(
+            "Không tìm thấy cảnh ảnh Flow lỗi hợp lệ để thử lại. "
+            "Hãy tải lại trạng thái hoặc dùng ‘Tạo lại từ cảnh…’."
+        )
     if not _job_supports_action(current_item, action):
         raise JobCenterActionNotAllowedError(
             "Job không hỗ trợ thao tác này ở trạng thái hiện tại."
@@ -12780,7 +13517,12 @@ def _run_system_job_center_action(
                 except Exception:
                     pass
     elif action == "pause":
-        updated_job = db.pause_system_job(job_id)
+        if str(job.get("job_type") or "") == full_movie_worker.JOB_TYPE:
+            updated_job = full_movie_worker.pause(job_id)
+        elif str(job.get("job_type") or "") == full_movie_thumbnail_worker.JOB_TYPE:
+            updated_job = full_movie_thumbnail_worker.pause(job_id)
+        else:
+            updated_job = db.pause_system_job(job_id)
     elif action == "force_stop":
         process_registry.kill_job_processes(job_id)
         v_id = job.get("video_id") or (job.get("payload") or {}).get("video_id")
@@ -12797,39 +13539,7 @@ def _run_system_job_center_action(
         if str(job.get("job_type") or "") == "muse_media_generation":
             updated_job = _resume_muse_media_job(job)
         elif str(job.get("job_type") or "") == "flow_media_generation":
-            res = dict(job.get("result") or {})
-            res["reconcile_stagnant_count"] = 0
-            res.pop("attention_required", None)
-            vid_id = int(job.get("video_id") or (job.get("payload") or {}).get("video_id") or 0)
-            if vid_id and job.get("status") == "paused":
-                scene_artifacts = db.list_latest_video_artifacts(vid_id, ("scene:",))
-                for k, art in scene_artifacts.items():
-                    art_meta = art.get("metadata") or {}
-                    if art.get("status") == "failed" and (art_meta.get("terminal") or art_meta.get("reason_code") == "flow_max_attempts_exceeded"):
-                        meta = dict(art_meta)
-                        meta["terminal"] = False
-                        meta["generation_attempt"] = 0
-                        meta.pop("reason_code", None)
-                        meta.pop("error", None)
-                        db.upsert_video_artifact(
-                            video_id=vid_id,
-                            artifact_type=k,
-                            path=str(art.get("path") or ""),
-                            content_hash=str(art.get("content_hash") or ""),
-                            status="queued",
-                            mime_type=art.get("mime_type") or "image/png",
-                            metadata=meta,
-                        )
-            db.update_system_job(job_id, result_json=res, error="")
-            updated_job = db.resume_system_job(job_id)
-            if updated_job and job.get("video_id"):
-                db.update_video_production_state(
-                    int(job["video_id"]),
-                    render_status="queued",
-                    current_stage="flow_media_generation",
-                    production_progress="Đang chờ tiếp tục tạo media Google Flow từ checkpoint",
-                    blocking_reason="",
-                )
+            updated_job = _resume_flow_media_job(job)
         else:
             updated_job = db.resume_system_job(job_id)
     elif action == "fallback_static":
@@ -12867,6 +13577,7 @@ def _run_system_job_center_action(
             cur_result = dict(job.get("result") or {})
             cur_result["reconcile_stagnant_count"] = 0
             cur_result.pop("attention_required", None)
+            cur_result.pop("attention_details", None)
             vid_id = int(job.get("video_id") or cur_payload.get("video_id") or 0)
             if vid_id:
                 artifacts = db.list_latest_video_artifacts(vid_id, ("scene_video:",))
@@ -12881,9 +13592,15 @@ def _run_system_job_center_action(
                             mime_type="video/mp4",
                             metadata={**(art.get("metadata") or {}), "failure_stage": "reset_new_project", "reason_code": "reset_requested"},
                         )
+                terminal_scene_types = {
+                    artifact_type
+                    for artifact_type, _artifact in _flow_terminal_scene_artifacts(vid_id)
+                }
+                if terminal_scene_types:
+                    _reset_flow_terminal_scenes_for_manual_retry(vid_id)
                 scene_artifacts = db.list_latest_video_artifacts(vid_id, ("scene:",))
                 for k, art in scene_artifacts.items():
-                    if art.get("status") != "completed":
+                    if art.get("status") != "completed" and k not in terminal_scene_types:
                         art_id = art.get("id")
                         if art_id:
                             db.delete_video_artifact(art_id)
@@ -12897,7 +13614,7 @@ def _run_system_job_center_action(
                 result_json=cur_result,
                 error="",
                 status="queued",
-                progress="Đang khởi tạo Canvas Google Flow mới để sinh lại video intro...",
+                progress="Đang khởi tạo Canvas Google Flow mới để thử lại media lỗi...",
             )
             updated_job = db.get_system_job(job_id)
             if updated_job and vid_id:
@@ -12905,13 +13622,18 @@ def _run_system_job_center_action(
                     vid_id,
                     render_status="queued",
                     current_stage="flow_media_generation",
-                    production_progress="Đang tạo Canvas Google Flow mới để sinh lại video intro",
+                    production_progress="Đang tạo Canvas Google Flow mới để thử lại media lỗi",
                     blocking_reason="",
                 )
         else:
             raise JobCenterActionNotAllowedError("Hành động chỉ áp dụng cho Google Flow media.")
     else:
-        updated_job = db.request_cancel_system_job(job_id)
+        if str(job.get("job_type") or "") == full_movie_worker.JOB_TYPE:
+            updated_job = full_movie_worker.cancel_running(job_id)
+        elif str(job.get("job_type") or "") == full_movie_thumbnail_worker.JOB_TYPE:
+            updated_job = full_movie_thumbnail_worker.cancel_running(job_id)
+        else:
+            updated_job = db.request_cancel_system_job(job_id)
         if str(job.get("job_type")) == "fb_crosspost":
             try:
                 task_id = (job.get("payload") or {}).get("task_id")
@@ -13268,6 +13990,24 @@ def delete_job(job_id: str):
             job_id="",
             error="Job điều phối đã bị xóa; artifact hiện có vẫn được giữ lại.",
         )
+    if str(deleted_job.get("job_type") or "") == full_movie_worker.JOB_TYPE:
+        try:
+            full_movie_pipeline.cleanup_job_artifacts(deleted_job)
+        except Exception as exc:
+            logger.warning(
+                "Không thể dọn temp của Full Movie job %s: %s",
+                job_id,
+                security_logging.redact_sensitive(exc),
+            )
+    if str(deleted_job.get("job_type") or "") == full_movie_thumbnail_worker.JOB_TYPE:
+        try:
+            full_movie_thumbnail_pipeline.cleanup_job_artifacts(deleted_job)
+        except Exception as exc:
+            logger.warning(
+                "Không thể dọn temp của Full Movie thumbnail job %s: %s",
+                job_id,
+                security_logging.redact_sensitive(exc),
+            )
     _kick_job_queues({str(deleted_job.get("job_type") or "video_generation")})
     return {"success": True}
 
@@ -15117,6 +15857,47 @@ def trigger_render_video(video_id: int, mode: str = "resume"):
     if force_new_project:
         cancel_render_video(video_id)
         video_production.purge_video_render_artifacts(video_id)
+    elif mode == "resume":
+        final_artifact = db.get_latest_video_artifact(
+            video_id, "final_mp4", status="ready"
+        )
+        final_metadata = (final_artifact or {}).get("metadata") or {}
+        caption_artifact = db.get_latest_video_artifact(
+            video_id, "captions", status="ready"
+        )
+        caption_path = Path(str((caption_artifact or {}).get("path") or ""))
+        current_subtitle_hash = (
+            video_production._sha256_file(caption_path)
+            if caption_path.is_file()
+            else ""
+        )
+        stale_subtitle_profile = bool(
+            final_artifact
+            and Path(str(final_artifact.get("path") or "")).is_file()
+            and (
+                final_metadata.get("subtitle_profile_version")
+                != subtitle_layout.SUBTITLE_PROFILE_VERSION
+                or final_metadata.get("subtitle_render_style_version")
+                != subtitle_layout.SUBTITLE_RENDER_STYLE_VERSION
+                or (
+                    current_subtitle_hash
+                    and final_metadata.get("subtitle_hash")
+                    != current_subtitle_hash
+                )
+            )
+        )
+        active_media_job = next(
+            (
+                job
+                for job in db.list_active_system_jobs()
+                if int(job.get("video_id") or 0) == video_id
+                and job.get("job_type")
+                in {"flow_media_generation", "muse_media_generation", "video_render"}
+            ),
+            None,
+        )
+        if stale_subtitle_profile and active_media_job is None:
+            video_production.purge_video_render_artifacts(video_id)
 
     try:
         job, created, phase = _route_video_render_job(
@@ -15125,7 +15906,7 @@ def trigger_render_video(video_id: int, mode: str = "resume"):
             mode=mode,
             force_new_project=force_new_project,
         )
-    except MuseCheckpointNotRecoverableError as exc:
+    except (MuseCheckpointNotRecoverableError, FlowCheckpointNotRecoverableError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         "success": True,
@@ -15141,13 +15922,21 @@ class RegenerateIntroRequest(BaseModel):
     keep_successful: bool = True
 
 
+class RetryNewFlowCanvasRequest(BaseModel):
+    keep_successful: bool = True
+
+
 class IntroReviewDecisionRequest(BaseModel):
     action: str  # "accept_fallback" | "retry_intro"
     keep_successful: bool = True
 
 
 @app.post("/api/videos/{video_id}/retry-new-flow-canvas")
-def retry_new_flow_canvas_for_video(video_id: int):
+def retry_new_flow_canvas_for_video(
+    video_id: int,
+    request: RetryNewFlowCanvasRequest | None = None,
+):
+    keep_successful = request.keep_successful if request is not None else True
     video = db.get_video(video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Không tìm thấy video.")
@@ -15167,14 +15956,32 @@ def retry_new_flow_canvas_for_video(video_id: int):
             detail="Đang có tiến trình tạo media hoặc dựng video đang chạy; vui lòng hủy trước khi đổi Canvas.",
         )
 
+    terminal_scene_artifacts = _flow_terminal_scene_artifacts(video_id)
+    if terminal_scene_artifacts:
+        attention_details = _build_flow_attention_details(video_id)
+        if not attention_details.get("can_retry_new_canvas"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Hãy thử lại cảnh lỗi trên Canvas hiện tại trước. "
+                    "Canvas mới chỉ khả dụng nếu cùng cảnh tiếp tục thất bại."
+                ),
+            )
+
     # Cancel any paused media generation jobs to avoid duplicate queue conflict
     for j in jobs:
         if j.get("job_type") in {"flow_media_generation", "muse_media_generation"} and j.get("status") == "paused":
             db.update_system_job(j["id"], status="canceled", error="Đã hủy để tạo Canvas mới theo yêu cầu của người dùng.")
 
-    # 1. Purge failed intro video artifacts (keeping successful ones) and manifest
+    if terminal_scene_artifacts:
+        _reset_flow_terminal_scenes_for_manual_retry(video_id)
+
+    # 1. Purge intro video artifacts according to the explicit retention policy.
     from nexus_engine.services import video_production
-    purged_count = video_production.purge_intro_video_artifacts(video_id, keep_successful=True)
+    purged_count = video_production.purge_intro_video_artifacts(
+        video_id,
+        keep_successful=keep_successful,
+    )
 
     # 2. Persist reset request for Google Flow project
     db.request_new_flow_project(video_id)
@@ -15203,6 +16010,7 @@ def retry_new_flow_canvas_for_video(video_id: int):
         "video_id": video_id,
         "job_id": job["id"],
         "purged_count": purged_count,
+        "keep_successful": keep_successful,
         "message": "Đã tạo Canvas Google Flow mới và khởi chạy lại tạo media intro.",
     }
 
@@ -15722,6 +16530,25 @@ def get_render_status(video_id: int):
         if latest_job and is_error
         else ""
     )
+    if not render_job:
+        orphan_render_status = str(video.get("render_status") or "")
+        is_active = orphan_render_status in {
+            "queued",
+            "running",
+            "retry_wait",
+            "processing",
+            "rendering",
+            "media_generation",
+            "generating",
+            "pending",
+        }
+        is_paused = orphan_render_status == "paused"
+        is_error = orphan_render_status == "error"
+        is_canceled = orphan_render_status == "canceled"
+        if is_error:
+            error_message = security_logging.redact_sensitive(
+                str(video.get("blocking_reason") or video.get("production_progress") or "")
+            )
 
     # A video is only ready if an actual valid file exists AND we are NOT currently in error or running an active re-render
     has_mp4 = bool(
@@ -15778,6 +16605,18 @@ def get_render_status(video_id: int):
     render_job_summary = None
     if render_job:
         result = dict(render_job.get("result") or {})
+        attention_details = (
+            dict(result.get("attention_details") or {})
+            if isinstance(result.get("attention_details"), dict)
+            else {}
+        )
+        if (
+            render_job.get("job_type") == "flow_media_generation"
+            and result.get("attention_required") == "flow_image_generation"
+        ):
+            current_attention = _build_flow_attention_details(video_id, result)
+            if current_attention.get("failed_scenes"):
+                attention_details = current_attention
         job_progress = str(
             render_notification.get("message")
             or render_job.get("progress")
@@ -15816,6 +16655,13 @@ def get_render_status(video_id: int):
                 str(render_job.get("error") or "")
             ),
             "attention_required": str(result.get("attention_required") or ""),
+            "attention_details": attention_details,
+            "can_retry_failed_scenes": bool(
+                attention_details.get("can_retry_failed_scenes")
+            ),
+            "can_retry_new_canvas": bool(
+                attention_details.get("can_retry_new_canvas")
+            ),
             "notification": render_notification,
             "muse_media_progress": (
                 dict(result.get("muse_media_progress") or {})
@@ -15843,6 +16689,40 @@ def get_render_status(video_id: int):
                 if key in (result.get("muse_artifacts") or {})
             },
         }
+    elif (
+        is_paused
+        and str(video.get("current_stage") or "") == "flow_image_needs_attention"
+    ):
+        attention_details = _build_flow_attention_details(video_id)
+        if attention_details.get("failed_scenes"):
+            phase = "media_generation"
+            render_job_summary = {
+                "id": "",
+                "status": "paused",
+                "display_status": "paused",
+                "job_type": "flow_media_generation",
+                "title": f"Tạo media Google Flow cho #{video_id}",
+                "progress": str(
+                    attention_details.get("message")
+                    or video.get("production_progress")
+                    or ""
+                ),
+                "next_retry_at": "",
+                "flow_media_progress": {},
+                "error": security_logging.redact_sensitive(
+                    str(video.get("blocking_reason") or "")
+                ),
+                "attention_required": "flow_image_generation",
+                "attention_details": attention_details,
+                "can_retry_failed_scenes": True,
+                "can_retry_new_canvas": bool(
+                    attention_details.get("can_retry_new_canvas")
+                ),
+                "notification": {},
+                "muse_media_progress": {},
+                "muse_recovery": {},
+                "muse_artifacts": {},
+            }
     safe_mp4_artifact = (
         {
             "status": str(artifact.get("status") or ""),

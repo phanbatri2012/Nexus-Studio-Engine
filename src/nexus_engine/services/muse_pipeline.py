@@ -25,6 +25,7 @@ from nexus_engine.services import (
     muse_semantic_planner,
     process_registry,
     prompt_assets,
+    subtitle_layout,
     video_production,
 )
 from nexus_engine.services.muse_provider import (
@@ -2955,7 +2956,8 @@ def render_prepared_muse_video(
     input_hash = _json_hash(
         {
             "audio": _sha256_file(prepared["audio_path"]),
-            "captions": prepared["caption_hash"],
+            "captions": prepared.get("subtitle_hash")
+            or _sha256_file(prepared["srt_path"]),
             "scenes": hashes,
             "fallback_images": fallback_image_hashes,
             "plan": scenes,
@@ -2964,6 +2966,7 @@ def render_prepared_muse_video(
                 "height": 1080,
                 "fps": 30,
                 "video_extension_policy": video_production.VIDEO_EXTENSION_POLICY_VERSION,
+                "subtitle_render_style_version": subtitle_layout.SUBTITLE_RENDER_STYLE_VERSION,
             },
         }
     )

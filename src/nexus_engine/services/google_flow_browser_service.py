@@ -762,41 +762,44 @@ def run_browser_service(profile_name: str = DEFAULT_GOOGLE_FLOW_PROFILE) -> int:
                 args=launch_options["args"],
                 viewport={"width": 1280, "height": 800},
             )
-            _restore_saved_google_flow_session(context)
-            _initialize_service_page(context)
-            ready_deadline = time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
-            while time.monotonic() < ready_deadline and not _cdp_is_ready(endpoint):
-                time.sleep(SERVICE_POLL_SECONDS)
-            if not _cdp_is_ready(endpoint):
-                raise RuntimeError("Chromium did not expose its local CDP endpoint.")
-            state["ready"] = True
-            _refresh_generation_state(state, context)
-            print(f"Google Flow Browser Service ready at {endpoint}", flush=True)
+            try:
+                _restore_saved_google_flow_session(context)
+                _initialize_service_page(context)
+                ready_deadline = time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
+                while time.monotonic() < ready_deadline and not _cdp_is_ready(endpoint):
+                    time.sleep(SERVICE_POLL_SECONDS)
+                if not _cdp_is_ready(endpoint):
+                    raise RuntimeError("Chromium did not expose its local CDP endpoint.")
+                state["ready"] = True
+                _refresh_generation_state(state, context)
+                print(f"Google Flow Browser Service ready at {endpoint}", flush=True)
 
-            next_health_check = time.monotonic() + SERVICE_HEALTH_CHECK_SECONDS
-            while not stop_event.wait(SERVICE_POLL_SECONDS):
-                if _stop_requested(instance_id):
-                    break
-                if time.monotonic() >= next_health_check:
-                    if not _cdp_is_ready(endpoint):
-                        raise RuntimeError(
-                            "Chromium closed or its CDP endpoint was lost."
+                next_health_check = time.monotonic() + SERVICE_HEALTH_CHECK_SECONDS
+                while not stop_event.wait(SERVICE_POLL_SECONDS):
+                    if _stop_requested(instance_id):
+                        break
+                    if time.monotonic() >= next_health_check:
+                        if not _cdp_is_ready(endpoint):
+                            raise RuntimeError(
+                                "Chromium closed or its CDP endpoint was lost."
+                            )
+                        _refresh_generation_state(state, context)
+                        next_health_check = (
+                            time.monotonic() + SERVICE_HEALTH_CHECK_SECONDS
                         )
-                    _refresh_generation_state(state, context)
-                    next_health_check = (
-                        time.monotonic() + SERVICE_HEALTH_CHECK_SECONDS
-                    )
-            _save_current_google_flow_session(context)
+                _save_current_google_flow_session(context)
+            finally:
+                if _cdp_is_ready(endpoint):
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                context = None
     except Exception as exc:
         exit_code = 1
         _write_last_error(str(exc))
         print(f"Google Flow Browser Service failed: {exc}", file=sys.stderr, flush=True)
     finally:
-        if context is not None:
-            try:
-                context.close()
-            except Exception:
-                pass
         current_state = _read_json(SERVICE_STATE_PATH)
         if current_state.get("instance_id") == instance_id:
             SERVICE_STATE_PATH.unlink(missing_ok=True)

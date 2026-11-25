@@ -10,6 +10,7 @@ Muxes background video footage from a repository with:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -36,7 +37,7 @@ from nexus_engine.paths import (
     THUMBNAILS_DIR,
 )
 from nexus_engine.services import database as db
-from nexus_engine.services import process_registry
+from nexus_engine.services import process_registry, subtitle_layout
 
 logger = logging.getLogger(__name__)
 
@@ -830,8 +831,12 @@ def produce_stock_video(
 
     logger.info("Stock Video: Video ID %s audio duration is %.2fs (file: %s)", video_id, audio_duration, audio_path.name)
 
+    scratch_dir = RENDERS_DIR / "temp" / f"video_{video_id}_{int(time.time())}"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+
     # 2e. Prepare subtitles aligned with delayed audio (+3.0s)
     srt_path: Path | None = None
+    rendered_subtitle_hash = ""
     burn_subs = bool(
         (snapshot.get("pipeline") or {}).get("captions", True)
         and (snapshot.get("image_generation_settings") or {}).get("burn_subtitles", True)
@@ -841,14 +846,25 @@ def produce_stock_video(
             from nexus_engine.services.video_production import create_srt
             progress("Đang chuẩn bị phụ đề cho video...", "captions")
             srt_master, _ = create_srt(audio_path, video_id, progress)
-            if srt_master and srt_master.is_file():
-                shifted_srt_path = scratch_dir / f"shifted_{video_id}.srt"
-                if _create_time_shifted_srt(srt_master, shifted_srt_path, shift_seconds=3.0):
-                    srt_path = shifted_srt_path
-                    logger.info("Stock Video: Subtitles prepared and shifted by +3.0s: %s", srt_path.name)
-        except Exception as e:
-            logger.warning("Không thể chuẩn bị phụ đề cho Stock Video: %s", e)
-            srt_path = None
+            if not srt_master or not srt_master.is_file():
+                raise StockVideoRenderError("Không tìm thấy SRT nguồn sau khi tạo caption.")
+            shifted_srt_path = scratch_dir / f"shifted_{video_id}.srt"
+            if not _create_time_shifted_srt(
+                srt_master, shifted_srt_path, shift_seconds=3.0
+            ):
+                raise StockVideoRenderError("Không thể dịch timeline subtitle thêm 3 giây.")
+            subtitle_layout.validate_srt(shifted_srt_path)
+            srt_path = shifted_srt_path
+            rendered_subtitle_hash = hashlib.sha256(srt_path.read_bytes()).hexdigest()
+            logger.info(
+                "Stock Video: Subtitles prepared and shifted by +3.0s: %s",
+                srt_path.name,
+            )
+        except Exception as exc:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+            raise StockVideoRenderError(
+                f"Không thể chuẩn bị phụ đề đạt profile 2 dòng: {exc}"
+            ) from exc
 
     # 3. Locate thumbnail images: thumb_no_text (for 3s full intro) and thumb_path (for PiP)
     thumb_no_text_path: Path | None = None
@@ -953,9 +969,6 @@ def produce_stock_video(
     logger.info("Stock Video: Selected corner '%s' (mode: %s) for Video ID %s", corner, raw_corner, video_id)
 
     # 6. Generate Pre-rendered Overlays (Full 3s Intro, PiP Thumbnail & Direct Title Overlay)
-    scratch_dir = RENDERS_DIR / "temp" / f"video_{video_id}_{int(time.time())}"
-    scratch_dir.mkdir(parents=True, exist_ok=True)
-
     # 6a. Full 1080p Intro Thumbnail (3s without text)
     thumb_full_path = scratch_dir / "thumb_full_1080p.png"
     with Image.open(thumb_no_text_path) as source_im:
@@ -1027,11 +1040,7 @@ def produce_stock_video(
     )
     if srt_path:
         esc_srt = _escape_subtitle_path(srt_path)
-        sub_style = (
-            "FontName=Arial,FontSize=20,Bold=1,PrimaryColour=&H00FFFFFF,"
-            "OutlineColour=&H00000000,BorderStyle=1,Outline=2.5,Shadow=1,"
-            "Alignment=2,MarginV=45"
-        )
+        sub_style = subtitle_layout.SUBTITLE_FORCE_STYLE
         filter_complex += f";[v_comp]subtitles=filename='{esc_srt}':force_style='{sub_style}'[final_v]"
 
     # 10. Target Output Path
@@ -1178,6 +1187,11 @@ def produce_stock_video(
         duration_seconds=total_duration,
         mime_type="video/mp4",
         status="ready",
+        metadata={
+            "subtitle_hash": rendered_subtitle_hash,
+            "subtitle_profile_version": subtitle_layout.SUBTITLE_PROFILE_VERSION,
+            "subtitle_render_style_version": subtitle_layout.SUBTITLE_RENDER_STYLE_VERSION,
+        },
     )
 
     return {

@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from nexus_engine import main
-from nexus_engine.services import database as db
+from nexus_engine.services import database as db, video_production
 
 def test_job_supports_action_flow_capabilities():
     item_stalled = {
@@ -27,7 +27,7 @@ def test_job_center_actions_includes_new_actions():
     assert "fallback_static" in main.JOB_CENTER_ACTIONS
     assert "retry_new_flow_project" in main.JOB_CENTER_ACTIONS
 
-def test_flow_media_resume_resets_stagnant_count_and_terminal_scenes(monkeypatch):
+def test_flow_reconcile_resume_does_not_reset_terminal_scenes(monkeypatch):
     mock_job = {
         "id": "flow-test-123",
         "job_type": "flow_media_generation",
@@ -79,11 +79,371 @@ def test_flow_media_resume_resets_stagnant_count_and_terminal_scenes(monkeypatch
 
     assert updated_result.get("reconcile_stagnant_count") == 0
     assert "attention_required" not in updated_result
-    assert len(upserted_artifacts) == 1
-    assert upserted_artifacts[0]["artifact_type"] == "scene:1"
-    assert upserted_artifacts[0]["status"] == "queued"
-    assert upserted_artifacts[0]["metadata"]["terminal"] is False
-    assert upserted_artifacts[0]["metadata"]["generation_attempt"] == 0
+    assert upserted_artifacts == []
+
+
+def test_flow_scene_retry_only_resets_failed_scene_and_preserves_later_completed(monkeypatch):
+    mock_job = {
+        "id": "flow-video-471",
+        "job_type": "flow_media_generation",
+        "status": "paused",
+        "video_id": 471,
+        "result": {
+            "attention_required": "flow_image_generation",
+            "flow_media_progress": {"images_total": 186, "images_completed": 185},
+        },
+        "payload": {
+            "video_id": 471,
+            "force_new_project": True,
+            "force_new_flow_project": True,
+        },
+    }
+    artifacts = {
+        f"scene:{index}": {
+            "id": index + 1,
+            "status": "completed",
+            "path": f"scene-{index}.png",
+            "content_hash": f"hash-{index}",
+            "metadata": {"index": index},
+        }
+        for index in range(184)
+    }
+    artifacts["scene:184"] = {
+        "id": 185,
+        "status": "failed",
+        "path": "scene-184.png",
+        "content_hash": "hash-184",
+        "metadata": {
+            "index": 184,
+            "terminal": True,
+            "reason_code": "flow_max_attempts_exceeded",
+            "error": "original failure",
+            "submission_count": 5,
+            "submission_count_total": 5,
+            "manual_retry_epoch": 0,
+        },
+    }
+    artifacts["scene:185"] = {
+        "id": 186,
+        "status": "completed",
+        "path": "scene-185.png",
+        "content_hash": "hash-185",
+        "metadata": {"index": 185},
+    }
+    upserts = []
+    updated_job_fields = {}
+
+    monkeypatch.setattr(db, "get_system_job", lambda job_id: mock_job)
+    monkeypatch.setattr(db, "get_system_job_queue_position", lambda job_id: None)
+    monkeypatch.setattr(db, "list_latest_video_artifacts", lambda video_id, prefixes: artifacts)
+    monkeypatch.setattr(db, "get_video", lambda video_id: {"id": video_id, "flow_scene_count": 186})
+    monkeypatch.setattr(db, "upsert_video_artifact", lambda **kwargs: upserts.append(kwargs))
+    monkeypatch.setattr(
+        db,
+        "update_system_job",
+        lambda job_id, **kwargs: updated_job_fields.update(kwargs),
+    )
+    monkeypatch.setattr(db, "resume_system_job", lambda job_id: {"id": job_id, "status": "queued"})
+    monkeypatch.setattr(db, "update_video_production_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_kick_job_queues", lambda job_types: None)
+
+    main._run_system_job_center_action("flow-video-471", "resume", kick_queues=False)
+
+    assert [item["artifact_type"] for item in upserts] == ["scene:184"]
+    retried = upserts[0]
+    assert retried["status"] == "queued"
+    assert retried["metadata"]["submission_count"] == 0
+    assert retried["metadata"]["submission_count_total"] == 5
+    assert retried["metadata"]["manual_retry_epoch"] == 1
+    assert retried["metadata"]["last_error"] == "original failure"
+    assert artifacts["scene:185"]["status"] == "completed"
+    assert updated_job_fields["payload_json"]["force_new_project"] is False
+    assert updated_job_fields["payload_json"]["force_new_flow_project"] is False
+
+
+def test_video_render_resume_uses_shared_flow_recovery_helper(monkeypatch):
+    paused_job = {
+        "id": "flow-shared-resume",
+        "job_type": "flow_media_generation",
+        "status": "paused",
+        "video_id": 471,
+        "payload": {"video_id": 471},
+    }
+    resumed_job = {**paused_job, "status": "queued"}
+    calls = []
+    monkeypatch.setattr(video_production, "get_render_mode", lambda snapshot: "google_flow")
+    monkeypatch.setattr(main, "_enqueue_flow_media_job", lambda **kwargs: (paused_job, False))
+    monkeypatch.setattr(
+        main,
+        "_resume_flow_media_job",
+        lambda job: calls.append(job["id"]) or resumed_job,
+    )
+    monkeypatch.setattr(db, "update_video_production_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(db, "get_system_job", lambda job_id: resumed_job)
+    monkeypatch.setattr(main, "_kick_job_queues", lambda job_types: None)
+
+    job, created, phase = main._route_video_render_job(
+        video_id=471,
+        snapshot={},
+        mode="resume",
+    )
+
+    assert calls == ["flow-shared-resume"]
+    assert created is False
+    assert phase == "media_generation"
+    assert job["status"] == "queued"
+
+
+@pytest.mark.parametrize(
+    "attention_required",
+    ["flow_image_quota_exhausted", "flow_agent_limit_reached"],
+)
+def test_quota_and_agent_limit_resume_do_not_reset_scene_artifacts(
+    monkeypatch, attention_required
+):
+    job = {
+        "id": f"flow-{attention_required}",
+        "job_type": "flow_media_generation",
+        "status": "paused",
+        "video_id": 500,
+        "result": {"attention_required": attention_required},
+        "payload": {"video_id": 500},
+    }
+    upserts = []
+    monkeypatch.setattr(db, "get_system_job", lambda job_id: job)
+    monkeypatch.setattr(db, "get_system_job_queue_position", lambda job_id: None)
+    monkeypatch.setattr(db, "upsert_video_artifact", lambda **kwargs: upserts.append(kwargs))
+    monkeypatch.setattr(db, "update_system_job", lambda *args, **kwargs: None)
+    monkeypatch.setattr(db, "resume_system_job", lambda job_id: {**job, "status": "queued"})
+    monkeypatch.setattr(db, "update_video_production_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_kick_job_queues", lambda job_types: None)
+
+    item = main._system_job_center_item(job, None, hydrate=True)
+    assert item["can_flow_reset_project"] is False
+    assert item["can_flow_fallback_static"] is False
+    main._run_system_job_center_action(job["id"], "resume", kick_queues=False)
+
+    assert upserts == []
+
+
+def test_flow_attention_details_reports_failed_scene_and_progress(monkeypatch):
+    artifacts = {
+        f"scene:{index}": {
+            "status": "completed",
+            "metadata": {"index": index},
+        }
+        for index in range(185)
+    }
+    artifacts["scene:184"] = {
+        "status": "failed",
+        "metadata": {
+            "index": 184,
+            "terminal": True,
+            "reason_code": "flow_max_attempts_exceeded",
+            "submission_count": 5,
+            "manual_retry_epoch": 1,
+            "last_error": "safe diagnostic",
+        },
+    }
+    artifacts["scene:185"] = {
+        "status": "completed",
+        "metadata": {"index": 185},
+    }
+    monkeypatch.setattr(db, "list_latest_video_artifacts", lambda video_id, prefixes: artifacts)
+    monkeypatch.setattr(db, "get_video", lambda video_id: {"flow_scene_count": 186})
+
+    details = main._build_flow_attention_details(
+        471,
+        {"flow_media_progress": {"images_total": 186}},
+    )
+
+    assert details["message"] == "Cảnh 185 thất bại sau 5 lượt gửi; 185/186 ảnh đã hoàn tất."
+    assert details["failed_scenes"] == [
+        {
+            "scene_index": 184,
+            "scene_number": 185,
+            "reason_code": "flow_max_attempts_exceeded",
+            "submission_count": 5,
+            "last_error": "safe diagnostic",
+        }
+    ]
+    assert details["can_retry_failed_scenes"] is True
+    assert details["can_retry_new_canvas"] is True
+
+
+def test_job_center_hydration_restores_flow_attention_capabilities(monkeypatch):
+    item = {
+        "id": "flow-hydrated",
+        "type": "flow_media_generation",
+        "video_id": 471,
+        "status": "paused",
+        "can_resume": True,
+    }
+    details = {
+        "kind": "flow_scene_failure",
+        "failed_scenes": [{"scene_number": 185}],
+        "can_retry_failed_scenes": True,
+        "can_retry_new_canvas": False,
+    }
+    monkeypatch.setattr(main, "_build_flow_attention_details", lambda *args: details)
+
+    main._populate_system_job_payload_result(
+        item,
+        {"video_id": 471},
+        {"attention_required": "flow_image_generation"},
+    )
+
+    assert item["attention_details"] == details
+    assert item["can_resume"] is False
+    assert item["can_retry_failed_scenes"] is True
+    assert item["can_flow_reset_project"] is False
+
+
+def test_flow_scene_resume_without_terminal_artifact_returns_clear_conflict(monkeypatch):
+    job = {
+        "id": "flow-missing-terminal",
+        "job_type": "flow_media_generation",
+        "status": "paused",
+        "video_id": 471,
+        "payload": {"video_id": 471},
+        "result": {"attention_required": "flow_image_generation"},
+    }
+    monkeypatch.setattr(db, "get_system_job", lambda job_id: job)
+    monkeypatch.setattr(db, "get_system_job_queue_position", lambda job_id: None)
+    monkeypatch.setattr(db, "list_latest_video_artifacts", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "get_video", lambda video_id: {"id": video_id})
+
+    with pytest.raises(main.JobCenterActionNotAllowedError) as excinfo:
+        main._run_system_job_center_action(
+            "flow-missing-terminal",
+            "resume",
+            kick_queues=False,
+        )
+
+    assert "Không tìm thấy cảnh ảnh Flow lỗi hợp lệ" in str(excinfo.value)
+    assert "Tạo lại từ cảnh" in str(excinfo.value)
+
+
+def test_render_status_exposes_structured_flow_attention(tmp_path):
+    video_id = db.save_video(
+        "https://youtube.com/watch?v=flow-attention-api",
+        "Flow attention API",
+        "Transcript",
+        "Script",
+    )
+    job_id = f"flow-attention-{video_id}"
+    try:
+        completed_path = tmp_path / "scene-0.png"
+        completed_path.write_bytes(b"image")
+        db.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:0",
+            path=str(completed_path),
+            content_hash="completed-hash",
+            status="completed",
+            mime_type="image/png",
+            metadata={"index": 0},
+        )
+        db.upsert_video_artifact(
+            video_id=video_id,
+            artifact_type="scene:1",
+            path=str(tmp_path / "scene-1.png"),
+            content_hash="failed-hash",
+            status="failed",
+            mime_type="image/png",
+            metadata={
+                "index": 1,
+                "terminal": True,
+                "reason_code": "flow_max_attempts_exceeded",
+                "submission_count": 5,
+                "manual_retry_epoch": 0,
+                "last_error": "safe failure",
+            },
+        )
+        db.create_system_job(
+            job_id=job_id,
+            job_type="flow_media_generation",
+            video_id=video_id,
+            title="Tạo media Google Flow",
+            payload={"video_id": video_id, "snapshot": {}},
+        )
+        db.update_system_job(
+            job_id,
+            status="paused",
+            progress="needs attention",
+            result_json={
+                "attention_required": "flow_image_generation",
+                "flow_media_progress": {"images_total": 2, "images_completed": 1},
+            },
+        )
+
+        response = main.get_render_status(video_id)
+
+        assert response["state"] == "paused"
+        assert response["job"]["attention_required"] == "flow_image_generation"
+        assert response["job"]["attention_details"]["kind"] == "flow_scene_failure"
+        assert response["job"]["attention_details"]["failed_scenes"][0]["scene_number"] == 2
+        assert response["job"]["can_retry_failed_scenes"] is True
+        assert response["job"]["can_retry_new_canvas"] is False
+    finally:
+        db.delete_system_job(job_id)
+        db.delete_video(video_id)
+
+
+def test_startup_reconciles_orphan_render_states_without_enqueue(tmp_path, monkeypatch):
+    final_mp4 = tmp_path / "ready.mp4"
+    final_mp4.write_bytes(b"valid-mp4")
+    videos = [
+        {"id": 1, "video_status": "active", "render_status": "running"},
+        {"id": 2, "video_status": "active", "render_status": "running"},
+        {"id": 221, "video_status": db.VIDEO_STATUS_ERROR, "render_status": "running"},
+        {"id": 4, "video_status": "active", "render_status": "running"},
+    ]
+    terminal_artifact = (
+        "scene:184",
+        {"status": "failed", "metadata": {"terminal": True}},
+    )
+    updates = []
+    monkeypatch.setattr(db, "list_orphaned_active_render_videos", lambda: videos)
+    monkeypatch.setattr(
+        main,
+        "_flow_terminal_scene_artifacts",
+        lambda video_id: [terminal_artifact] if video_id == 1 else [],
+    )
+    monkeypatch.setattr(
+        main,
+        "_build_flow_attention_details",
+        lambda video_id, result=None: {
+            "message": "Cảnh 185 thất bại",
+            "failed_scenes": [{"last_error": "safe failure"}],
+        },
+    )
+    monkeypatch.setattr(
+        db,
+        "get_latest_video_artifact",
+        lambda video_id, artifact_type, status=None: (
+            {"path": str(final_mp4), "status": "ready"} if video_id == 2 else None
+        ),
+    )
+    monkeypatch.setattr(
+        db,
+        "update_video_production_state",
+        lambda video_id, **kwargs: updates.append((video_id, kwargs)),
+    )
+    monkeypatch.setattr(
+        main,
+        "_enqueue_flow_media_job",
+        lambda **kwargs: pytest.fail("startup reconcile must not enqueue"),
+    )
+
+    counts = main._reconcile_orphaned_video_render_states()
+
+    assert counts == {"paused": 1, "ready": 1, "error": 1, "canceled": 1}
+    by_id = dict(updates)
+    assert by_id[1]["current_stage"] == "flow_image_needs_attention"
+    assert by_id[2]["render_status"] == "ready"
+    assert by_id[221]["render_status"] == "error"
+    assert by_id[4]["current_stage"] == "interrupted"
 
 def test_retry_new_flow_project_purges_failed_scene_artifacts(monkeypatch):
     mock_job = {
@@ -97,6 +457,7 @@ def test_retry_new_flow_project_purges_failed_scene_artifacts(monkeypatch):
 
     deleted_artifacts = []
     project_requested = []
+    upserted_artifacts = []
 
     def mock_get_system_job(job_id):
         return mock_job
@@ -109,7 +470,7 @@ def test_retry_new_flow_project_purges_failed_scene_artifacts(monkeypatch):
 
     mock_scenes = {
         "scene:10": {"id": 101, "status": "completed", "metadata": {}},
-        "scene:11": {"id": 102, "status": "failed", "metadata": {"terminal": True, "reason_code": "flow_max_attempts_exceeded"}},
+        "scene:11": {"id": 102, "status": "failed", "path": "scene-11.png", "content_hash": "hash-11", "metadata": {"terminal": True, "reason_code": "flow_max_attempts_exceeded", "manual_retry_epoch": 1, "submission_count": 5, "submission_count_total": 10}},
     }
 
     def mock_list_latest(vid_id, prefixes):
@@ -130,12 +491,18 @@ def test_retry_new_flow_project_purges_failed_scene_artifacts(monkeypatch):
     monkeypatch.setattr(db, "update_video_production_state", mock_update_video_production_state)
     monkeypatch.setattr(db, "list_latest_video_artifacts", mock_list_latest)
     monkeypatch.setattr(db, "delete_video_artifact", mock_delete_artifact)
+    monkeypatch.setattr(db, "upsert_video_artifact", lambda **kwargs: upserted_artifacts.append(kwargs))
     monkeypatch.setattr(db, "request_new_flow_project", mock_request_new)
+    monkeypatch.setattr(db, "get_video", lambda vid_id: {"id": vid_id, "flow_scene_count": 12})
     monkeypatch.setattr(main, "_kick_job_queues", lambda x: None)
 
     main._run_system_job_center_action("flow-test-456", "retry_new_flow_project", kick_queues=False)
 
-    assert deleted_artifacts == [102]
+    assert deleted_artifacts == []
+    assert [item["artifact_type"] for item in upserted_artifacts] == ["scene:11"]
+    assert upserted_artifacts[0]["status"] == "queued"
+    assert upserted_artifacts[0]["metadata"]["manual_retry_epoch"] == 2
+    assert upserted_artifacts[0]["metadata"]["submission_count_total"] == 10
     assert project_requested == [888]
 
 
@@ -164,7 +531,56 @@ def test_retry_new_flow_canvas_for_video_validation(monkeypatch):
     assert exc_info.value.status_code == 409
 
 
-def test_retry_new_flow_canvas_for_video_success_after_completed_job(monkeypatch):
+def test_retry_new_flow_canvas_requires_current_canvas_retry_first(monkeypatch):
+    from fastapi import HTTPException
+
+    terminal_scene = {
+        "scene:184": {
+            "status": "failed",
+            "metadata": {
+                "index": 184,
+                "terminal": True,
+                "reason_code": "flow_max_attempts_exceeded",
+                "submission_count": 5,
+                "manual_retry_epoch": 0,
+            },
+        }
+    }
+    monkeypatch.setattr(
+        db,
+        "get_video",
+        lambda video_id: {
+            "id": video_id,
+            "video_status": "active",
+            "flow_scene_count": 186,
+        },
+    )
+    monkeypatch.setattr(db, "list_system_jobs", lambda video_id, limit=None: [])
+    monkeypatch.setattr(
+        db,
+        "list_latest_video_artifacts",
+        lambda video_id, prefixes: terminal_scene,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        main.retry_new_flow_canvas_for_video(471)
+
+    assert exc_info.value.status_code == 409
+    assert "Canvas hiện tại" in str(exc_info.value.detail)
+
+
+@pytest.mark.parametrize(
+    ("keep_successful", "request_body"),
+    [
+        (True, None),
+        (False, main.RetryNewFlowCanvasRequest(keep_successful=False)),
+    ],
+)
+def test_retry_new_flow_canvas_for_video_success_after_completed_job(
+    monkeypatch,
+    keep_successful,
+    request_body,
+):
     """Simulate video 379 scenario: video in intro_fallback_review with a completed flow job."""
     from nexus_engine.services import video_production
 
@@ -219,17 +635,18 @@ def test_retry_new_flow_canvas_for_video_success_after_completed_job(monkeypatch
     monkeypatch.setattr(db, "update_video_production_state", mock_update_prod_state)
     monkeypatch.setattr(main, "_kick_job_queues", lambda x: None)
 
-    res = main.retry_new_flow_canvas_for_video(379)
+    res = main.retry_new_flow_canvas_for_video(379, request_body)
 
     assert res["success"] is True
     assert res["video_id"] == 379
     assert res["job_id"] == "flow-media-new"
     assert res["purged_count"] == 12
+    assert res["keep_successful"] is keep_successful
 
     # Verify paused job was canceled to avoid duplicate queue conflict
     assert canceled_jobs == ["flow-media-paused"]
-    # Verify intro video artifacts were purged with keep_successful=True
-    assert purged_videos == [(379, True)]
+    # Default remains compatible while the explicit false path removes all intro clips.
+    assert purged_videos == [(379, keep_successful)]
     # Verify new flow project was requested
     assert requested_flow_projects == [379]
     # Verify new flow media job was enqueued with force_new_flow_project=True
@@ -269,7 +686,7 @@ async def test_generate_scene_video_reuses_valid_target_on_disk(tmp_path, monkey
     monkeypatch.setattr(video_production, "SCENES_DIR", tmp_path)
     monkeypatch.setattr(video_production, "probe_scene_video", lambda p: {"duration_seconds": 4.0, "video_codec": "h264"})
     monkeypatch.setattr(video_production, "_sha256_file", lambda p: "test_hash_val")
-    monkeypatch.setattr(video_production, "_scene_hash", lambda *args: "test1234abcd")
+    monkeypatch.setattr(video_production, "_scene_video_hash", lambda *args: "test1234abcd")
 
     start_frame = tmp_path / "start.png"
     start_frame.write_bytes(b"image")

@@ -497,7 +497,7 @@ def normalize_image_generation_settings(value: object) -> dict:
     )
     normalized["enable_intro_video"] = bool(settings.get("enable_intro_video", True))
     try:
-        normalized["intro_scene_target_seconds"] = max(4.0, min(15.0, float(settings.get("intro_scene_target_seconds", 8.0) or 8.0)))
+        normalized["intro_scene_target_seconds"] = max(8.0, min(10.0, float(settings.get("intro_scene_target_seconds", 8.0) or 8.0)))
     except (TypeError, ValueError):
         normalized["intro_scene_target_seconds"] = 8.0
     normalized["intro_crop_watermark"] = bool(settings.get("intro_crop_watermark", True))

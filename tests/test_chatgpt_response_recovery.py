@@ -719,3 +719,168 @@ def test_set_primary_thumbnail_and_remove_models():
 
 
 
+
+
+def test_is_chatgpt_accessibility_or_boilerplate():
+    from nexus_engine.services.chatgpt_worker import is_chatgpt_accessibility_or_boilerplate
+    assert is_chatgpt_accessibility_or_boilerplate("ChatGPT said:") is True
+    assert is_chatgpt_accessibility_or_boilerplate("ChatGPT said") is True
+    assert is_chatgpt_accessibility_or_boilerplate("You said:") is True
+    assert is_chatgpt_accessibility_or_boilerplate("Latest response") is True
+    assert is_chatgpt_accessibility_or_boilerplate("ChatGPT said: short note") is True
+    assert is_chatgpt_accessibility_or_boilerplate("") is True
+    assert is_chatgpt_accessibility_or_boilerplate(None) is True
+    # Real responses must NOT match
+    assert is_chatgpt_accessibility_or_boilerplate("Phần 1: Trung tá Nguyễn Minh Đức bất ngờ gặp lại vợ cũ") is False
+    assert is_chatgpt_accessibility_or_boilerplate("MC: Giữa cơn mưa tầm tã, một trung tá bắt gặp vợ cũ bị giang hồ truy đuổi.") is False
+
+
+def test_strip_chatgpt_speech_header():
+    from nexus_engine.services.chatgpt_worker import strip_chatgpt_speech_header
+    assert strip_chatgpt_speech_header("ChatGPT said: MC: Chào mừng quý vị") == "MC: Chào mừng quý vị"
+    assert strip_chatgpt_speech_header("ChatGPT said:\n\nMC: Chào mừng quý vị") == "MC: Chào mừng quý vị"
+    assert strip_chatgpt_speech_header("You said: Viết dàn ý chi tiết") == "Viết dàn ý chi tiết"
+    assert strip_chatgpt_speech_header("ChatGPT said:") == ""
+    assert strip_chatgpt_speech_header("Latest response:") == ""
+
+
+def test_clean_text_drops_chatgpt_speech_headers():
+    from nexus_engine.services.chatgpt_worker import clean_text
+    raw = "ChatGPT said:\n\nMC: Giữa cơn mưa tầm tã, trung tá gặp vợ cũ.\n\nKHACH_1: Cháu thấy Hạnh ôm con chạy trốn."
+    cleaned = clean_text(raw)
+    assert not cleaned.startswith("ChatGPT said")
+    assert "MC: Giữa cơn mưa tầm tã" in cleaned
+    assert "KHACH_1: Cháu thấy Hạnh" in cleaned
+
+
+def test_read_assistant_message_ignores_sr_only_heading():
+    from unittest.mock import MagicMock
+    from nexus_engine.services.chatgpt_worker import _read_assistant_message
+
+    # Mock sr-only H4 element (ChatGPT screen-reader turn header)
+    h4_node = MagicMock()
+    h4_node.get_attribute.side_effect = lambda attr: "sr-only m-0 select-none" if attr == "class" else ""
+    assert _read_assistant_message(h4_node) == ""
+
+    # Mock message that only returns 'ChatGPT said:' on fallback
+    empty_markdown_locator = MagicMock()
+    empty_markdown_locator.count.return_value = 0
+    empty_markdown_locator.first.count.return_value = 0
+
+    msg_node = MagicMock()
+    msg_node.get_attribute.return_value = ""
+    msg_node.locator.return_value = empty_markdown_locator
+    msg_node.inner_text.return_value = "ChatGPT said:"
+    msg_node.evaluate.return_value = "ChatGPT said:"
+
+    assert _read_assistant_message(msg_node) == ""
+
+
+def test_is_chatgpt_boilerplate_filters_footer_disclaimer():
+    from nexus_engine.services.chatgpt_worker import is_chatgpt_accessibility_or_boilerplate
+
+    assert is_chatgpt_accessibility_or_boilerplate("ChatGPT can make mistakes. Check important info.") is True
+    assert is_chatgpt_accessibility_or_boilerplate("ChatGPT có thể mắc lỗi. Hãy kiểm tra các thông tin quan trọng.") is True
+
+
+def test_extract_payload_respects_excluded_message_ids_for_repeated_prompts():
+    prompt_text = "Hãy soạn câu trả lời cho bình luận YouTube."
+    payload = {
+        "current_node": "user_2",
+        "mapping": {
+            "user_1": {
+                "id": "user_1",
+                "parent": None,
+                "message": {
+                    "id": "user_1",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": [prompt_text]},
+                    "status": "finished_successfully",
+                },
+            },
+            "assistant_1": {
+                "id": "assistant_1",
+                "parent": "user_1",
+                "message": {
+                    "id": "assistant_1",
+                    "author": {"role": "assistant"},
+                    "content": {"content_type": "text", "parts": ['[{"comment_id":"c1","reply":"Old reply"}]']},
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                },
+            },
+            "user_2": {
+                "id": "user_2",
+                "parent": "assistant_1",
+                "message": {
+                    "id": "user_2",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": [prompt_text]},
+                    "status": "finished_successfully",
+                },
+            },
+        },
+    }
+
+    # Before the new assistant reply is persisted, excluded_message_ids must
+    # prevent returning the stale assistant_1 answer from the earlier identical turn.
+    assert (
+        extract_assistant_response_from_conversation_payload(
+            payload,
+            expected_user_text=prompt_text,
+            excluded_message_ids={"assistant_1"},
+        )
+        == ""
+    )
+
+    payload["current_node"] = "assistant_2"
+    payload["mapping"]["assistant_2"] = {
+        "id": "assistant_2",
+        "parent": "user_2",
+        "message": {
+            "id": "assistant_2",
+            "author": {"role": "assistant"},
+            "content": {"content_type": "text", "parts": ['<escape>[{"comment_id":"c1","reply":"New reply"}]</escape>']},
+            "status": "finished_successfully",
+            "end_turn": True,
+        },
+    }
+
+    extracted = extract_assistant_response_from_conversation_payload(
+        payload,
+        expected_user_text=prompt_text,
+        excluded_message_ids={"assistant_1"},
+    )
+    assert "New reply" in extracted
+    assert "Old reply" not in extracted
+
+
+def test_wait_for_assistant_response_polls_backend_early_for_dil_renderer(monkeypatch):
+    from nexus_engine.services import chatgpt_worker
+
+    mock_page = MagicMock()
+    mock_page.url = "https://chatgpt.com/g/g-p-123/c/6afd15ea-4f68-83ec-b62c-fa2bb100af00"
+    monkeypatch.setattr(chatgpt_worker, "accept_external_app_permission_dialog", lambda p: False)
+    monkeypatch.setattr(chatgpt_worker, "is_chatgpt_generation_active", lambda p: False)
+    monkeypatch.setattr(chatgpt_worker, "is_chatgpt_render_error_present", lambda p: False)
+    monkeypatch.setattr(chatgpt_worker, "has_empty_dil_renderer", lambda p: True)
+    monkeypatch.setattr(chatgpt_worker, "get_new_assistant_response", lambda *a, **kw: "")
+    monkeypatch.setattr(chatgpt_worker, "get_assistant_response_after_latest_user", lambda *a, **kw: "")
+    monkeypatch.setattr(
+        chatgpt_worker,
+        "recover_assistant_response_from_backend",
+        lambda p, expected_user_text="", excluded_message_ids=None: '[{"comment_id":"c1","reply":"Dil reply"}]',
+    )
+
+    monotonic_values = iter([0.0, 2.5, 6.5, 35.0])
+    monkeypatch.setattr(chatgpt_worker.time, "monotonic", lambda: next(monotonic_values, 35.0))
+    monkeypatch.setattr(chatgpt_worker.time, "sleep", lambda _: None)
+
+    result = wait_for_assistant_response(
+        mock_page,
+        previous_assistant_turn=1,
+        timeout=30,
+        submitted_prompt_text="prompt",
+        excluded_message_ids={"old_msg"},
+    )
+    assert result == '[{"comment_id":"c1","reply":"Dil reply"}]'

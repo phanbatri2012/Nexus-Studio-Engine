@@ -14,6 +14,7 @@ import ChannelManager from './ChannelManager'
 import VideoQueuePanel from './VideoQueuePanel'
 import VideoGenerationProgressCard from './VideoGenerationProgressCard'
 import YouTubeDownloader from './YouTubeDownloader'
+import FullMovie from './FullMovie'
 import YouTubeComments from './YouTubeComments'
 import TTSSettings from './TTSSettings'
 import MuseStudio from './MuseStudio'
@@ -269,6 +270,8 @@ function App() {
 
   const renderJobStatus = renderInfo?.job?.display_status || renderInfo?.job?.status || ''
   const renderNotification = renderInfo?.job?.notification || {}
+  const flowAttentionDetails = renderInfo?.job?.attention_details || {}
+  const isFlowSceneAttention = flowAttentionDetails?.kind === 'flow_scene_failure'
   const isRenderPaused = Boolean(!isRendering && (renderInfo?.is_paused || renderJobStatus === 'paused'))
   const isRenderActive = Boolean(isRendering || renderInfo?.is_active || ['queued', 'running', 'retry_wait'].includes(renderJobStatus)) && !isRenderPaused
   const isRenderError = !isRenderActive && !isRenderPaused && Boolean(renderInfo?.is_error || renderInfo?.job?.status === 'error' || renderInfo?.job?.status === 'failed')
@@ -1964,6 +1967,17 @@ function App() {
     }
   };
 
+  const handleRetryFailedFlowScenes = async () => {
+    const sceneNumbers = (flowAttentionDetails.failed_scenes || [])
+      .map(scene => scene.scene_number)
+      .join(', ')
+    if (!window.confirm(
+      `Thử lại cảnh ${sceneNumbers || 'lỗi'} trên Canvas hiện tại?\n\n` +
+      'Hành động này mở một chu kỳ mới, tối đa 5 lượt gửi Google Flow cho mỗi cảnh lỗi và có thể dùng quota.'
+    )) return
+    await handleRenderVideo('resume')
+  }
+
   const handleCancelRenderVideo = async () => {
     if (!currentVideoId || isCancelingRender) return;
     setIsCancelingRender(true);
@@ -2406,6 +2420,11 @@ function App() {
             onClick={() => setActiveView('downloader')}
           >YouTube Downloader</li>
           <li
+            className={`nav-item ${activeView === 'fullmovie' ? 'active' : ''}`}
+            data-view="fullmovie"
+            onClick={() => setActiveView('fullmovie')}
+          >Ghép phim Full</li>
+          <li
             className={`nav-item ${activeView === 'autologin' ? 'active' : ''}`}
             data-view="autologin"
             aria-disabled={chatGptControlsDisabled}
@@ -2509,6 +2528,8 @@ function App() {
             />
           ) : activeView === 'downloader' ? (
             <YouTubeDownloader />
+          ) : activeView === 'fullmovie' ? (
+            <FullMovie />
           ) : activeView === 'dashboard' ? (
             <>
               <h1 className="hero-title">Video Library</h1>
@@ -3814,7 +3835,7 @@ function App() {
                             {isRenderPaused && (
                               <div style={{ marginTop: '4px', display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
                                 <button
-                                  onClick={() => handleRenderVideo('resume')}
+                                  onClick={isFlowSceneAttention ? handleRetryFailedFlowScenes : () => handleRenderVideo('resume')}
                                   disabled={isRendering}
                                   style={{
                                     background: 'linear-gradient(135deg, #1abc9c, #16a085)',
@@ -3829,10 +3850,32 @@ function App() {
                                     alignItems: 'center',
                                     gap: '4px'
                                   }}
-                                  title="Tiếp tục tiến trình dựng từ checkpoint an toàn"
+                                  title={isFlowSceneAttention
+                                    ? 'Giữ nguyên mọi artifact đã hoàn tất và thử lại đúng cảnh lỗi trên Canvas hiện tại'
+                                    : 'Tiếp tục tiến trình dựng từ checkpoint an toàn'}
                                 >
-                                  ▶️ Tiếp tục Render
+                                  {isFlowSceneAttention
+                                    ? `▶️ Thử lại cảnh ${(flowAttentionDetails.failed_scenes || []).map(scene => scene.scene_number).join(', ')}`
+                                    : '▶️ Tiếp tục Render'}
                                 </button>
+                                {isFlowSceneAttention && flowAttentionDetails.can_retry_new_canvas && (
+                                  <button
+                                    onClick={handleRetryNewFlowCanvas}
+                                    disabled={isRendering}
+                                    style={{
+                                      background: 'rgba(2, 132, 199, 0.2)',
+                                      border: '1px solid #0284c7',
+                                      color: '#38bdf8',
+                                      borderRadius: '4px',
+                                      padding: '4px 8px',
+                                      fontSize: '0.78em',
+                                      fontWeight: 'bold',
+                                      cursor: isRendering ? 'not-allowed' : 'pointer'
+                                    }}
+                                  >
+                                    Đổi Canvas mới & thử lại
+                                  </button>
+                                )}
                                 <button
                                   onClick={handleCancelRenderVideo}
                                   disabled={isCancelingRender}
@@ -4373,6 +4416,33 @@ function App() {
                                     )}
                                   </div>
                                 </div>
+                                {isRenderPaused && isFlowSceneAttention && (
+                                  <div
+                                    data-testid="flow-scene-attention-card"
+                                    style={{
+                                      width: '100%',
+                                      marginBottom: '10px',
+                                      padding: '10px 14px',
+                                      background: 'rgba(245, 158, 11, 0.12)',
+                                      border: '1px solid rgba(245, 158, 11, 0.5)',
+                                      borderRadius: '6px',
+                                      color: '#fde68a'
+                                    }}
+                                  >
+                                    <div style={{ fontWeight: 'bold', fontSize: '0.9em' }}>
+                                      ⚠️ {flowAttentionDetails.message}
+                                    </div>
+                                    {(flowAttentionDetails.failed_scenes || []).map(scene => (
+                                      <div key={scene.scene_index} style={{ marginTop: '5px', fontSize: '0.82em', color: '#fef3c7' }}>
+                                        Cảnh {scene.scene_number}: {scene.reason_code}
+                                        {scene.last_error ? ` · ${scene.last_error}` : ''}
+                                      </div>
+                                    ))}
+                                    <div style={{ marginTop: '6px', fontSize: '0.82em', color: '#fbbf24' }}>
+                                      Thử lại đúng cảnh lỗi trên Canvas hiện tại; các artifact đã hoàn tất được giữ nguyên.
+                                    </div>
+                                  </div>
+                                )}
                                 {(renderInfo?.current_stage === 'intro_fallback_review' || renderInfo?.current_stage === 'flow_reconcile_stalled') && (
                                     <div style={{
                                       width: '100%',
@@ -4494,11 +4564,13 @@ function App() {
                                     <>
                                       <button
                                         className="btn-primary"
-                                        onClick={() => handleRenderVideo('resume')}
+                                        onClick={isFlowSceneAttention ? handleRetryFailedFlowScenes : () => handleRenderVideo('resume')}
                                         disabled={isRendering || currentVideoIsError}
-                                        title={renderInfo?.render_mode === 'stock_video'
-                                          ? "Tận dụng lại audio và phụ đề đã tạo, tiếp tục dựng video MP4"
-                                          : "Tiếp tục tạo các cảnh media còn lại từ checkpoint"}
+                                        title={isFlowSceneAttention
+                                          ? 'Giữ nguyên mọi artifact đã hoàn tất và thử lại đúng cảnh lỗi trên Canvas hiện tại'
+                                          : renderInfo?.render_mode === 'stock_video'
+                                            ? "Tận dụng lại audio và phụ đề đã tạo, tiếp tục dựng video MP4"
+                                            : "Tiếp tục tạo các cảnh media còn lại từ checkpoint"}
                                         style={{
                                           padding: '4px 14px',
                                           fontSize: '0.82em',
@@ -4513,8 +4585,30 @@ function App() {
                                           gap: '4px'
                                         }}
                                       >
-                                        ▶️ Tiếp tục
+                                        {isFlowSceneAttention
+                                          ? `▶️ Thử lại cảnh ${(flowAttentionDetails.failed_scenes || []).map(scene => scene.scene_number).join(', ')}`
+                                          : '▶️ Tiếp tục'}
                                       </button>
+                                      {isFlowSceneAttention && flowAttentionDetails.can_retry_new_canvas && (
+                                        <button
+                                          className="btn-secondary"
+                                          onClick={handleRetryNewFlowCanvas}
+                                          disabled={isRendering || currentVideoIsError}
+                                          title="Cùng cảnh đã thất bại thêm một chu kỳ; đổi Canvas mới nhưng giữ nguyên artifact hoàn tất"
+                                          style={{
+                                            padding: '4px 14px',
+                                            fontSize: '0.82em',
+                                            background: 'rgba(2, 132, 199, 0.2)',
+                                            border: '1px solid #0284c7',
+                                            color: '#38bdf8',
+                                            cursor: 'pointer',
+                                            fontWeight: 'bold',
+                                            borderRadius: '4px'
+                                          }}
+                                        >
+                                          🔄 Đổi Canvas mới & thử lại
+                                        </button>
+                                      )}
                                       {renderInfo?.render_mode !== 'stock_video' && allBaseImagesReady && (
                                         <button
                                           className="btn-secondary"

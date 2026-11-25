@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import inspect
 import json
 import logging
 import re
@@ -397,6 +398,7 @@ def capture_browser_diagnostics_sync(
     current_url = ""
     page_title = ""
     html_content = ""
+    visible_text: str | None = None
     screenshot_captured = False
 
     if page is not None:
@@ -409,6 +411,13 @@ def capture_browser_diagnostics_sync(
             page_title = str(page.title() or "")
         except Exception:
             page_title = ""
+
+        try:
+            candidate = page.evaluate("() => document.body?.innerText || ''")
+            if isinstance(candidate, str):
+                visible_text = candidate
+        except Exception as visible_exc:
+            logger.debug("Failed to read visible page text: %s", visible_exc)
 
         # DOM snapshot
         try:
@@ -447,7 +456,7 @@ def capture_browser_diagnostics_sync(
     detected_blockers = detect_browser_blockers(
         url=current_url,
         title=page_title,
-        html_text=html_content,
+        html_text=visible_text if visible_text is not None else html_content,
     )
 
     error_str = security_logging.redact_sensitive(error) if error is not None else ""
@@ -524,6 +533,7 @@ async def capture_browser_diagnostics_async(
     current_url = ""
     page_title = ""
     html_content = ""
+    visible_text: str | None = None
     screenshot_captured = False
 
     if page is not None:
@@ -536,6 +546,15 @@ async def capture_browser_diagnostics_async(
             page_title = str(await page.title() if asyncio.iscoroutinefunction(page.title) else page.title() or "")
         except Exception:
             page_title = ""
+
+        try:
+            candidate = page.evaluate("() => document.body?.innerText || ''")
+            if inspect.isawaitable(candidate):
+                candidate = await asyncio.wait_for(candidate, timeout=2.0)
+            if isinstance(candidate, str):
+                visible_text = candidate
+        except Exception as visible_exc:
+            logger.debug("Failed to read visible page text: %s", visible_exc)
 
         # DOM snapshot
         try:
@@ -573,7 +592,7 @@ async def capture_browser_diagnostics_async(
     detected_blockers = detect_browser_blockers(
         url=current_url,
         title=page_title,
-        html_text=html_content,
+        html_text=visible_text if visible_text is not None else html_content,
     )
 
     error_str = security_logging.redact_sensitive(error) if error is not None else ""

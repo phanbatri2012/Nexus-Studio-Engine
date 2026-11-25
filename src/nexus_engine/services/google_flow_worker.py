@@ -140,6 +140,10 @@ class FlowSubmissionError(RuntimeError):
 class FlowUiStateError(RuntimeError):
     """Raised when the Flow UI cannot be inspected reliably."""
 
+    def __init__(self, message: str, *, reason_code: str = "flow_ui_state_error"):
+        super().__init__(message)
+        self.reason_code = reason_code
+
 
 class FlowResultMissingError(RuntimeError):
     """Raised when Flow becomes idle without exposing a new result."""
@@ -211,6 +215,15 @@ class FlowVideoPending(FlowMediaPending):
 
 class FlowImageNeedsAttention(RuntimeError):
     """Raised after bounded transient image retries have been exhausted."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "flow_image_needs_attention",
+    ):
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 class FlowVideoWaitExpired(FlowGenerationTimeout):
@@ -1994,6 +2007,45 @@ class GoogleFlowWorker:
             raw = re.sub(r"=(?:s\d+|w\d+-h\d+)(-[a-zA-Z0-9_-]+)?$", "", raw)
         return raw
 
+    @staticmethod
+    def _is_playable_video_source(value: object) -> bool:
+        """Return whether a value is a playable video URL, never a UI locator."""
+        source = str(value or "").strip()
+        if not source:
+            return False
+        lower = source.casefold()
+        if lower.startswith(("data:", "flow_canvas_tile:", "flow_video_tile:")):
+            return False
+        is_media_stream = "=mm," in lower or "/videoplayback" in lower
+        is_image = bool(
+            re.search(r"\.(?:png|jpe?g|webp|gif)(?:\?|$)", source, re.IGNORECASE)
+        ) or "/image/" in lower or ("/asb/" in lower and not is_media_stream)
+        if is_image:
+            return False
+        return bool(
+            lower.startswith("blob:")
+            or re.search(r"\.(?:mp4|webm|mov)(?:\?|$)", source, re.IGNORECASE)
+            or is_media_stream
+            or "/video/" in lower
+        )
+
+    def _candidate_has_video_evidence(self, candidate: dict) -> bool:
+        """Fail closed unless a candidate has explicit video UI or media evidence."""
+        if candidate.get("isVideo") is True:
+            return True
+        if str(candidate.get("uiRef") or "").startswith("flow_video_tile:"):
+            return True
+        if candidate.get("hasPlayControl") is True or candidate.get("hasDownloadControl") is True:
+            return True
+        return any(
+            self._is_playable_video_source(value)
+            for value in [
+                candidate.get("src"),
+                candidate.get("url"),
+                *(candidate.get("urls") or []),
+            ]
+        )
+
     def _remember_generated_image_identity(self, candidate: dict, source: str) -> None:
         self._last_generated_image_identity = {
             "flow_project_id": self._project_id(),
@@ -2187,6 +2239,7 @@ class GoogleFlowWorker:
                 "[data-testid*='asset-picker' i], .asset-picker, .uploads-picker";
             const cardSelector =
                 "flow-grid-tile-container, flow-tile-container, flow-video-tile, " +
+                "flow-a2ui-video-option, [data-video-url], [data-testid*='video' i], " +
                 "flow-media-tile, flow-canvas-tile, flow-canvas-item, " +
                 "[data-media-id], [data-asset-id], [data-testid*='media' i], " +
                 ".media-card, .canvas-tile";
@@ -2220,9 +2273,11 @@ class GoogleFlowWorker:
                 const videoNodes = mediaNodes.filter((node) =>
                     node.tagName === 'VIDEO' || node.tagName === 'SOURCE'
                 );
-                const controlText = Array.from(card.querySelectorAll(
+                const controlNodes = Array.from(card.querySelectorAll(
                     "button, [role='button'], mat-icon, .material-icons, .material-symbols-outlined"
-                )).map((node) => `${node.textContent || ''} ${node.getAttribute('aria-label') || ''}`)
+                ));
+                const controlText = controlNodes
+                    .map((node) => `${node.textContent || ''} ${node.getAttribute('aria-label') || ''}`)
                     .join(' ').toLowerCase();
                 const cardText = `${card.textContent || ''} ${card.getAttribute('aria-label') || ''}`
                     .toLowerCase();
@@ -2230,10 +2285,29 @@ class GoogleFlowWorker:
                     `${card.getAttribute('data-state') || ''} ` +
                     `${card.getAttribute('data-tile-state') || ''}`
                 ).toLowerCase();
+                const explicitVideoTile = card.matches(
+                    "flow-video-tile, flow-a2ui-video-option, [data-testid*='video' i]"
+                ) || Boolean(card.querySelector(
+                    "flow-video-tile, flow-a2ui-video-option, [data-testid*='video' i]"
+                ));
+                const typeMarker = [
+                    card.getAttribute('type'),
+                    card.getAttribute('data-type'),
+                    card.getAttribute('data-media-type'),
+                    card.getAttribute('data-kind'),
+                ].map((value) => String(value || '').toLowerCase()).join(' ');
                 const hasPlayControl = /(^|\s)(play|phát|play_arrow|play_circle)(\s|$)/i.test(controlText);
-                const hasVideoMarker = videoNodes.length > 0 || hasPlayControl ||
-                    card.matches('[data-video-url]') || Boolean(card.querySelector('[data-video-url]')) ||
-                    /(^|\s)video(\s|$)/i.test(cardText);
+                const hasGenericDownloadControl = /(^|\s)(download|tải|file_download)(\s|$)/i.test(controlText);
+                const hasDownloadControl = controlNodes.some((node) => {
+                    const label = `${node.textContent || ''} ${node.getAttribute('aria-label') || ''}`
+                        .toLowerCase();
+                    return /(download video|video download|tải video)/i.test(label);
+                }) || (explicitVideoTile && hasGenericDownloadControl);
+                const hasVideoAttribute = card.matches('[data-video-url]') ||
+                    Boolean(card.querySelector('[data-video-url]'));
+                const hasVideoType = /(^|\s)video(\s|$)/i.test(typeMarker);
+                const hasVideoMarker = explicitVideoTile || videoNodes.length > 0 ||
+                    hasPlayControl || hasDownloadControl || hasVideoAttribute || hasVideoType;
                 if (!hasVideoMarker) continue;
 
                 const urls = [];
@@ -2313,12 +2387,16 @@ class GoogleFlowWorker:
                 if (seen.has(dedupeKey)) continue;
                 seen.add(dedupeKey);
                 candidates.push({
-                    src: urls[0] || (cardAria ? `flow_canvas_tile:${cardAria}` : ''),
+                    src: urls[0] || '',
+                    uiRef: cardAria ? `flow_video_tile:${cardAria}` : '',
                     urls,
                     matchUrls,
                     assetId,
                     cardAria,
                     identityKeys,
+                    isVideo: true,
+                    hasPlayControl,
+                    hasDownloadControl,
                     completed,
                     source: card.closest(
                         '.sidebar, .mat-drawer, flow-chat-panel, flow-chat-view, flow-chat-scroller'
@@ -2667,6 +2745,7 @@ class GoogleFlowWorker:
                     let followedByNewUser = false;
                     const candidates = [];
                     const seen = new Set();
+                    const ignoredImageKeys = new Set();
                     for (let index = promptIndex + 1; index < turns.length; index += 1) {
                         const turn = turns[index];
                         const nextUser = turn.matches(
@@ -2708,7 +2787,12 @@ class GoogleFlowWorker:
                         ));
                         if (!nodes.length) {
                             nodes = Array.from(document.querySelectorAll(
-                                'flow-grid-tile-container:has(flow-video-tile), flow-grid-tile-container, flow-video-tile'
+                                'flow-grid-tile-container:has(flow-video-tile), ' +
+                                'flow-grid-tile-container:has(video), ' +
+                                'flow-grid-tile-container:has([data-video-url]), ' +
+                                'flow-video-tile, flow-a2ui-video-option, video, source[src], ' +
+                                '[data-video-url], [data-media-type="video" i], [data-kind="video" i], ' +
+                                '[data-testid*="video" i]'
                             ));
                         }
                         for (const node of nodes) {
@@ -2766,8 +2850,48 @@ class GoogleFlowWorker:
                                 '.material-symbols-outlined'
                             )).map((item) => `${item.textContent || ''} ` +
                                 `${item.getAttribute('aria-label') || ''}`).join(' '));
+                            const explicitVideoTile = card.matches(
+                                'flow-video-tile, flow-a2ui-video-option, [data-testid*="video" i]'
+                            ) || Boolean(card.querySelector(
+                                'flow-video-tile, flow-a2ui-video-option, [data-testid*="video" i]'
+                            ));
+                            const typeMarker = [
+                                card.getAttribute('type'),
+                                card.getAttribute('data-type'),
+                                card.getAttribute('data-media-type'),
+                                card.getAttribute('data-kind'),
+                            ].map((value) => String(value || '').toLowerCase()).join(' ');
+                            const hasPlayControl = /(^|\s)(play|phát|play_arrow|play_circle)(\s|$)/i.test(controls);
+                            const hasDownloadControl = /(download video|video download|tải video)/i.test(controls) ||
+                                (explicitVideoTile && /(^|\s)(download|tải|file_download)(\s|$)/i.test(controls));
+                            const hasVideoAttribute = card.matches('[data-video-url]') ||
+                                Boolean(card.querySelector('[data-video-url]'));
+                            const hasVideoType = /(^|\s)video(\s|$)/i.test(typeMarker);
+                            const hasVideoNode = card.matches('video, source') ||
+                                Boolean(card.querySelector('video, source'));
+                            const hasKnownVideoUrl = urls.some((url) => {
+                                const lower = String(url || '').toLowerCase();
+                                return lower.startsWith('blob:') ||
+                                    /\.(?:mp4|webm|mov)(?:\?|$)/i.test(url) ||
+                                    lower.includes('=mm,') || lower.includes('/videoplayback') ||
+                                    lower.includes('/video/');
+                            });
+                            const isVideo = explicitVideoTile || hasVideoNode || hasVideoAttribute ||
+                                hasVideoType || hasPlayControl || hasDownloadControl || hasKnownVideoUrl;
+                            if (!isVideo) {
+                                const hasImage = card.matches('img, flow-image-tile') ||
+                                    Boolean(card.querySelector('img[src], img[srcset], flow-image-tile')) ||
+                                    matchUrls.some((url) => /\.(?:png|jpe?g|webp|gif)(?:\?|$)/i.test(url) ||
+                                        url.toLowerCase().includes('/image/') ||
+                                        url.toLowerCase().includes('/asb/'));
+                                if (hasImage) {
+                                    const imageKey = `${assetId}|${matchUrls[0] || ''}|${cardAria}`;
+                                    ignoredImageKeys.add(imageKey);
+                                }
+                                continue;
+                            }
                             const completed = /completed|complete|ready|succeeded|success/.test(state) ||
-                                /(^|\s)(play|phát|play_arrow|play_circle)(\s|$)/i.test(controls) ||
+                                hasPlayControl || hasDownloadControl ||
                                 urls.length > 0;
                             if (!assetId && !matchUrls.length && !cardAria) continue;
                             const key = `${assetId}|${matchUrls[0] || ''}|${cardAria}`;
@@ -2778,9 +2902,13 @@ class GoogleFlowWorker:
                             if (matchUrls.length) identityKeys.push(`poster:${matchUrls[0]}`);
                             if (cardAria) identityKeys.push(`label:${cardAria.toLowerCase()}`);
                             candidates.push({
-                                src: urls[0] || (cardAria ? `flow_canvas_tile:${cardAria}` : ''),
+                                src: urls[0] || '',
+                                uiRef: cardAria ? `flow_video_tile:${cardAria}` : '',
                                 urls, matchUrls, assetId, cardAria,
                                 identityKeys,
+                                isVideo: true,
+                                hasPlayControl,
+                                hasDownloadControl,
                                 completed,
                             });
                         }
@@ -2791,6 +2919,7 @@ class GoogleFlowWorker:
                         error,
                         isLatestPrompt: !followedByNewUser,
                         candidates,
+                        ignoredImageCandidates: ignoredImageKeys.size,
                     };
                 }''',
                 expected_prompts,
@@ -2815,9 +2944,18 @@ class GoogleFlowWorker:
                 "error": error_text,
                 "is_latest_prompt": bool(result.get("isLatestPrompt")),
             }
-        candidates = [
+        raw_candidates = [
             item for item in (result.get("candidates") or []) if isinstance(item, dict)
         ]
+        candidates = [
+            item for item in raw_candidates if self._candidate_has_video_evidence(item)
+        ]
+        ignored_image_count = max(
+            0,
+            int(result.get("ignoredImageCandidates") or 0)
+            + len(raw_candidates)
+            - len(candidates),
+        )
         source = self._find_new_video_source(candidates, set())
         if source:
             logger.info(
@@ -2868,6 +3006,7 @@ class GoogleFlowWorker:
             "state": "queued" if result.get("queued") else "pending",
             "source": "",
             "is_latest_prompt": bool(result.get("isLatestPrompt")),
+            "image_only_count": ignored_image_count,
         }
 
     async def cancel_generation_for_prompt(self, *prompts: str) -> bool:
@@ -3060,7 +3199,11 @@ class GoogleFlowWorker:
                     let error = '';
                     const seen = new Set();
 
-                    const addValidUrlsFromNode = (node, turnRole = 'agent') => {
+                    const addValidUrlsFromNode = (
+                        node,
+                        turnRole = 'agent',
+                        matchScope = ''
+                    ) => {
                         const urls = [
                             node.currentSrc || '', node.src || '', node.href || '',
                             node.getAttribute('data-image-url') || '',
@@ -3096,7 +3239,8 @@ class GoogleFlowWorker:
                             urls: validUrls,
                             assetId,
                             labelText: '',
-                            turnRole
+                            turnRole,
+                            matchScope
                         });
                     };
 
@@ -3116,30 +3260,33 @@ class GoogleFlowWorker:
                                 '[data-download-url], a[download][href]'
                             );
                             for (const node of nodes) {
-                                addValidUrlsFromNode(node, 'agent');
+                                addValidUrlsFromNode(node, 'agent', 'prompt_turn');
                             }
                         }
                     }
 
-                    // 2. Scan Canvas tiles (flow-image-tile, flow-canvas-tile, flow-media-tile)
+                    // 2. Canvas tiles are accepted only when they expose the exact
+                    // request marker. Finding the prompt bubble alone cannot prove
+                    // that an arbitrary tile belongs to this request.
+                    const requestMarkers = expectedPrompts
+                        .map((expected) => {
+                            const match = String(expected || '').match(/ayt-[a-z0-9_-]+/i);
+                            return match ? match[0].toLowerCase() : '';
+                        })
+                        .filter(Boolean);
                     const canvasTiles = Array.from(document.querySelectorAll(
                         'flow-image-tile, flow-canvas-tile, flow-media-tile'
                     ));
                     for (const tile of canvasTiles) {
                         if (tile.tagName.toLowerCase() === 'flow-pending-tile') continue;
                         const tileText = normalize(tile.textContent);
-                        const isMatch = promptIndex >= 0 || expectedPrompts.some((expected) => {
-                            const match = String(expected || '').match(/ayt-[a-z0-9_-]+/i);
-                            if (match && tileText.includes(match[0].toLowerCase())) return true;
-                            const sceneMatch = expected.match(/scene\s+\d+\/\d+/i);
-                            if (sceneMatch && tileText.includes(sceneMatch[0])) return true;
-                            const sample = expected.slice(0, 60);
-                            return sample && tileText.includes(sample);
-                        });
+                        const isMatch = requestMarkers.some(
+                            (marker) => tileText.includes(marker)
+                        );
                         if (isMatch) {
                             const nodes = tile.querySelectorAll('img[src], img[srcset], [data-image-url], [data-media-url]');
                             for (const node of nodes) {
-                                addValidUrlsFromNode(node, 'canvas');
+                                addValidUrlsFromNode(node, 'canvas', 'request_marker');
                             }
                         }
                     }
@@ -3171,7 +3318,18 @@ class GoogleFlowWorker:
         if not isinstance(candidates, list):
             return ""
         for candidate in reversed(candidates):
-            if not isinstance(candidate, dict) or self._candidate_matches_active_reference(candidate):
+            if not isinstance(candidate, dict):
+                continue
+            match_scope = str(candidate.get("matchScope") or "").strip()
+            if match_scope not in {"prompt_turn", "request_marker"}:
+                logger.warning(
+                    "flow_generation media=image state=late_output_unverified "
+                    "project=%s asset=%s",
+                    self._project_id(),
+                    str(candidate.get("assetId") or "")[:80],
+                )
+                continue
+            if self._candidate_matches_active_reference(candidate):
                 continue
             source = await self._validate_image_candidate(candidate)
             if source:
@@ -5499,7 +5657,10 @@ class GoogleFlowWorker:
         baseline_keys: set[str],
     ) -> dict | None:
         for candidate in reversed(candidates):
-            if not candidate.get("completed"):
+            if (
+                not candidate.get("completed")
+                or not self._candidate_has_video_evidence(candidate)
+            ):
                 continue
             if self._is_new_video_candidate(candidate, baseline_keys):
                 return candidate
@@ -5511,6 +5672,8 @@ class GoogleFlowWorker:
         baseline_keys: set[str],
     ) -> str:
         for candidate in reversed(candidates):
+            if not self._candidate_has_video_evidence(candidate):
+                continue
             if not self._is_new_video_candidate(candidate, baseline_keys):
                 continue
             for value in [
@@ -5519,7 +5682,7 @@ class GoogleFlowWorker:
                 *(candidate.get("urls") or []),
             ]:
                 source = str(value or "").strip()
-                if source:
+                if self._is_playable_video_source(source):
                     return source
         return ""
 
@@ -5528,6 +5691,8 @@ class GoogleFlowWorker:
         candidate: dict,
         baseline_keys: set[str],
     ) -> str:
+        if not self._candidate_has_video_evidence(candidate):
+            return ""
         detail_key = self._video_candidate_detail_key(candidate)
         if not detail_key or detail_key in self._inspected_video_detail_keys:
             return ""
@@ -5543,6 +5708,7 @@ class GoogleFlowWorker:
         }
 
         card_aria = str(candidate.get("cardAria") or "").strip()
+        ui_ref = str(candidate.get("uiRef") or "").strip()
         asset_id = str(candidate.get("assetId") or "").strip()
         clicked = False
 
@@ -5629,17 +5795,37 @@ class GoogleFlowWorker:
             return str(self.page.url)
 
         deadline = time.monotonic() + VIDEO_DETAIL_SCAN_TIMEOUT_SECONDS
+        max_iterations = max(
+            1,
+            int(
+                VIDEO_DETAIL_SCAN_TIMEOUT_SECONDS
+                / max(VIDEO_COMPLETION_FAST_POLL_SECONDS, 0.1)
+            )
+            + 2,
+        )
         try:
-            while True:
+            for _ in range(max_iterations):
                 if self._is_asset_edit_url(str(self.page.url or "")):
                     return str(self.page.url)
                 candidates = await self._collect_video_candidates()
                 source = self._find_new_video_source(candidates, baseline_keys)
                 if source:
                     return source
+                if ui_ref:
+                    download_button = self.page.locator(
+                        "button[aria-label*='Tải' i], "
+                        "button[aria-label*='Download' i], "
+                        "button:has(mat-icon:text-is('download'))"
+                    ).first
+                    try:
+                        if await download_button.is_visible(timeout=500):
+                            return ui_ref
+                    except Exception:
+                        pass
                 if time.monotonic() >= deadline:
-                    return ""
+                    break
                 await asyncio.sleep(VIDEO_COMPLETION_FAST_POLL_SECONDS)
+            return ""
         finally:
             await self._close_media_detail()
 
@@ -6116,19 +6302,6 @@ class GoogleFlowWorker:
             )
         if late_source:
             return late_source
-        if reconcile_only:
-            canvas_candidates = await self._collect_image_candidates()
-            for cand in reversed(canvas_candidates):
-                if not isinstance(cand, dict) or self._candidate_matches_active_reference(cand):
-                    continue
-                source = await self._validate_image_candidate(cand)
-                if source:
-                    self._remember_generated_image_identity(cand, source)
-                    logger.info(
-                        "flow_generation media=image state=canvas_reconcile_reused project=%s",
-                        self._project_id(),
-                    )
-                    return source
         intent_requires_reconciliation = bool(
             submit_if_prompt_missing
             and (
@@ -6637,9 +6810,24 @@ class GoogleFlowWorker:
                     video_error_count_before_submit=video_error_count_before_submit,
                     video_tile_count_before_submit=video_tile_count_before_submit,
                 )
+                image_only_count = max(
+                    0,
+                    int(existing_result.get("image_only_count") or 0),
+                )
                 raise FlowVideoPending(
-                    "Google Flow đã nhận yêu cầu video và chưa có file tải xuống; "
-                    "sẽ tiếp tục đối soát mà không gửi lại prompt."
+                    (
+                        "Google Flow chỉ trả về card ảnh hoặc output chưa xác minh là video; "
+                        "sẽ tiếp tục đối soát mà không gửi lại prompt."
+                        if image_only_count
+                        else
+                        "Google Flow đã nhận yêu cầu video và chưa có file tải xuống; "
+                        "sẽ tiếp tục đối soát mà không gửi lại prompt."
+                    ),
+                    reason_code=(
+                        "flow_video_output_unverified"
+                        if image_only_count
+                        else "flow_video_pending"
+                    ),
                 )
 
         await self._ensure_agent_session_ready()
@@ -6765,7 +6953,9 @@ class GoogleFlowWorker:
                     await self.wait_for_load()
                 else:
                     card_aria = ""
-                    if str(edit_url_or_asset_id).startswith("flow_canvas_tile:"):
+                    if str(edit_url_or_asset_id).startswith("flow_video_tile:"):
+                        card_aria = str(edit_url_or_asset_id).split("flow_video_tile:", 1)[1].strip()
+                    elif str(edit_url_or_asset_id).startswith("flow_canvas_tile:"):
                         card_aria = str(edit_url_or_asset_id).split("flow_canvas_tile:", 1)[1].strip()
                     elif not str(edit_url_or_asset_id).startswith("http"):
                         card_aria = str(edit_url_or_asset_id).strip()
@@ -6840,18 +7030,36 @@ class GoogleFlowWorker:
         target.parent.mkdir(parents=True, exist_ok=True)
         self._record_video_timing("download_started")
 
-        if (
-            self._is_asset_edit_url(asset_url)
-            or self._is_asset_edit_url(str(self.page.url or ""))
-            or str(asset_url).startswith("flow_")
-        ):
+        source = str(asset_url or "").strip()
+        if source.startswith("flow_canvas_tile:"):
+            raise FlowVideoPending(
+                "Flow trả về locator card chưa được xác minh là video; sẽ tiếp tục đối soát.",
+                reason_code="flow_video_output_unverified",
+            )
+        if source.startswith("flow_video_tile:"):
             if await self._download_video_from_ui(asset_url, target):
                 return
+            raise FlowVideoPending(
+                "Video tile đã xuất hiện nhưng nút tải chưa sẵn sàng; sẽ tiếp tục đối soát.",
+                reason_code="flow_video_download_pending",
+            )
+        if self._is_asset_edit_url(source):
+            if await self._download_video_from_ui(asset_url, target):
+                return
+            raise FlowVideoPending(
+                "Trang chi tiết video đã mở nhưng file tải chưa sẵn sàng; sẽ tiếp tục đối soát.",
+                reason_code="flow_video_download_pending",
+            )
+        if not self._is_playable_video_source(source):
+            raise FlowVideoPending(
+                "Google Flow chưa cung cấp URL video có thể phát; sẽ tiếp tục đối soát.",
+                reason_code="flow_video_output_unverified",
+            )
 
         last_error = None
         for attempt in range(3):
             try:
-                if asset_url.startswith("blob:"):
+                if source.startswith("blob:"):
                     # Extract blob data using in-page fetch
                     base64_data = await self.page.evaluate(
                         '''async (blobUrl) => {
@@ -6864,7 +7072,7 @@ class GoogleFlowWorker:
                                 reader.readAsDataURL(blob);
                             });
                         }''',
-                        asset_url,
+                        source,
                     )
                     import base64
                     if base64_data and "base64," in base64_data:
@@ -6874,25 +7082,35 @@ class GoogleFlowWorker:
                             logger.info("Downloaded video from blob successfully (%d bytes) to %s", len(raw_bytes), target)
                             self._record_video_timing("download_completed")
                             return
-                elif str(asset_url).startswith("http"):
-                    response = await self.page.request.get(asset_url, timeout=60000)
+                elif source.startswith("http"):
+                    response = await self.page.request.get(source, timeout=60000)
                     if response.status == 200:
                         body = await response.body()
+                        content_type = str(
+                            (response.headers or {}).get("content-type") or ""
+                        ).casefold()
+                        if content_type and not (
+                            content_type.startswith("video/")
+                            or "application/octet-stream" in content_type
+                            or "application/binary" in content_type
+                        ):
+                            raise RuntimeError(
+                                "Google Flow trả về nội dung không phải video "
+                                f"({content_type})."
+                            )
                         if body and len(body) > 1000:
                             target.write_bytes(body)
                             logger.info("Downloaded video successfully (%d bytes) to %s", len(body), target)
                             self._record_video_timing("download_completed")
                             return
                         raise RuntimeError(f"Tải video từ Google Flow rỗng hoặc quá nhỏ ({len(body) if body else 0} bytes).")
-                    raise RuntimeError(f"HTTP {response.status} khi tải video từ Google Flow: {asset_url}")
+                    raise RuntimeError(f"HTTP {response.status} khi tải video từ Google Flow: {source}")
                 else:
-                    if await self._download_video_from_ui(asset_url, target):
-                        return
-                    raise RuntimeError(f"Không thể xử lý URL video Google Flow: {asset_url}")
+                    raise RuntimeError(f"Không thể xử lý URL video Google Flow: {source}")
             except Exception as e:
                 last_error = e
                 logger.warning("Attempt %d/3 download_video failed: %s", attempt + 1, e)
-                if await self._download_video_from_ui(asset_url, target):
+                if await self._download_video_from_ui(source, target):
                     return
                 await asyncio.sleep(2)
 

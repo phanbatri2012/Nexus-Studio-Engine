@@ -240,6 +240,36 @@ class TestDiagnosticsCapture(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_async_diagnostics_ignores_hidden_generic_retry_marker(self):
+        async def _run():
+            mock_page = MagicMock()
+            mock_page.url = "https://www.youtube.com/watch?v=video-id"
+            mock_page.title = AsyncMock(return_value="Video - YouTube")
+            mock_page.content = AsyncMock(
+                return_value=(
+                    "<html><body><div hidden>Please try again later</div>"
+                    "<main>Video loaded</main></body></html>"
+                )
+            )
+            mock_page.evaluate = AsyncMock(return_value="Video loaded")
+            mock_page.screenshot = AsyncMock(return_value=None)
+
+            diag = await capture_browser_diagnostics_async(
+                page=mock_page,
+                service="youtube_pinned_comment",
+                job_id="comment-id",
+                error="Comment lazy-load timed out",
+                action_name="pin_top_level_comment_via_gpm",
+                logs_dir=self.test_dir,
+            )
+
+            categories = {
+                blocker["category"] for blocker in diag["detected_blockers"]
+            }
+            self.assertNotIn(CATEGORY_RATE_LIMIT_QUOTA, categories)
+
+        asyncio.run(_run())
+
     def test_sync_capture_with_dead_page(self):
         diag = capture_browser_diagnostics_sync(
             page=None,

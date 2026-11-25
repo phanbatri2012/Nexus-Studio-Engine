@@ -73,6 +73,12 @@ export const ROUTE_REGISTRY = {
     aliases: ['/downloader', '/youtube-downloader', '/tai-video'],
     title: 'YouTube Downloader'
   },
+  fullmovie: {
+    id: 'fullmovie',
+    canonicalPath: '/full-movie',
+    aliases: ['/full-movie', '/movie-merge', '/ghep-phim'],
+    title: 'Ghép phim Full'
+  },
   autologin: {
     id: 'autologin',
     canonicalPath: '/autologin',

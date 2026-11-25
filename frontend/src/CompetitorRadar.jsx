@@ -387,7 +387,11 @@ export default function CompetitorRadar({ onOpenJobCenter }) {
       {report && <div className="radar-modal-backdrop" onClick={() => setReport(null)}><section className="radar-modal" onClick={event => event.stopPropagation()}>
         <div className="radar-card-title"><div><h2>Báo cáo video #{report.item.video_id}</h2><small>{report.item.source_title}</small></div><button onClick={() => setReport(null)}>Đóng</button></div>
         <h3>Casting <small>v{report.casting.casting_version || 1}</small></h3>
-        {report.casting.source_voice_profile?.status && <div className="radar-casting-evidence">
+        {report.casting.source_voice_profile?.status === 'error' ? <div className="radar-casting-evidence error">
+          <b>Phân tích âm sắc tự động chưa sẵn sàng.</b> Cần duyệt casting thủ công.
+          {report.casting.source_voice_profile.failure_code ? ` · ${report.casting.source_voice_profile.failure_code}` : ''}
+          {report.casting.source_voice_profile.error_id ? ` · Mã lỗi ${report.casting.source_voice_profile.error_id}` : ''}
+        </div> : report.casting.source_voice_profile?.status && <div className="radar-casting-evidence">
           <b>Âm sắc giọng nguồn:</b> {report.casting.source_voice_profile.gender !== 'any' ? report.casting.source_voice_profile.gender : (report.casting.source_voice_profile.predicted_timbre || 'chưa xác định')}
           {' · '}confidence {Math.round((report.casting.source_voice_profile.confidence || 0) * 100)}%
           {' · '}{report.casting.source_voice_profile.status}

@@ -195,7 +195,8 @@ def _read_browser_service_status() -> dict:
     pid = int(state.get("pid") or 0)
     endpoint = str(state.get("cdp_url") or "")
     process_alive = _pid_is_alive(pid)
-    connected = process_alive and _cdp_is_ready(endpoint)
+    ready = state.get("ready") is True
+    connected = ready and process_alive and _cdp_is_ready(endpoint)
     window_visible = bool(state.get("window_visible", False))
     if connected and window_visible:
         service_state = "connected"
@@ -212,6 +213,7 @@ def _read_browser_service_status() -> dict:
     return {
         "running": connected,
         "connected": connected,
+        "ready": ready,
         "process_alive": process_alive,
         "state": service_state,
         "pid": pid or None,
@@ -256,7 +258,7 @@ def get_browser_service_endpoint() -> str:
     state = _read_json(SERVICE_STATE_PATH)
     endpoint = str(state.get("cdp_url") or "")
     pid = int(state.get("pid") or 0)
-    if _pid_is_alive(pid) and _cdp_is_ready(endpoint):
+    if state.get("ready") is True and _pid_is_alive(pid) and _cdp_is_ready(endpoint):
         return endpoint
     return ""
 
@@ -356,6 +358,9 @@ def _stop_browser_service_process(
             SERVICE_STOP_PATH.unlink(missing_ok=True)
             return _read_browser_service_status()
 
+        state["ready"] = False
+        state["stopping"] = True
+        _write_json(SERVICE_STATE_PATH, state)
         _write_json(
             SERVICE_STOP_PATH,
             {"instance_id": instance_id, "requested_at": _utc_now()},
@@ -639,40 +644,48 @@ def run_browser_service() -> int:
                 args=launch_options["args"],
                 viewport={"width": 1280, "height": 800},
             )
-            _restore_saved_chatgpt_session(context)
-            _initialize_service_page(context)
-            ready_deadline = time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
-            while time.monotonic() < ready_deadline and not _cdp_is_ready(endpoint):
-                time.sleep(SERVICE_POLL_SECONDS)
-            if not _cdp_is_ready(endpoint):
-                raise RuntimeError("Chromium did not expose its local CDP endpoint.")
-            state["ready"] = True
-            _write_json(SERVICE_STATE_PATH, state)
-            print(f"ChatGPT Browser Service ready at {endpoint}", flush=True)
+            try:
+                _restore_saved_chatgpt_session(context)
+                _initialize_service_page(context)
+                ready_deadline = time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
+                while time.monotonic() < ready_deadline and not _cdp_is_ready(endpoint):
+                    time.sleep(SERVICE_POLL_SECONDS)
+                if not _cdp_is_ready(endpoint):
+                    raise RuntimeError("Chromium did not expose its local CDP endpoint.")
+                state["ready"] = True
+                _write_json(SERVICE_STATE_PATH, state)
+                print(f"ChatGPT Browser Service ready at {endpoint}", flush=True)
 
-            next_health_check = time.monotonic() + SERVICE_HEALTH_CHECK_SECONDS
-            while not stop_event.wait(SERVICE_POLL_SECONDS):
-                if _stop_requested(instance_id):
-                    break
-                if time.monotonic() >= next_health_check:
-                    if not _cdp_is_ready(endpoint):
-                        raise RuntimeError(
-                            "Chromium closed or its CDP endpoint was lost."
+                next_health_check = time.monotonic() + SERVICE_HEALTH_CHECK_SECONDS
+                while not stop_event.wait(SERVICE_POLL_SECONDS):
+                    if _stop_requested(instance_id):
+                        break
+                    if time.monotonic() >= next_health_check:
+                        if not _cdp_is_ready(endpoint):
+                            raise RuntimeError(
+                                "Chromium closed or its CDP endpoint was lost."
+                            )
+                        next_health_check = (
+                            time.monotonic() + SERVICE_HEALTH_CHECK_SECONDS
                         )
-                    next_health_check = (
-                        time.monotonic() + SERVICE_HEALTH_CHECK_SECONDS
-                    )
-            _save_current_chatgpt_session(context)
+                _save_current_chatgpt_session(context)
+            finally:
+                if _cdp_is_ready(endpoint):
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                context = None
     except Exception as exc:
         exit_code = 1
+        current_state = _read_json(SERVICE_STATE_PATH)
+        if current_state.get("instance_id") == instance_id:
+            current_state["ready"] = False
+            current_state["failed_at"] = _utc_now()
+            _write_json(SERVICE_STATE_PATH, current_state)
         _write_last_error(str(exc))
         print(f"ChatGPT Browser Service failed: {exc}", file=sys.stderr, flush=True)
     finally:
-        if context is not None:
-            try:
-                context.close()
-            except Exception:
-                pass
         current_state = _read_json(SERVICE_STATE_PATH)
         if current_state.get("instance_id") == instance_id:
             SERVICE_STATE_PATH.unlink(missing_ok=True)

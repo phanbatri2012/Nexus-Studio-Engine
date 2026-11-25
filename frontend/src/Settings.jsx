@@ -3060,10 +3060,10 @@ export default function Settings({
                     Thời lượng Intro mục tiêu (giây)
                     <input
                       type="number"
-                      min="4"
-                      max="15"
+                      min="8"
+                      max="10"
                       step="0.5"
-                      value={currentImageGeneration.intro_scene_target_seconds || 8.0}
+                      value={Math.min(10, Math.max(8, Number(currentImageGeneration.intro_scene_target_seconds) || 8))}
                       onChange={event => handlePromptSettingChange(
                         'image_generation_settings', 'intro_scene_target_seconds', Number(event.target.value)
                       )}
@@ -3367,7 +3367,10 @@ export default function Settings({
               const liveVidStyle = (currentImageGeneration.video_style_prompt || DEFAULT_IMAGE_GENERATION_SETTINGS.video_style_prompt).split('\n')[0].slice(0, 100);
               const liveMotion = currentImageGeneration.video_motion_prompt || DEFAULT_IMAGE_GENERATION_SETTINGS.video_motion_prompt;
               const liveVidTemplate = currentImageGeneration.video_prompt_template || DEFAULT_IMAGE_GENERATION_SETTINGS.video_prompt_template;
-              const liveDuration = Number(currentImageGeneration.intro_scene_target_seconds || 8.0);
+              const rawLiveDuration = Number(currentImageGeneration.intro_scene_target_seconds || 8.0);
+              const liveDuration = Number.isFinite(rawLiveDuration)
+                ? Math.min(10, Math.max(8, rawLiveDuration))
+                : 8;
               const liveDurationLabel = Number.isFinite(liveDuration) && liveDuration > 0
                 ? String(liveDuration)
                 : '8';

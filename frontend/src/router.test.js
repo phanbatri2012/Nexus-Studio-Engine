@@ -9,10 +9,10 @@ import {
   stringifyQueryParams
 } from './router.js'
 
-test('registers all 15 primary modules in ROUTE_REGISTRY', () => {
+test('registers all 16 primary modules in ROUTE_REGISTRY', () => {
   const expectedKeys = [
     'dashboard', 'jobs', 'competitors', 'comments', 'channels', 'trustbuilder', 'crossposter',
-    'shortvideo', 'fetcher', 'downloader', 'autologin', 'flowlogin', 'tts', 'muse', 'settings'
+    'shortvideo', 'fetcher', 'downloader', 'fullmovie', 'autologin', 'flowlogin', 'tts', 'muse', 'settings'
   ]
   for (const key of expectedKeys) {
     assert.ok(ROUTE_REGISTRY[key], `Missing registry entry for ${key}`)
@@ -38,7 +38,7 @@ test('parses query strings and formats them back reliably', () => {
   assert.equal(formatted, '?status=failed&limit=10')
 })
 
-test('parses primary routes across all 15 menus correctly', () => {
+test('parses primary routes across all 16 menus correctly', () => {
   const expectedMappings = [
     { url: '/', viewId: 'dashboard' },
     { url: '/dashboard', viewId: 'dashboard' },
@@ -60,6 +60,9 @@ test('parses primary routes across all 15 menus correctly', () => {
     { url: '/video-fetcher', viewId: 'fetcher' },
     { url: '/downloader', viewId: 'downloader' },
     { url: '/youtube-downloader', viewId: 'downloader' },
+    { url: '/full-movie', viewId: 'fullmovie' },
+    { url: '/movie-merge', viewId: 'fullmovie' },
+    { url: '/ghep-phim', viewId: 'fullmovie' },
     { url: '/autologin', viewId: 'autologin' },
     { url: '/auto-login', viewId: 'autologin' },
     { url: '/flowlogin', viewId: 'flowlogin' },
@@ -139,4 +142,5 @@ test('builds canonical URLs with sub-paths and query parameters', () => {
   )
   assert.equal(buildPath('channels', 'youtube'), '/channels/youtube')
   assert.equal(buildPath('dashboard'), '/dashboard')
+  assert.equal(buildPath('fullmovie'), '/full-movie')
 })
